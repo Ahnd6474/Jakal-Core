@@ -326,6 +326,7 @@ public:
             }
         }
 
+        materialize_graph_costs(graph);
         return {graph};
     }
 };

@@ -559,6 +559,7 @@ public:
                     }
                 }
 
+                materialize_graph_costs(graph);
                 graphs.push_back(std::move(graph));
                 ++ordinal;
             }

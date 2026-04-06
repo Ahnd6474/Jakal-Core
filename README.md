@@ -47,6 +47,8 @@ Instead, each discovered hardware target is normalized into a graph:
 
 The graph is built from hardware-readable information first. If a detail is not directly readable, it should not be invented casually.
 
+Edge `weight` is treated as an estimated execution cost in microseconds for a small canonical operation on that relation. Bandwidth and latency remain explicit on the edge, and `weight` is materialized from them with lightweight hierarchy propagation.
+
 ## Graph model
 
 ### Medium resolution
@@ -82,6 +84,8 @@ The graph model also supports finer objects:
 These are only instantiated when the probe can read enough hardware information to justify them. The current implementation mixes medium resolution with selective aggressive nodes so the graph stays useful without exploding the search space.
 
 Bank, router, and deeper pipeline decomposition are intentionally left as future selective refinements. They should only be expanded where measured bottlenecks justify the extra complexity.
+
+When aggressive nodes are present, their edge costs are propagated upward so parent `contains`, `controls`, and `dispatches` relations change as the lower-level graph changes.
 
 ## Architecture
 

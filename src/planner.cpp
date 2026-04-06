@@ -86,6 +86,9 @@ double effective_host_link_gbps(const HardwareGraphSummary& summary) {
 }
 
 double effective_dispatch_latency_us(const HardwareGraphSummary& summary) {
+    if (summary.average_dispatch_cost_us > 0.0) {
+        return summary.average_dispatch_cost_us;
+    }
     if (summary.dispatch_latency_us > 0.0) {
         return summary.dispatch_latency_us;
     }
@@ -147,9 +150,18 @@ ScoreComponents score_graph(const HardwareGraph& graph, const WorkloadSpec& work
     // Favor graphs that expose more useful structure for mapping and scheduling.
     graph_bonus += std::log2(static_cast<double>(graph.nodes.size()) + 1.0) * 0.02;
     graph_bonus += std::log2(static_cast<double>(graph.edges.size()) + 1.0) * 0.01;
+    graph_bonus += std::log2((summary.average_feed_cost_us > 0.0 ? 1.0 / summary.average_feed_cost_us : 1.0) + 1.0) * 0.03;
 
     double transfer_penalty =
         (effective_dispatch_latency_us(summary) + effective_sync_latency_us(summary)) / 100.0;
+
+    if (summary.average_transfer_cost_us > 0.0) {
+        transfer_penalty += summary.average_transfer_cost_us / (workload.latency_sensitive ? 40.0 : 80.0);
+    }
+
+    if (summary.average_hierarchy_cost_us > 0.0) {
+        transfer_penalty += summary.average_hierarchy_cost_us / (workload.latency_sensitive ? 120.0 : 240.0);
+    }
 
     if (workload.host_exchange_bytes > 0) {
         transfer_penalty +=

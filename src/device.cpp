@@ -3,11 +3,20 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <sstream>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace gpu {
 namespace {
+
+constexpr double kBytesPerGb = 1.0e9;
+constexpr double kMicrosecondsPerSecond = 1.0e6;
+constexpr double kCanonicalTransferBytes = 256.0 * 1024.0;
+constexpr double kCanonicalFeedBytes = 16.0 * 1024.0;
+constexpr double kDefaultOnChipBandwidthGbps = 512.0;
 
 bool is_execution_node(const HardwareObjectNode& node) {
     return node.domain == HardwareObjectDomain::compute && node.role == HardwareObjectRole::tile;
@@ -34,6 +43,37 @@ T min_positive(const T current, const T candidate) {
         return candidate;
     }
     return std::min(current, candidate);
+}
+
+double transfer_time_us(const double bytes, const double bandwidth_gbps) {
+    if (bytes <= 0.0 || bandwidth_gbps <= 0.0) {
+        return 0.0;
+    }
+    return (bytes / (bandwidth_gbps * kBytesPerGb)) * kMicrosecondsPerSecond;
+}
+
+double default_bandwidth_for_feed(const HardwareObjectNode* source, const HardwareObjectNode* target) {
+    if (source != nullptr) {
+        if (source->role == HardwareObjectRole::scratchpad || source->role == HardwareObjectRole::cache) {
+            return 1024.0;
+        }
+        if (source->role == HardwareObjectRole::global_memory || source->role == HardwareObjectRole::host_memory) {
+            return 128.0;
+        }
+    }
+    if (target != nullptr) {
+        if (target->role == HardwareObjectRole::lane) {
+            return 1024.0;
+        }
+        if (target->role == HardwareObjectRole::pipeline) {
+            return 768.0;
+        }
+    }
+    return kDefaultOnChipBandwidthGbps;
+}
+
+double average_or_zero(const double total, const std::size_t count) {
+    return count == 0 ? 0.0 : total / static_cast<double>(count);
 }
 
 }  // namespace
@@ -118,6 +158,132 @@ std::string to_string(const GraphEdgeSemantics semantics) {
     }
 }
 
+void materialize_graph_costs(HardwareGraph& graph) {
+    std::unordered_map<std::string, const HardwareObjectNode*> node_lookup;
+    node_lookup.reserve(graph.nodes.size());
+    for (const auto& node : graph.nodes) {
+        node_lookup.emplace(node.id, &node);
+    }
+
+    std::unordered_map<std::string, std::vector<std::string>> children;
+    children.reserve(graph.nodes.size());
+    for (const auto& node : graph.nodes) {
+        if (!node.parent_id.empty()) {
+            children[node.parent_id].push_back(node.id);
+        }
+    }
+
+    std::unordered_map<std::string, std::vector<std::size_t>> outgoing_edges;
+    outgoing_edges.reserve(graph.nodes.size());
+    for (std::size_t edge_index = 0; edge_index < graph.edges.size(); ++edge_index) {
+        outgoing_edges[graph.edges[edge_index].source_id].push_back(edge_index);
+    }
+
+    for (auto& edge : graph.edges) {
+        const auto source_it = node_lookup.find(edge.source_id);
+        const auto target_it = node_lookup.find(edge.target_id);
+        const HardwareObjectNode* source = source_it == node_lookup.end() ? nullptr : source_it->second;
+        const HardwareObjectNode* target = target_it == node_lookup.end() ? nullptr : target_it->second;
+
+        switch (edge.semantics) {
+        case GraphEdgeSemantics::transfers_to:
+        case GraphEdgeSemantics::reads_from:
+        case GraphEdgeSemantics::writes_to: {
+            const double bandwidth = edge.bandwidth_gbps > 0.0 ? edge.bandwidth_gbps : 32.0;
+            edge.weight = edge.latency_us + transfer_time_us(kCanonicalTransferBytes, bandwidth);
+            break;
+        }
+        case GraphEdgeSemantics::dispatches:
+            edge.weight = edge.latency_us > 0.0 ? edge.latency_us : 2.0;
+            break;
+        case GraphEdgeSemantics::feeds: {
+            const double bandwidth =
+                edge.bandwidth_gbps > 0.0 ? edge.bandwidth_gbps : default_bandwidth_for_feed(source, target);
+            const double base_latency = edge.latency_us > 0.0 ? edge.latency_us : 0.10;
+            edge.weight = base_latency + transfer_time_us(kCanonicalFeedBytes, bandwidth);
+            break;
+        }
+        case GraphEdgeSemantics::controls:
+            edge.weight = edge.latency_us > 0.0 ? edge.latency_us : 0.25;
+            break;
+        case GraphEdgeSemantics::synchronizes_with:
+            edge.weight = edge.latency_us > 0.0 ? edge.latency_us : 0.50;
+            break;
+        case GraphEdgeSemantics::contains:
+        default:
+            edge.weight = 0.0;
+            break;
+        }
+    }
+
+    std::unordered_map<std::string, double> subtree_cost_cache;
+    subtree_cost_cache.reserve(graph.nodes.size());
+
+    std::function<double(const std::string&)> subtree_cost = [&](const std::string& node_id) -> double {
+        if (const auto cached = subtree_cost_cache.find(node_id); cached != subtree_cost_cache.end()) {
+            return cached->second;
+        }
+
+        double direct_total = 0.0;
+        std::size_t direct_count = 0;
+        if (const auto out_it = outgoing_edges.find(node_id); out_it != outgoing_edges.end()) {
+            for (const auto edge_index : out_it->second) {
+                const auto& edge = graph.edges[edge_index];
+                if (edge.semantics == GraphEdgeSemantics::contains) {
+                    continue;
+                }
+                direct_total += edge.weight;
+                ++direct_count;
+            }
+        }
+
+        double child_total = 0.0;
+        std::size_t child_count = 0;
+        if (const auto child_it = children.find(node_id); child_it != children.end()) {
+            for (const auto& child_id : child_it->second) {
+                child_total += subtree_cost(child_id);
+                ++child_count;
+            }
+        }
+
+        const double direct_component = average_or_zero(direct_total, direct_count);
+        const double child_component = average_or_zero(child_total, child_count);
+        const double aggregate_cost = direct_component + (child_component * 0.35);
+        subtree_cost_cache.emplace(node_id, aggregate_cost);
+        return aggregate_cost;
+    };
+
+    for (auto& edge : graph.edges) {
+        const double target_subtree_cost = subtree_cost(edge.target_id);
+        const double source_subtree_cost = subtree_cost(edge.source_id);
+
+        switch (edge.semantics) {
+        case GraphEdgeSemantics::contains:
+            edge.weight = target_subtree_cost;
+            break;
+        case GraphEdgeSemantics::controls:
+            edge.weight += target_subtree_cost * 0.20;
+            break;
+        case GraphEdgeSemantics::dispatches:
+            edge.weight += target_subtree_cost * 0.10;
+            break;
+        case GraphEdgeSemantics::feeds:
+            edge.weight += (source_subtree_cost + target_subtree_cost) * 0.05;
+            break;
+        case GraphEdgeSemantics::transfers_to:
+        case GraphEdgeSemantics::reads_from:
+        case GraphEdgeSemantics::writes_to:
+            edge.weight += target_subtree_cost * 0.03;
+            break;
+        case GraphEdgeSemantics::synchronizes_with:
+            edge.weight += (source_subtree_cost + target_subtree_cost) * 0.10;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 HardwareGraphSummary summarize_graph(const HardwareGraph& graph) {
     HardwareGraphSummary summary;
     bool has_numa_domain = false;
@@ -130,6 +296,14 @@ HardwareGraphSummary summarize_graph(const HardwareGraph& graph) {
     }
 
     std::uint32_t fallback_compute_nodes = 0;
+    double transfer_cost_total = 0.0;
+    double dispatch_cost_total = 0.0;
+    double feed_cost_total = 0.0;
+    double hierarchy_cost_total = 0.0;
+    std::size_t transfer_cost_count = 0;
+    std::size_t dispatch_cost_count = 0;
+    std::size_t feed_cost_count = 0;
+    std::size_t hierarchy_cost_count = 0;
 
     for (const auto& node : graph.nodes) {
         if (node.domain == HardwareObjectDomain::compute) {
@@ -200,6 +374,51 @@ HardwareGraphSummary summarize_graph(const HardwareGraph& graph) {
         }
     }
 
+    for (const auto& edge : graph.edges) {
+        switch (edge.semantics) {
+        case GraphEdgeSemantics::transfers_to:
+        case GraphEdgeSemantics::reads_from:
+        case GraphEdgeSemantics::writes_to:
+            if (edge.weight > 0.0) {
+                transfer_cost_total += edge.weight;
+                ++transfer_cost_count;
+            }
+            break;
+        case GraphEdgeSemantics::dispatches:
+            if (edge.weight > 0.0) {
+                dispatch_cost_total += edge.weight;
+                ++dispatch_cost_count;
+                summary.dispatch_latency_us = min_positive(summary.dispatch_latency_us, edge.weight);
+            }
+            break;
+        case GraphEdgeSemantics::feeds:
+            if (edge.weight > 0.0) {
+                feed_cost_total += edge.weight;
+                ++feed_cost_count;
+            }
+            break;
+        case GraphEdgeSemantics::contains:
+        case GraphEdgeSemantics::controls:
+            if (edge.weight > 0.0) {
+                hierarchy_cost_total += edge.weight;
+                ++hierarchy_cost_count;
+            }
+            break;
+        case GraphEdgeSemantics::synchronizes_with:
+            if (edge.weight > 0.0) {
+                summary.synchronization_latency_us = min_positive(summary.synchronization_latency_us, edge.weight);
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    summary.average_transfer_cost_us = average_or_zero(transfer_cost_total, transfer_cost_count);
+    summary.average_dispatch_cost_us = average_or_zero(dispatch_cost_total, dispatch_cost_count);
+    summary.average_feed_cost_us = average_or_zero(feed_cost_total, feed_cost_count);
+    summary.average_hierarchy_cost_us = average_or_zero(hierarchy_cost_total, hierarchy_cost_count);
+
     if (summary.execution_objects == 0 && fallback_compute_nodes > 0) {
         summary.execution_objects = fallback_compute_nodes;
     }
@@ -239,6 +458,10 @@ std::string structural_fingerprint(const HardwareGraph& graph) {
            << summary.host_write_gbps << ':'
            << summary.dispatch_latency_us << ':'
            << summary.synchronization_latency_us << ':'
+           << summary.average_transfer_cost_us << ':'
+           << summary.average_dispatch_cost_us << ':'
+           << summary.average_feed_cost_us << ':'
+           << summary.average_hierarchy_cost_us << ':'
            << summary.coherent_with_host << ':'
            << summary.unified_address_space << ':'
            << summary.host_visible << ':'

@@ -132,6 +132,10 @@ struct HardwareGraphSummary {
     double host_write_gbps = 0.0;
     double dispatch_latency_us = 0.0;
     double synchronization_latency_us = 0.0;
+    double average_transfer_cost_us = 0.0;
+    double average_dispatch_cost_us = 0.0;
+    double average_feed_cost_us = 0.0;
+    double average_hierarchy_cost_us = 0.0;
     bool coherent_with_host = false;
     bool unified_address_space = false;
     bool host_visible = false;
@@ -147,6 +151,7 @@ struct HardwareGraphSummary {
 [[nodiscard]] std::string to_string(HardwareObjectRole role);
 [[nodiscard]] std::string to_string(HardwareObjectResolution resolution);
 [[nodiscard]] std::string to_string(GraphEdgeSemantics semantics);
+void materialize_graph_costs(HardwareGraph& graph);
 [[nodiscard]] HardwareGraphSummary summarize_graph(const HardwareGraph& graph);
 [[nodiscard]] std::string structural_fingerprint(const HardwareGraph& graph);
 
