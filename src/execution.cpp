@@ -12,24 +12,172 @@
 #include <limits>
 #include <numeric>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 
 namespace gpu {
 namespace {
 
 constexpr std::uint64_t kKiB = 1024ull;
 constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+constexpr std::uint64_t kGiB = 1024ull * 1024ull * 1024ull;
 constexpr double kBytesPerGb = 1.0e9;
 constexpr double kMicrosecondsPerSecond = 1.0e6;
+constexpr std::uint32_t kLearningWarmupSamples = 3u;
 
 struct ValidationResult {
     double reference_latency_us = 0.0;
     double candidate_latency_us = 0.0;
     double relative_error = 0.0;
 };
+
+std::string join_csv(const std::vector<std::string>& values);
+
+std::filesystem::path performance_cache_path_for(const std::filesystem::path& cache_path) {
+    if (cache_path.empty()) {
+        return std::filesystem::path("gpu_runtime_execution_perf_cache.tsv");
+    }
+    auto path = cache_path;
+    path += ".perf";
+    return path;
+}
+
+std::string shape_bucket_for(const OperationSpec& operation) {
+    std::ostringstream stream;
+    stream << to_string(operation.op_class);
+    for (const auto extent : operation.extents) {
+        std::uint64_t bucket = 1;
+        while (bucket < extent) {
+            bucket <<= 1u;
+        }
+        stream << ':' << bucket;
+    }
+    const auto bytes_bucket = std::max<std::uint64_t>(1ull, operation.input_bytes / (4ull * kMiB));
+    stream << "|b" << bytes_bucket;
+    return stream.str();
+}
+
+std::string summarize_graph_set(const std::vector<HardwareGraph>& graphs) {
+    std::vector<std::string> fingerprints;
+    fingerprints.reserve(graphs.size());
+    for (const auto& graph : graphs) {
+        fingerprints.push_back(structural_fingerprint(graph));
+    }
+    std::sort(fingerprints.begin(), fingerprints.end());
+    std::ostringstream stream;
+    for (const auto& fingerprint : fingerprints) {
+        stream << fingerprint << '|';
+    }
+    return stream.str();
+}
+
+std::string performance_key(
+    const std::string& graph_set_signature,
+    const SystemProfile& system,
+    const std::string& shape_bucket,
+    const ExecutionConfig& config) {
+    std::ostringstream stream;
+    stream << graph_set_signature << '|'
+           << shape_bucket << '|'
+           << system.low_spec_mode << '|'
+           << system.on_battery << '|'
+           << system.battery_saver << '|'
+           << (system.free_memory_ratio < 0.25 ? "mem-low" : system.free_memory_ratio < 0.5 ? "mem-mid" : "mem-high")
+           << '|'
+           << to_string(config.strategy) << '|'
+           << config.primary_device_uid << '|'
+           << join_csv(config.participating_devices) << '|'
+           << config.queue_depth << '|'
+           << config.stages << '|'
+           << config.tile_x << '|'
+           << config.tile_y << '|'
+           << config.tile_k << '|'
+           << config.overlap_transfers << '|'
+           << config.use_low_precision;
+    return stream.str();
+}
+
+double aggregate_execution_score(const std::vector<HardwareGraph>& graphs) {
+    double score = 0.0;
+    for (const auto& graph : graphs) {
+        const auto summary = summarize_graph(graph);
+        score += static_cast<double>(std::max(summary.execution_objects, 1u)) *
+                 static_cast<double>(std::max(summary.lanes_per_object, 1u));
+    }
+    return score;
+}
+
+SystemProfile capture_system_profile(const WorkloadSpec& workload, const std::vector<HardwareGraph>& graphs) {
+    SystemProfile profile;
+
+#ifdef _WIN32
+    MEMORYSTATUSEX memory_status{};
+    memory_status.dwLength = sizeof(memory_status);
+    if (GlobalMemoryStatusEx(&memory_status) != 0) {
+        profile.available_memory_bytes = memory_status.ullAvailPhys;
+        if (memory_status.ullTotalPhys > 0) {
+            profile.free_memory_ratio =
+                static_cast<double>(memory_status.ullAvailPhys) / static_cast<double>(memory_status.ullTotalPhys);
+        }
+    }
+
+    SYSTEM_POWER_STATUS power_status{};
+    if (GetSystemPowerStatus(&power_status) != 0) {
+        profile.on_battery = power_status.ACLineStatus == 0;
+        profile.battery_saver = power_status.SystemStatusFlag != 0;
+        if (power_status.BatteryLifePercent != 255) {
+            profile.battery_percent = static_cast<double>(power_status.BatteryLifePercent);
+        }
+    }
+#else
+    (void)workload;
+#endif
+
+    std::uint64_t addressable_bytes = 0;
+    std::uint64_t directly_attached_bytes = 0;
+    for (const auto& graph : graphs) {
+        const auto summary = summarize_graph(graph);
+        addressable_bytes += summary.addressable_bytes;
+        directly_attached_bytes += summary.directly_attached_bytes;
+    }
+
+    const bool low_memory_machine =
+        (profile.available_memory_bytes > 0 && profile.available_memory_bytes < 6ull * kGiB) ||
+        (addressable_bytes > 0 && addressable_bytes < 12ull * kGiB);
+    const bool low_compute_machine = aggregate_execution_score(graphs) < 512.0;
+    profile.low_spec_mode = low_memory_machine || low_compute_machine;
+
+    const double demand_bytes =
+        static_cast<double>(workload.working_set_bytes + workload.host_exchange_bytes + (workload.batch_size * 4ull * kMiB));
+    if (profile.available_memory_bytes > 0) {
+        const double available = static_cast<double>(profile.available_memory_bytes);
+        profile.paging_risk = std::clamp((demand_bytes - (available * 0.65)) / std::max(available, 1.0), 0.0, 2.0);
+    }
+
+    if (profile.on_battery) {
+        profile.sustained_slowdown *= profile.battery_percent < 25.0 ? 1.30 : 1.12;
+    }
+    if (profile.battery_saver) {
+        profile.sustained_slowdown *= 1.20;
+    }
+    if (profile.free_memory_ratio < 0.20) {
+        profile.sustained_slowdown *= 1.25;
+    }
+    if (profile.low_spec_mode) {
+        profile.sustained_slowdown *= 1.15;
+    }
+
+    profile.amortization_gain = profile.low_spec_mode ? 0.80 : 0.90;
+    profile.initialization_penalty_us = profile.low_spec_mode ? 1800.0 : 900.0;
+    return profile;
+}
 
 std::vector<std::string> split_tab(const std::string& line) {
     std::vector<std::string> fields;
@@ -276,6 +424,71 @@ std::uint32_t choose_queue_depth(const HardwareGraphSummary& summary) {
     return std::clamp(summary.queue_slots / 32u, 1u, 8u);
 }
 
+double compute_initialization_penalty_us(
+    const ExecutionConfig& config,
+    const SystemProfile& system,
+    const std::unordered_map<std::string, bool>& warmed_devices) {
+    double penalty = 0.0;
+    for (const auto& device_uid : config.participating_devices) {
+        const auto warm_it = warmed_devices.find(device_uid);
+        const bool warmed = warm_it != warmed_devices.end() && warm_it->second;
+        if (!warmed) {
+            penalty += system.initialization_penalty_us;
+        }
+    }
+    return penalty;
+}
+
+double compute_memory_pressure_penalty_us(
+    const OperationSpec& operation,
+    const ExecutionConfig& config,
+    const SystemProfile& system) {
+    if (system.available_memory_bytes == 0) {
+        return 0.0;
+    }
+
+    double replicated_input_factor = config.strategy == ExecutionStrategy::sharded ? 1.35 : 1.0;
+    if (config.strategy == ExecutionStrategy::streaming) {
+        replicated_input_factor *= 0.85;
+    }
+
+    const double device_copies = static_cast<double>(std::max<std::size_t>(config.participating_devices.size(), 1u));
+    const double resident_bytes =
+        (static_cast<double>(operation.input_bytes) * replicated_input_factor * device_copies) +
+        static_cast<double>(operation.output_bytes + operation.temporary_bytes);
+    const double available = static_cast<double>(system.available_memory_bytes);
+    const double excess = std::max(0.0, resident_bytes - (available * 0.55));
+    return (excess / static_cast<double>(kMiB)) * (system.low_spec_mode ? 12.0 : 4.0);
+}
+
+double compute_surrogate_penalty_us(
+    const OperationSpec& operation,
+    const ExecutionConfig& config,
+    const SystemProfile& system,
+    const std::unordered_map<std::string, bool>& warmed_devices) {
+    double penalty = compute_initialization_penalty_us(config, system, warmed_devices);
+    penalty += compute_memory_pressure_penalty_us(operation, config, system);
+    penalty += system.paging_risk * (system.low_spec_mode ? 900.0 : 300.0);
+
+    if (system.on_battery) {
+        penalty += static_cast<double>(config.participating_devices.size() - 1) * 250.0;
+        penalty += static_cast<double>(std::max(config.queue_depth, 1u) - 1u) * 18.0;
+    }
+    if (system.low_spec_mode && config.strategy == ExecutionStrategy::sharded) {
+        penalty += 500.0;
+    }
+    if (system.low_spec_mode && config.strategy == ExecutionStrategy::streaming) {
+        penalty -= 120.0;
+    }
+    if (system.low_spec_mode && config.overlap_transfers) {
+        penalty -= 80.0;
+    }
+    if (system.low_spec_mode && config.use_low_precision) {
+        penalty -= 60.0;
+    }
+    return std::max(0.0, penalty);
+}
+
 void configure_tiles(const OperationSpec& operation, const HardwareGraphSummary& summary, ExecutionConfig& config) {
     const std::uint32_t lanes = std::max(summary.lanes_per_object, 1u);
     const std::uint32_t vector_width = std::max(summary.native_vector_bits / 32u, 1u);
@@ -311,6 +524,7 @@ std::vector<ExecutionConfig> build_candidate_configs(
     const WorkloadSpec& workload,
     const ExecutionPlan& placement,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    const SystemProfile& system,
     const std::string& report_signature) {
     std::vector<ExecutionConfig> candidates;
     if (placement.allocations.empty()) {
@@ -359,12 +573,17 @@ std::vector<ExecutionConfig> build_candidate_configs(
     base.participating_devices = {primary.device.uid};
     base.queue_depth = choose_queue_depth(primary_summary);
     base.stages = primary_summary.supports_asynchronous_dispatch ? 2u : 1u;
+    if (system.low_spec_mode) {
+        base.queue_depth = std::min(base.queue_depth, 2u);
+        base.stages = 1u;
+    }
     add_candidate(base);
 
-    if (operation.streaming_friendly && primary_summary.supports_asynchronous_dispatch) {
+    if (operation.streaming_friendly &&
+        (primary_summary.supports_asynchronous_dispatch || system.low_spec_mode)) {
         ExecutionConfig streaming = base;
         streaming.strategy = ExecutionStrategy::streaming;
-        streaming.stages = std::max(3u, streaming.stages);
+        streaming.stages = system.low_spec_mode ? 2u : std::max(3u, streaming.stages);
         streaming.overlap_transfers = true;
         add_candidate(streaming);
     }
@@ -379,7 +598,10 @@ std::vector<ExecutionConfig> build_candidate_configs(
         add_candidate(low_precision);
     }
 
-    if (operation.parallelizable && placement.allocations.size() > 1 && !workload.latency_sensitive) {
+    if (operation.parallelizable &&
+        placement.allocations.size() > 1 &&
+        !workload.latency_sensitive &&
+        !(system.low_spec_mode && system.paging_risk > 0.25)) {
         ExecutionConfig sharded = base;
         sharded.strategy = ExecutionStrategy::sharded;
         sharded.participating_devices.clear();
@@ -387,7 +609,7 @@ std::vector<ExecutionConfig> build_candidate_configs(
             sharded.participating_devices.push_back(allocation.device.uid);
         }
         sharded.overlap_transfers = true;
-        sharded.stages = std::max(2u, sharded.stages);
+        sharded.stages = system.low_spec_mode ? 2u : std::max(2u, sharded.stages);
         add_candidate(sharded);
     }
 
@@ -897,13 +1119,15 @@ ValidationResult validate_resample(const OperationSpec& operation, const Executi
     auto bilinear = [&](std::vector<float>& output, const bool low_precision) {
         for (std::size_t y = 0; y < dst_h; ++y) {
             const float src_y = (static_cast<float>(y) + 0.5f) * static_cast<float>(src_h) / static_cast<float>(dst_h) - 0.5f;
-            const auto y0 = static_cast<std::size_t>(std::clamp(std::floor(src_y), 0.0, static_cast<double>(src_h - 1)));
-            const auto y1 = std::min(y0 + 1, src_h - 1);
+            const float clamped_y = std::clamp(std::floor(src_y), 0.0f, static_cast<float>(src_h - 1));
+            const auto y0 = static_cast<std::size_t>(clamped_y);
+            const auto y1 = std::min<std::size_t>(y0 + 1u, src_h - 1u);
             const float wy = static_cast<float>(src_y - std::floor(src_y));
             for (std::size_t x = 0; x < dst_w; ++x) {
                 const float src_x = (static_cast<float>(x) + 0.5f) * static_cast<float>(src_w) / static_cast<float>(dst_w) - 0.5f;
-                const auto x0 = static_cast<std::size_t>(std::clamp(std::floor(src_x), 0.0, static_cast<double>(src_w - 1)));
-                const auto x1 = std::min(x0 + 1, src_w - 1);
+                const float clamped_x = std::clamp(std::floor(src_x), 0.0f, static_cast<float>(src_w - 1));
+                const auto x0 = static_cast<std::size_t>(clamped_x);
+                const auto x1 = std::min<std::size_t>(x0 + 1u, src_w - 1u);
                 const float wx = static_cast<float>(src_x - std::floor(src_x));
                 const float v00 = quantize_value(input[y0 * src_w + x0], low_precision);
                 const float v01 = quantize_value(input[y0 * src_w + x1], low_precision);
@@ -933,7 +1157,10 @@ BenchmarkRecord benchmark_operation(
     const OperationSpec& operation,
     const ExecutionConfig& config,
     const ExecutionGraph& graph,
-    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup) {
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    const std::string& shape_bucket,
+    const double surrogate_latency_us,
+    const double system_penalty_us) {
     ValidationResult validation;
     switch (operation.op_class) {
     case OperationClass::elementwise_map:
@@ -961,13 +1188,16 @@ BenchmarkRecord benchmark_operation(
         }
     }
 
-    const double effective_latency = executable_on_host ? validation.candidate_latency_us : graph.predicted_latency_us;
+    const double effective_latency = executable_on_host ? validation.candidate_latency_us : surrogate_latency_us;
     BenchmarkRecord record;
     record.operation_name = operation.name;
     record.config_signature = config.signature;
+    record.shape_bucket = shape_bucket;
     record.reference_latency_us = validation.reference_latency_us;
     record.validation_latency_us = validation.candidate_latency_us;
     record.predicted_latency_us = graph.predicted_latency_us;
+    record.surrogate_latency_us = surrogate_latency_us;
+    record.system_penalty_us = system_penalty_us;
     record.effective_latency_us = std::max(0.01, effective_latency);
     record.speedup_vs_reference = validation.reference_latency_us / record.effective_latency_us;
     record.relative_error = validation.relative_error;
@@ -995,26 +1225,64 @@ OperationOptimizationResult optimize_operation(
     const WorkloadSpec& workload,
     const ExecutionPlan& placement,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    const SystemProfile& system,
+    const std::unordered_map<std::string, ExecutionOptimizer::PerformanceSummary>& performance_cache,
+    const std::unordered_map<std::string, bool>& warmed_devices,
+    const std::string& graph_set_signature,
     const ExecutionConfig* cached_config) {
     std::vector<ExecutionConfig> candidates;
     if (cached_config != nullptr) {
         candidates.push_back(*cached_config);
-    } else {
-        candidates = build_candidate_configs(operation, workload, placement, graph_lookup, report_signature);
+    }
+    const auto generated = build_candidate_configs(operation, workload, placement, graph_lookup, system, report_signature);
+    for (const auto& candidate : generated) {
+        const auto duplicate = std::find_if(
+            candidates.begin(),
+            candidates.end(),
+            [&](const ExecutionConfig& existing) {
+                return existing.signature == candidate.signature;
+            });
+        if (duplicate == candidates.end()) {
+            candidates.push_back(candidate);
+        }
     }
 
     if (candidates.empty()) {
         return {};
     }
 
+    const auto shape_bucket = shape_bucket_for(operation);
+
     double best_objective = std::numeric_limits<double>::max();
     OperationOptimizationResult best;
 
     for (auto candidate : candidates) {
         auto graph = build_execution_graph(report_signature, operation, candidate, placement, graph_lookup);
-        auto benchmark = benchmark_operation(operation, candidate, graph, graph_lookup);
+        const double system_penalty_us = compute_surrogate_penalty_us(operation, candidate, system, warmed_devices);
+        double learning_scale = 1.0;
+        if (const auto it = performance_cache.find(performance_key(graph_set_signature, system, shape_bucket, candidate));
+            it != performance_cache.end()) {
+            learning_scale = std::clamp(it->second.average_prediction_scale, 0.50, 2.50);
+            if (it->second.observations < kLearningWarmupSamples) {
+                learning_scale *= 0.97;
+            }
+            if (it->second.average_relative_error > candidate.target_error_tolerance) {
+                learning_scale *= 1.5;
+            }
+        }
 
-        double objective = graph.predicted_latency_us;
+        const double surrogate_latency_us =
+            (graph.predicted_latency_us * system.sustained_slowdown * learning_scale) + system_penalty_us;
+        auto benchmark = benchmark_operation(
+            operation,
+            candidate,
+            graph,
+            graph_lookup,
+            shape_bucket,
+            surrogate_latency_us,
+            system_penalty_us);
+
+        double objective = surrogate_latency_us;
         if (!benchmark.simulated) {
             objective = std::min(objective, benchmark.validation_latency_us);
         }
@@ -1209,7 +1477,8 @@ std::vector<OperationSpec> default_operation_suite(const WorkloadSpec& workload)
 }
 
 ExecutionOptimizer::ExecutionOptimizer(std::filesystem::path cache_path)
-    : cache_path_(std::move(cache_path)) {}
+    : cache_path_(std::move(cache_path)),
+      performance_cache_path_(performance_cache_path_for(cache_path_)) {}
 
 std::filesystem::path ExecutionOptimizer::default_cache_path() {
     try {
@@ -1227,9 +1496,21 @@ OptimizationReport ExecutionOptimizer::optimize(
 
     OptimizationReport report;
     report.placement = placement;
+    report.system_profile = capture_system_profile(workload, graphs);
+    if (!device_sustained_slowdown_.empty()) {
+        double total_slowdown = 0.0;
+        for (const auto& [uid, slowdown] : device_sustained_slowdown_) {
+            (void)uid;
+            total_slowdown += slowdown;
+        }
+        report.system_profile.sustained_slowdown *=
+            std::max(1.0, total_slowdown / static_cast<double>(device_sustained_slowdown_.size()));
+    }
+    report.system_profile.cold_start = warmed_devices_.empty();
 
     const auto operations = default_operation_suite(workload);
     report.signature = build_report_signature(workload, placement, operations);
+    const auto graph_set_signature = summarize_graph_set(graphs);
 
     std::unordered_map<std::string, const HardwareGraph*> graph_lookup;
     graph_lookup.reserve(graphs.size());
@@ -1262,10 +1543,61 @@ OptimizationReport ExecutionOptimizer::optimize(
     for (const auto& operation : operations) {
         const auto cached_it = cached_by_operation.find(operation.name);
         const ExecutionConfig* cached_config = cached_it == cached_by_operation.end() ? nullptr : &cached_it->second;
-        auto result = optimize_operation(report.signature, operation, workload, placement, graph_lookup, cached_config);
+        auto result = optimize_operation(
+            report.signature,
+            operation,
+            workload,
+            placement,
+            graph_lookup,
+            report.system_profile,
+            performance_cache_,
+            warmed_devices_,
+            graph_set_signature,
+            cached_config);
         if (result.config.signature.empty()) {
             continue;
         }
+
+        const auto perf_key = performance_key(
+            graph_set_signature,
+            report.system_profile,
+            result.benchmark.shape_bucket,
+            result.config);
+        auto& summary = performance_cache_[perf_key];
+        summary.shape_bucket = result.benchmark.shape_bucket;
+        summary.config = result.config;
+        ++summary.observations;
+        const double sample_count = static_cast<double>(summary.observations);
+        summary.average_effective_latency_us +=
+            (result.benchmark.effective_latency_us - summary.average_effective_latency_us) / sample_count;
+        summary.average_relative_error +=
+            (result.benchmark.relative_error - summary.average_relative_error) / sample_count;
+        const double prediction_scale =
+            result.graph.predicted_latency_us > 0.0
+                ? (result.benchmark.effective_latency_us / result.graph.predicted_latency_us)
+                : 1.0;
+        summary.average_prediction_scale +=
+            (prediction_scale - summary.average_prediction_scale) / sample_count;
+        summary.average_system_penalty_us +=
+            (result.benchmark.system_penalty_us - summary.average_system_penalty_us) / sample_count;
+
+        for (const auto& device_uid : result.config.participating_devices) {
+            warmed_devices_[device_uid] = true;
+            auto& slowdown = device_sustained_slowdown_[device_uid];
+            if (slowdown <= 0.0) {
+                slowdown = 1.0;
+            }
+            const double observed_slowdown =
+                result.benchmark.predicted_latency_us > 0.0
+                    ? std::clamp(
+                          result.benchmark.effective_latency_us /
+                              std::max(result.benchmark.predicted_latency_us, 1.0),
+                          0.5,
+                          3.0)
+                    : 1.0;
+            slowdown = (slowdown * 0.8) + (observed_slowdown * 0.2);
+        }
+
         persisted_configs.push_back(CachedConfig{
             operation.name,
             result.config});
@@ -1320,6 +1652,46 @@ void ExecutionOptimizer::load_cache() {
             continue;
         }
     }
+
+    std::ifstream performance_input(performance_cache_path_);
+    if (!performance_input.is_open()) {
+        return;
+    }
+
+    while (std::getline(performance_input, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+
+        const auto fields = split_tab(line);
+        if (fields.size() != 18) {
+            continue;
+        }
+
+        try {
+            PerformanceSummary summary;
+            summary.shape_bucket = fields[1];
+            summary.config.operation_name = fields[2];
+            summary.config.strategy = parse_strategy(fields[3]);
+            summary.config.primary_device_uid = fields[4];
+            summary.config.participating_devices = split_csv(fields[5]);
+            summary.config.queue_depth = static_cast<std::uint32_t>(std::stoul(fields[6]));
+            summary.config.stages = static_cast<std::uint32_t>(std::stoul(fields[7]));
+            summary.config.tile_x = static_cast<std::uint32_t>(std::stoul(fields[8]));
+            summary.config.tile_y = static_cast<std::uint32_t>(std::stoul(fields[9]));
+            summary.config.tile_k = static_cast<std::uint32_t>(std::stoul(fields[10]));
+            summary.config.overlap_transfers = std::stoi(fields[11]) != 0;
+            summary.config.use_low_precision = std::stoi(fields[12]) != 0;
+            summary.observations = static_cast<std::uint32_t>(std::stoul(fields[13]));
+            summary.average_effective_latency_us = std::stod(fields[14]);
+            summary.average_relative_error = std::stod(fields[15]);
+            summary.average_prediction_scale = std::stod(fields[16]);
+            summary.average_system_penalty_us = std::stod(fields[17]);
+            performance_cache_[fields[0]] = std::move(summary);
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
 }
 
 void ExecutionOptimizer::persist_cache() const {
@@ -1352,6 +1724,34 @@ void ExecutionOptimizer::persist_cache() const {
                    << (cached.config.use_low_precision ? 1 : 0) << '\t'
                    << cached.config.target_error_tolerance << '\n';
         }
+    }
+
+    std::ofstream performance_output(performance_cache_path_, std::ios::trunc);
+    if (!performance_output.is_open()) {
+        return;
+    }
+
+    performance_output
+        << "# key\tshape_bucket\toperation\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\toverlap\tlow_precision\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_system_penalty\n";
+    for (const auto& [key, summary] : performance_cache_) {
+        performance_output << key << '\t'
+                           << summary.shape_bucket << '\t'
+                           << summary.config.operation_name << '\t'
+                           << to_string(summary.config.strategy) << '\t'
+                           << summary.config.primary_device_uid << '\t'
+                           << join_csv(summary.config.participating_devices) << '\t'
+                           << summary.config.queue_depth << '\t'
+                           << summary.config.stages << '\t'
+                           << summary.config.tile_x << '\t'
+                           << summary.config.tile_y << '\t'
+                           << summary.config.tile_k << '\t'
+                           << (summary.config.overlap_transfers ? 1 : 0) << '\t'
+                           << (summary.config.use_low_precision ? 1 : 0) << '\t'
+                           << summary.observations << '\t'
+                           << summary.average_effective_latency_us << '\t'
+                           << summary.average_relative_error << '\t'
+                           << summary.average_prediction_scale << '\t'
+                           << summary.average_system_penalty_us << '\n';
     }
 }
 

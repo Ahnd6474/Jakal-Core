@@ -65,5 +65,28 @@ int main() {
             << '\n';
     }
 
+    const auto report = runtime.optimize(workload);
+    std::cout << "\nExecution report: " << report.signature << '\n';
+    std::cout << "Execution settings cache: " << (report.loaded_from_cache ? "hit" : "miss") << '\n';
+    std::cout << "System profile: low_spec=" << (report.system_profile.low_spec_mode ? "yes" : "no")
+              << " cold=" << (report.system_profile.cold_start ? "yes" : "no")
+              << " battery=" << (report.system_profile.on_battery ? "yes" : "no")
+              << " free_mem_ratio=" << std::fixed << std::setprecision(3) << report.system_profile.free_memory_ratio
+              << " paging_risk=" << report.system_profile.paging_risk
+              << " sustained=" << report.system_profile.sustained_slowdown
+              << '\n';
+
+    for (const auto& result : report.operations) {
+        std::cout
+            << "  op=" << std::setw(20) << std::left << result.operation.name
+            << " strategy=" << std::setw(12) << gpu::to_string(result.config.strategy)
+            << " devices=" << result.config.participating_devices.size()
+            << " predicted=" << std::fixed << std::setprecision(3) << result.graph.predicted_latency_us << "us"
+            << " surrogate=" << result.benchmark.surrogate_latency_us << "us"
+            << " effective=" << result.benchmark.effective_latency_us << "us"
+            << " error=" << result.benchmark.relative_error
+            << '\n';
+    }
+
     return 0;
 }

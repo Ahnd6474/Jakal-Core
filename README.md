@@ -21,9 +21,13 @@ Implemented now:
 - hierarchical hardware graph model
 - directed, weighted execution and transfer edges
 - planner that partitions work from graph-derived summaries
+- execution-graph builder that maps global placements into signal-flow graphs
+- operation-family optimization across the discovered device set
+- validation microbenchmarks with latency and accuracy recording
+- execution-setting cache persistence
 - plan cache persistence
 - minimal C ABI with graph node and edge inspection
-- example and smoke test targets
+- example and test targets
 
 Not implemented yet:
 
@@ -130,6 +134,62 @@ Inputs from the workload side:
 - matrix-friendly flag
 
 This is still heuristic, but it is aligned with the intended architecture: the optimizer reasons from graph structure and measured-readable hardware properties.
+
+## Execution graph and optimization
+
+The runtime now has two graph layers:
+
+- structural graph: what hardware objects exist and how they relate
+- execution graph: how data, dispatch, compute, aggregation, and synchronization flow across the placed hardware set
+
+The execution graph is built from the structural graph plus the global placement plan. It is not device-class-specific: one optimization pass can pick one device, shard across several, or overlap stages when the graph suggests it is useful.
+
+Current operation families:
+
+- elementwise map
+- reduction
+- blocked matmul
+- 3x3 convolution
+- bilinear resample
+
+For each operation family, the optimizer:
+
+1. generates a small candidate set of execution settings
+2. builds an execution graph for each candidate
+3. predicts latency from graph structure and edge costs
+4. runs a lightweight validation benchmark
+5. records latency and relative error
+6. keeps the fastest candidate that stays inside tolerance
+
+The chosen execution settings are persisted so later runs can rebuild the same execution graph without re-searching from scratch.
+
+Validation is still lightweight. The benchmark path is a correctness and shape-validation loop, not a full backend execution engine.
+
+## Low-spec track and learning cache
+
+The optimizer now always captures a lightweight system profile and can switch into a low-spec track automatically.
+
+Inputs reflected in the surrogate cost:
+
+- cold vs warm execution
+- battery and battery-saver state
+- available memory and paging risk
+- sustained slowdown estimated from prior runs
+- one-time device initialization amortization
+
+When the machine is constrained, the candidate generator becomes more conservative:
+
+- shallower queue depth
+- fewer pipeline stages
+- stronger bias toward streaming
+- reduced bias toward multi-device sharding when paging risk is high
+
+The optimizer also keeps a lightweight shape-bucket performance cache:
+
+- key = graph set, environment bucket, operation family, shape bucket, execution config
+- value = running averages for latency, prediction scale, error, and system penalty
+
+This cache is used by default and grows only with the distinct shapes and environment buckets actually observed. It is meant to stay lightweight while making repeated runs better over time.
 
 ## Build
 

@@ -38,8 +38,15 @@ int main() {
         return 1;
     }
 
+    const auto report = runtime.optimize(workload);
+    if (report.operations.empty()) {
+        std::cerr << "No execution optimizations created.\n";
+        return 1;
+    }
+
     std::cout << "Graphs=" << runtime.devices().size()
               << " allocations=" << plan.allocations.size()
+              << " operations=" << report.operations.size()
               << " cache=" << (plan.loaded_from_cache ? "hit" : "miss")
               << '\n';
 
