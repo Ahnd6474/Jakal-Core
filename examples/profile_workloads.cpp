@@ -56,6 +56,9 @@ int main() {
                   << " reference=" << warm_report.total_reference_runtime_us << "us"
                   << " exec_improvement=" << warm_report.speedup_vs_reference << "x"
                   << " learning_gain=" << (report.total_runtime_us / std::max(warm_report.total_runtime_us, 1.0)) << "x"
+                  << "\n  graph_opt=" << warm_report.optimization.graph_optimization.optimizer_name
+                  << " passes=" << warm_report.optimization.graph_optimization.passes.size()
+                  << " logical_parts=" << warm_report.optimization.graph_optimization.total_logical_partitions
                   << "\n  desc=" << preset.description
                   << "\n  backends host=" << host_ops
                   << " opencl=" << opencl_ops;

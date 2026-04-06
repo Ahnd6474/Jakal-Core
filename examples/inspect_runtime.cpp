@@ -42,6 +42,23 @@ int main() {
         }
     }
 
+    std::cout << "\nGPU toolkit index\n";
+    for (const auto& entry : runtime.gpu_toolkit_index()) {
+        std::cout << "  device=" << entry.device_uid << " variants=" << entry.variants.size() << '\n';
+        for (const auto& variant : entry.variants) {
+            std::cout
+                << "    vendor=" << std::setw(10) << std::left << gpu::to_string(variant.binding.vendor)
+                << " backend=" << std::setw(18) << gpu::to_string(variant.binding.backend)
+                << " adapter=" << std::setw(20) << variant.binding.adapter_id
+                << " executable=" << (variant.executable ? "yes" : "no")
+                << " score=" << std::fixed << std::setprecision(3) << variant.toolkit_score
+                << " wg=(" << variant.tuning.workgroup_x << "," << variant.tuning.workgroup_y << "," << variant.tuning.workgroup_z << ")"
+                << " batch=" << variant.tuning.queue_batch
+                << " rationale=" << variant.rationale
+                << '\n';
+        }
+    }
+
     const gpu::WorkloadSpec workload{
         "sample-inference",
         gpu::WorkloadKind::inference,
@@ -77,12 +94,19 @@ int main() {
               << " paging_risk=" << report.system_profile.paging_risk
               << " sustained=" << report.system_profile.sustained_slowdown
               << '\n';
+    std::cout << "Graph optimizer: " << report.graph_optimization.optimizer_name
+              << " passes=" << report.graph_optimization.passes.size()
+              << " initial=" << report.graph_optimization.initial_objective_us
+              << "us final=" << report.graph_optimization.final_objective_us
+              << "us logical_partitions=" << report.graph_optimization.total_logical_partitions
+              << '\n';
 
     for (const auto& result : report.operations) {
         std::cout
             << "  op=" << std::setw(20) << std::left << result.operation.name
             << " strategy=" << std::setw(12) << gpu::to_string(result.config.strategy)
             << " optimizer=" << std::setw(15) << result.benchmark.optimizer_name
+            << " partitions=" << result.config.logical_partitions
             << " devices=" << result.config.participating_devices.size()
             << " predicted=" << std::fixed << std::setprecision(3) << result.graph.predicted_latency_us << "us"
             << " surrogate=" << result.benchmark.surrogate_latency_us << "us"
@@ -101,6 +125,7 @@ int main() {
         std::cout
             << "  op=" << std::setw(20) << std::left << operation.operation_name
             << " backend=" << std::setw(14) << operation.backend_name
+            << " partitions=" << operation.logical_partitions_used
             << " runtime=" << std::fixed << std::setprecision(3) << operation.runtime_us << "us"
             << " ref=" << operation.reference_runtime_us << "us"
             << " speedup=" << operation.speedup_vs_reference << "x"

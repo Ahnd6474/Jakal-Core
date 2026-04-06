@@ -12,6 +12,10 @@ add_library(gpu_runtime
     src/device.cpp
     src/execution.cpp
     src/executor.cpp
+    src/gpu_l0.cpp
+    src/gpu_toolkit.cpp
+    src/executors/common_scheduler.cpp
+    src/executors/direct_backends.cpp
     src/planner.cpp
     src/workloads.cpp
     src/runtime.cpp

@@ -52,12 +52,16 @@ enum class OptimizationPolicy {
 };
 
 struct ContinuousExecutionState {
-    double queue_depth_scale = 1.0;
-    double stage_scale = 1.0;
-    double tile_scale = 1.0;
-    double overlap_ratio = 0.0;
-    double partition_intensity = 0.0;
-    double precision_mix = 0.0;
+    double queue_depth_raw = 0.0;
+    double stage_raw = 0.0;
+    double tile_raw = 0.0;
+    double overlap_raw = 0.0;
+    double partition_raw = 0.0;
+    double precision_raw = 0.0;
+    double single_device_logit = 1.2;
+    double sharded_logit = -0.8;
+    double streaming_logit = 0.4;
+    double overlapped_logit = 0.6;
 };
 
 struct GraphOptimizationPass {
@@ -205,10 +209,16 @@ struct OptimizationReport {
 
 struct ExecutionFeedbackRecord {
     std::string operation_name;
+    std::string backend_name;
+    std::vector<std::string> participating_devices;
     double runtime_us = 0.0;
     double reference_runtime_us = 0.0;
     double relative_error = 0.0;
     bool verified = false;
+    bool used_host = false;
+    bool used_opencl = false;
+    bool used_multiple_devices = false;
+    std::uint32_t logical_partitions_used = 1;
 };
 
 [[nodiscard]] std::string to_string(OperationClass op_class);
@@ -259,6 +269,7 @@ private:
     std::unordered_map<std::string, PerformanceSummary> performance_cache_;
     std::unordered_map<std::string, double> device_sustained_slowdown_;
     std::unordered_map<std::string, bool> warmed_devices_;
+    std::unordered_map<std::string, double> backend_penalty_cache_;
 };
 
 [[nodiscard]] std::vector<OperationSpec> default_operation_suite(const WorkloadSpec& workload);

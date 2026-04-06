@@ -3,6 +3,7 @@
 #include "gpu/backend.hpp"
 #include "gpu/execution.hpp"
 #include "gpu/executor.hpp"
+#include "gpu/gpu_toolkit.hpp"
 #include "gpu/planner.hpp"
 
 #include <filesystem>
@@ -25,6 +26,7 @@ public:
     void refresh_hardware();
 
     [[nodiscard]] const std::vector<HardwareGraph>& devices() const;
+    [[nodiscard]] const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index() const;
     [[nodiscard]] ExecutionPlan plan(const WorkloadSpec& workload);
     [[nodiscard]] OptimizationReport optimize(const WorkloadSpec& workload);
     [[nodiscard]] DirectExecutionReport execute(const WorkloadSpec& workload);
@@ -36,8 +38,10 @@ private:
     Planner planner_;
     ExecutionOptimizer execution_optimizer_;
     DirectExecutor direct_executor_;
+    GpuToolkit gpu_toolkit_;
     std::vector<std::unique_ptr<IDeviceProbe>> probes_;
     std::vector<HardwareGraph> devices_;
+    std::vector<GpuToolkitIndexEntry> gpu_toolkit_index_;
 };
 
 }  // namespace gpu

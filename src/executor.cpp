@@ -110,6 +110,8 @@ struct DeviceAssignment {
     const HardwareGraph* graph = nullptr;
     double ratio = 0.0;
     ShardRange shard;
+    std::uint32_t logical_partition_index = 0;
+    std::uint32_t logical_partition_count = 1;
 };
 
 struct OperationData {
@@ -151,7 +153,8 @@ std::vector<DeviceAssignment> make_assignments(
     }
 
     std::vector<DeviceAssignment> assignments;
-    assignments.reserve(operation.config.participating_devices.size());
+    assignments.reserve(
+        operation.config.participating_devices.size() * static_cast<std::size_t>(std::max(operation.config.logical_partitions, 1u)));
     std::size_t consumed = 0;
 
     for (std::size_t index = 0; index < operation.config.participating_devices.size(); ++index) {
@@ -171,10 +174,25 @@ std::vector<DeviceAssignment> make_assignments(
             count = std::min(count, remaining);
         }
 
-        assignments.push_back(DeviceAssignment{
-            graph_it->second,
-            ratio,
-            {consumed, count}});
+        const auto partitions = std::max(operation.config.logical_partitions, 1u);
+        std::size_t local_consumed = 0;
+        for (std::uint32_t partition = 0; partition < partitions; ++partition) {
+            std::size_t partition_count = 0;
+            if (partition + 1 == partitions) {
+                partition_count = count - local_consumed;
+            } else {
+                partition_count = static_cast<std::size_t>(
+                    std::llround(static_cast<double>(count) / static_cast<double>(partitions)));
+                partition_count = std::min(partition_count, count - local_consumed);
+            }
+            assignments.push_back(DeviceAssignment{
+                graph_it->second,
+                ratio / static_cast<double>(partitions),
+                {consumed + local_consumed, partition_count},
+                partition,
+                partitions});
+            local_consumed += partition_count;
+        }
         consumed += count;
     }
 
@@ -1549,6 +1567,7 @@ DirectExecutionReport DirectExecutor::execute(
         record.backend_name = mixed_backend_name(assignments);
         record.participating_devices = optimized.config.participating_devices;
         record.used_multiple_devices = assignments.size() > 1;
+        record.logical_partitions_used = optimized.config.logical_partitions;
 
         for (const auto& assignment : assignments) {
             record.used_host = record.used_host || assignment.graph->probe == "host";

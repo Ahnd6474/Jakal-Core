@@ -19,6 +19,7 @@ struct OperationExecutionRecord {
     bool used_host = false;
     bool used_opencl = false;
     bool used_multiple_devices = false;
+    std::uint32_t logical_partitions_used = 1;
 };
 
 struct DirectExecutionReport {

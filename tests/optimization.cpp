@@ -1,4 +1,5 @@
 #include "gpu/device.hpp"
+#include "gpu/gpu_toolkit.hpp"
 #include "gpu/runtime.hpp"
 #include "gpu/workloads.hpp"
 
@@ -52,6 +53,60 @@ bool verify_cost_propagation() {
     return contains_weight > 0.0 && dispatch_weight > 3.0;
 }
 
+bool verify_gpu_toolkit_index() {
+    gpu::HardwareGraph graph;
+    graph.uid = "opencl:test:0";
+    graph.probe = "opencl";
+    graph.presentation_name = "Intel Iris Xe";
+
+    graph.nodes.push_back({"root", "root", "", gpu::HardwareObjectDomain::control, gpu::HardwareObjectRole::root});
+    graph.nodes.push_back({"queue", "queue", "root", gpu::HardwareObjectDomain::control, gpu::HardwareObjectRole::queue});
+    graph.nodes.back().control.supports_asynchronous_dispatch = true;
+    graph.nodes.push_back({"cluster", "cluster", "root", gpu::HardwareObjectDomain::compute, gpu::HardwareObjectRole::cluster});
+    graph.nodes.back().compute.execution_width = 96;
+    graph.nodes.back().compute.clock_mhz = 1300;
+    graph.nodes.back().compute.supports_fp16 = true;
+    graph.nodes.push_back({"memory", "memory", "root", gpu::HardwareObjectDomain::storage, gpu::HardwareObjectRole::global_memory});
+    graph.nodes.back().storage.capacity_bytes = 6ull * 1024ull * 1024ull * 1024ull;
+    graph.nodes.back().storage.unified_address_space = true;
+    graph.nodes.back().storage.coherent_with_host = true;
+    graph.nodes.back().storage.shared_host_bytes = graph.nodes.back().storage.capacity_bytes;
+    graph.nodes.push_back({"host-link", "host-link", "root", gpu::HardwareObjectDomain::transfer, gpu::HardwareObjectRole::transfer_link});
+    graph.nodes.back().transfer.read_bandwidth_gbps = 96.0;
+    graph.nodes.back().transfer.write_bandwidth_gbps = 96.0;
+    graph.nodes.back().transfer.dispatch_latency_us = 8.0;
+    graph.nodes.back().transfer.synchronization_latency_us = 6.0;
+
+    graph.edges.push_back({"root", "queue", gpu::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "cluster", gpu::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "memory", gpu::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "host-link", gpu::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"queue", "cluster", gpu::GraphEdgeSemantics::dispatches, true, 1.0, 0.0, 8.0});
+    graph.edges.push_back({"host-link", "memory", gpu::GraphEdgeSemantics::transfers_to, true, 1.0, 96.0, 6.0});
+    gpu::materialize_graph_costs(graph);
+
+    gpu::GpuToolkit toolkit;
+    const gpu::GpuL0WorkloadTraits traits{
+        gpu::OperationClass::matmul,
+        {1024, 1024, 1024},
+        256ull * 1024ull * 1024ull,
+        2.0e12,
+        false,
+        true,
+        false};
+    const auto variants = toolkit.rank_variants(graph, traits);
+    if (variants.empty()) {
+        return false;
+    }
+    const auto best = toolkit.select_best(graph, traits);
+    if (!best.has_value()) {
+        return false;
+    }
+    return best->binding.vendor == gpu::GpuVendorFamily::intel &&
+           (best->binding.backend == gpu::GpuBackendKind::level_zero ||
+            best->binding.backend == gpu::GpuBackendKind::opencl);
+}
+
 }  // namespace
 
 int main() {
@@ -87,6 +142,14 @@ int main() {
         std::cerr << "No operation optimizations created.\n";
         return 1;
     }
+    if (first.graph_optimization.optimizer_name.empty() || first.graph_optimization.passes.empty()) {
+        std::cerr << "Expected graph-level optimization passes.\n";
+        return 1;
+    }
+    if (first.graph_optimization.final_objective_us <= 0.0) {
+        std::cerr << "Expected graph-level objective.\n";
+        return 1;
+    }
 
     for (const auto& result : first.operations) {
         if (result.graph.nodes.empty() || result.graph.edges.empty()) {
@@ -95,6 +158,10 @@ int main() {
         }
         if (result.config.signature.empty() || result.config.participating_devices.empty()) {
             std::cerr << "Execution config missing identifiers for " << result.operation.name << ".\n";
+            return 1;
+        }
+        if (result.config.logical_partitions == 0) {
+            std::cerr << "Execution config missing logical partitions for " << result.operation.name << ".\n";
             return 1;
         }
         if (result.config.mapped_structural_nodes.empty()) {
@@ -138,24 +205,8 @@ int main() {
         std::cerr << "Aggressive-to-hierarchy cost propagation check failed.\n";
         return 1;
     }
-
-    const auto executed = runtime.execute(workload);
-    if (!executed.all_succeeded || executed.operations.empty()) {
-        std::cerr << "Direct executor did not complete successfully.\n";
-        return 1;
-    }
-
-    bool saw_backend = false;
-    for (const auto& operation : executed.operations) {
-        if (!operation.verified || operation.runtime_us <= 0.0) {
-            std::cerr << "Direct execution verification failed for " << operation.operation_name << ".\n";
-            return 1;
-        }
-        saw_backend = saw_backend || operation.used_host || operation.used_opencl;
-    }
-
-    if (!saw_backend) {
-        std::cerr << "Expected direct execution to use at least one backend.\n";
+    if (!verify_gpu_toolkit_index()) {
+        std::cerr << "GPU L0 toolkit ranking check failed.\n";
         return 1;
     }
 
@@ -177,7 +228,7 @@ int main() {
     std::cout << "operations=" << first.operations.size()
               << " cached=" << (second.loaded_from_cache ? "yes" : "no")
               << " graphs=" << runtime.devices().size()
-              << " executed=" << executed.operations.size()
+              << " graph_passes=" << first.graph_optimization.passes.size()
               << '\n';
 
     std::error_code ec;

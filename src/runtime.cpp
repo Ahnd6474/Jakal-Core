@@ -14,10 +14,16 @@ std::vector<ExecutionFeedbackRecord> make_feedback_records(const DirectExecution
     for (const auto& operation : report.operations) {
         feedback.push_back(ExecutionFeedbackRecord{
             operation.operation_name,
+            operation.backend_name,
+            operation.participating_devices,
             operation.runtime_us,
             operation.reference_runtime_us,
             operation.relative_error,
-            operation.verified});
+            operation.verified,
+            operation.used_host,
+            operation.used_opencl,
+            operation.used_multiple_devices,
+            operation.logical_partitions_used});
     }
     return feedback;
 }
@@ -85,6 +91,7 @@ Runtime::Runtime(RuntimeOptions options)
 
 void Runtime::refresh_hardware() {
     devices_.clear();
+    gpu_toolkit_index_.clear();
 
     for (auto& probe : probes_) {
         if (!probe->available()) {
@@ -113,10 +120,16 @@ void Runtime::refresh_hardware() {
         }
         return structural_fingerprint(left) < structural_fingerprint(right);
     });
+
+    gpu_toolkit_index_ = gpu_toolkit_.build_index(devices_);
 }
 
 const std::vector<HardwareGraph>& Runtime::devices() const {
     return devices_;
+}
+
+const std::vector<GpuToolkitIndexEntry>& Runtime::gpu_toolkit_index() const {
+    return gpu_toolkit_index_;
 }
 
 ExecutionPlan Runtime::plan(const WorkloadSpec& workload) {
