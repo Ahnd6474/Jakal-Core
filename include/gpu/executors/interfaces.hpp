@@ -33,6 +33,8 @@ struct BackendRunResult {
     double scalar_output = 0.0;
     double runtime_us = 0.0;
     bool success = false;
+    bool used_host = true;
+    bool used_opencl = false;
     std::string error;
 };
 

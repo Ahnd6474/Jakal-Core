@@ -104,6 +104,59 @@ typedef struct gpu_plan_entry {
     double score;
 } gpu_plan_entry;
 
+typedef struct gpu_optimization_info {
+    char signature[128];
+    char workload_kind[32];
+    char dataset_tag[128];
+    unsigned long long operation_count;
+    unsigned long long tensor_count;
+    unsigned long long dependency_count;
+    double readiness_score;
+    double stability_score;
+    double sustained_slowdown;
+    int loaded_from_cache;
+} gpu_optimization_info;
+
+typedef struct gpu_operation_optimization_info {
+    char operation_name[128];
+    char strategy[32];
+    char primary_device_uid[128];
+    unsigned int logical_partitions;
+    unsigned int participating_device_count;
+    double predicted_latency_us;
+    double predicted_speedup_vs_reference;
+    double predicted_transfer_latency_us;
+    double predicted_memory_pressure;
+    unsigned long long peak_resident_bytes;
+    double target_error_tolerance;
+    int use_low_precision;
+} gpu_operation_optimization_info;
+
+typedef struct gpu_execution_info {
+    char signature[128];
+    unsigned long long operation_count;
+    double total_runtime_us;
+    double total_reference_runtime_us;
+    double speedup_vs_reference;
+    int all_succeeded;
+} gpu_execution_info;
+
+typedef struct gpu_execution_operation_info {
+    char operation_name[128];
+    char backend_name[64];
+    char requested_gpu_vendor[32];
+    char requested_gpu_backend[32];
+    double runtime_us;
+    double reference_runtime_us;
+    double speedup_vs_reference;
+    double relative_error;
+    int verified;
+    int used_host;
+    int used_opencl;
+    int used_multiple_devices;
+    unsigned int logical_partitions_used;
+} gpu_execution_operation_info;
+
 gpu_runtime_t* gpu_runtime_create(void);
 void gpu_runtime_destroy(gpu_runtime_t* runtime);
 int gpu_runtime_refresh(gpu_runtime_t* runtime);
@@ -128,6 +181,20 @@ int gpu_runtime_plan(
     size_t capacity,
     size_t* out_count,
     int* out_loaded_from_cache);
+int gpu_runtime_optimize(
+    gpu_runtime_t* runtime,
+    const gpu_workload_spec* workload,
+    gpu_optimization_info* out_optimization,
+    gpu_operation_optimization_info* operations,
+    size_t capacity,
+    size_t* out_count);
+int gpu_runtime_execute(
+    gpu_runtime_t* runtime,
+    const gpu_workload_spec* workload,
+    gpu_execution_info* out_execution,
+    gpu_execution_operation_info* operations,
+    size_t capacity,
+    size_t* out_count);
 
 #ifdef __cplusplus
 }
