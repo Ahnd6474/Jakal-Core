@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu/backend.hpp"
+#include "gpu/execution.hpp"
 #include "gpu/planner.hpp"
 
 #include <filesystem>
@@ -13,6 +14,7 @@ struct RuntimeOptions {
     bool enable_host_probe = true;
     bool enable_opencl_probe = true;
     std::filesystem::path cache_path;
+    std::filesystem::path execution_cache_path;
 };
 
 class Runtime {
@@ -23,12 +25,14 @@ public:
 
     [[nodiscard]] const std::vector<HardwareGraph>& devices() const;
     [[nodiscard]] ExecutionPlan plan(const WorkloadSpec& workload);
+    [[nodiscard]] OptimizationReport optimize(const WorkloadSpec& workload);
 
 private:
     [[nodiscard]] bool should_include_descriptor(const HardwareGraph& candidate) const;
 
     RuntimeOptions options_;
     Planner planner_;
+    ExecutionOptimizer execution_optimizer_;
     std::vector<std::unique_ptr<IDeviceProbe>> probes_;
     std::vector<HardwareGraph> devices_;
 };

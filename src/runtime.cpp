@@ -7,7 +7,11 @@ namespace gpu {
 
 Runtime::Runtime(RuntimeOptions options)
     : options_(std::move(options)),
-      planner_(options_.cache_path.empty() ? Planner::default_cache_path() : options_.cache_path) {
+      planner_(options_.cache_path.empty() ? Planner::default_cache_path() : options_.cache_path),
+      execution_optimizer_(
+          options_.execution_cache_path.empty()
+              ? ExecutionOptimizer::default_cache_path()
+              : options_.execution_cache_path) {
     if (options_.enable_host_probe) {
         probes_.push_back(make_host_probe());
     }
@@ -59,6 +63,15 @@ ExecutionPlan Runtime::plan(const WorkloadSpec& workload) {
     }
 
     return planner_.build_plan(workload, devices_);
+}
+
+OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
+    if (devices_.empty()) {
+        refresh_hardware();
+    }
+
+    const auto placement = planner_.build_plan(workload, devices_);
+    return execution_optimizer_.optimize(workload, placement, devices_);
 }
 
 bool Runtime::should_include_descriptor(const HardwareGraph& candidate) const {

@@ -10,6 +10,7 @@ option(GPU_BUILD_TESTS "Build test targets" ON)
 
 add_library(gpu_runtime
     src/device.cpp
+    src/execution.cpp
     src/planner.cpp
     src/runtime.cpp
     src/c_api.cpp
@@ -47,4 +48,9 @@ if(GPU_BUILD_TESTS)
     target_link_libraries(gpu_smoke PRIVATE gpu::runtime)
 
     add_test(NAME gpu_smoke COMMAND gpu_smoke)
+
+    add_executable(gpu_optimization tests/optimization.cpp)
+    target_link_libraries(gpu_optimization PRIVATE gpu::runtime)
+
+    add_test(NAME gpu_optimization COMMAND gpu_optimization)
 endif()
