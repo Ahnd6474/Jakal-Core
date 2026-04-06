@@ -1,0 +1,17 @@
+.idea/
+.venv/
+build/
+out/
+
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.dylib
+
+gpu_runtime_plan_cache.tsv
