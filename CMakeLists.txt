@@ -13,6 +13,7 @@ add_library(gpu_runtime
     src/execution.cpp
     src/executor.cpp
     src/planner.cpp
+    src/workloads.cpp
     src/runtime.cpp
     src/c_api.cpp
     src/backends/cpu_backend.cpp
@@ -40,6 +41,9 @@ endif()
 if(GPU_BUILD_EXAMPLES)
     add_executable(gpu_inspect examples/inspect_runtime.cpp)
     target_link_libraries(gpu_inspect PRIVATE gpu::runtime)
+
+    add_executable(gpu_profile_workloads examples/profile_workloads.cpp)
+    target_link_libraries(gpu_profile_workloads PRIVATE gpu::runtime)
 endif()
 
 if(GPU_BUILD_TESTS)

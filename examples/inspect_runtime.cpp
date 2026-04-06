@@ -45,6 +45,7 @@ int main() {
     const gpu::WorkloadSpec workload{
         "sample-inference",
         gpu::WorkloadKind::inference,
+        "",
         4ull * 1024ull * 1024ull * 1024ull,
         512ull * 1024ull * 1024ull,
         30.0e12,
@@ -69,8 +70,9 @@ int main() {
     std::cout << "\nExecution report: " << report.signature << '\n';
     std::cout << "Execution settings cache: " << (report.loaded_from_cache ? "hit" : "miss") << '\n';
     std::cout << "System profile: low_spec=" << (report.system_profile.low_spec_mode ? "yes" : "no")
-              << " cold=" << (report.system_profile.cold_start ? "yes" : "no")
               << " battery=" << (report.system_profile.on_battery ? "yes" : "no")
+              << " readiness=" << std::fixed << std::setprecision(3) << report.system_profile.readiness_score
+              << " stability=" << report.system_profile.stability_score
               << " free_mem_ratio=" << std::fixed << std::setprecision(3) << report.system_profile.free_memory_ratio
               << " paging_risk=" << report.system_profile.paging_risk
               << " sustained=" << report.system_profile.sustained_slowdown
@@ -80,22 +82,28 @@ int main() {
         std::cout
             << "  op=" << std::setw(20) << std::left << result.operation.name
             << " strategy=" << std::setw(12) << gpu::to_string(result.config.strategy)
+            << " optimizer=" << std::setw(15) << result.benchmark.optimizer_name
             << " devices=" << result.config.participating_devices.size()
             << " predicted=" << std::fixed << std::setprecision(3) << result.graph.predicted_latency_us << "us"
             << " surrogate=" << result.benchmark.surrogate_latency_us << "us"
             << " effective=" << result.benchmark.effective_latency_us << "us"
+            << " objective=" << result.benchmark.objective_score
             << " error=" << result.benchmark.relative_error
             << '\n';
     }
 
     const auto executed = runtime.execute(workload);
     std::cout << "\nDirect execution: " << (executed.all_succeeded ? "ok" : "failed") << '\n';
+    std::cout << "Total runtime=" << std::fixed << std::setprecision(3) << executed.total_runtime_us
+              << "us reference=" << executed.total_reference_runtime_us
+              << "us improvement=" << executed.speedup_vs_reference << "x\n";
     for (const auto& operation : executed.operations) {
         std::cout
             << "  op=" << std::setw(20) << std::left << operation.operation_name
             << " backend=" << std::setw(14) << operation.backend_name
             << " runtime=" << std::fixed << std::setprecision(3) << operation.runtime_us << "us"
             << " ref=" << operation.reference_runtime_us << "us"
+            << " speedup=" << operation.speedup_vs_reference << "x"
             << " error=" << operation.relative_error
             << '\n';
     }

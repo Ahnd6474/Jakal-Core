@@ -41,6 +41,44 @@ enum class ExecutionStrategy {
     overlapped
 };
 
+enum class OptimizationPolicy {
+    heuristic_greedy,
+    learned_greedy,
+    trace_replay,
+    ucb_explore,
+    reinforce_softmax,
+    spsa_local_search,
+    adam_surrogate
+};
+
+struct ContinuousExecutionState {
+    double queue_depth_scale = 1.0;
+    double stage_scale = 1.0;
+    double tile_scale = 1.0;
+    double overlap_ratio = 0.0;
+    double partition_intensity = 0.0;
+    double precision_mix = 0.0;
+};
+
+struct GraphOptimizationPass {
+    std::uint32_t pass_index = 0;
+    double objective_us = 0.0;
+    double gradient_norm = 0.0;
+    double learning_rate = 0.0;
+    ContinuousExecutionState state;
+};
+
+struct GraphOptimizationSummary {
+    std::string optimizer_name;
+    ContinuousExecutionState initial_state;
+    ContinuousExecutionState final_state;
+    std::vector<GraphOptimizationPass> passes;
+    double initial_objective_us = 0.0;
+    double final_objective_us = 0.0;
+    std::uint32_t total_logical_partitions = 0;
+    bool converged = false;
+};
+
 struct OperationSpec {
     std::string name;
     OperationClass op_class = OperationClass::elementwise_map;
@@ -101,14 +139,20 @@ struct ExecutionConfig {
     std::uint32_t tile_x = 0;
     std::uint32_t tile_y = 0;
     std::uint32_t tile_k = 0;
+    std::uint32_t logical_partitions = 1;
     bool overlap_transfers = false;
     bool use_low_precision = false;
     double target_error_tolerance = 1.0e-4;
+    double queue_depth_scale = 1.0;
+    double stage_scale = 1.0;
+    double tile_scale = 1.0;
+    double overlap_ratio = 0.0;
+    double partition_intensity = 0.0;
+    double precision_mix = 0.0;
 };
 
 struct SystemProfile {
     bool low_spec_mode = false;
-    bool cold_start = true;
     bool on_battery = false;
     bool battery_saver = false;
     double battery_percent = 100.0;
@@ -116,6 +160,8 @@ struct SystemProfile {
     double free_memory_ratio = 1.0;
     double paging_risk = 0.0;
     double sustained_slowdown = 1.0;
+    double readiness_score = 0.0;
+    double stability_score = 1.0;
     double initialization_penalty_us = 0.0;
     double amortization_gain = 1.0;
 };
@@ -124,12 +170,15 @@ struct BenchmarkRecord {
     std::string operation_name;
     std::string config_signature;
     std::string shape_bucket;
+    std::string optimizer_name;
     double reference_latency_us = 0.0;
     double validation_latency_us = 0.0;
     double predicted_latency_us = 0.0;
     double surrogate_latency_us = 0.0;
     double effective_latency_us = 0.0;
     double system_penalty_us = 0.0;
+    double objective_score = 0.0;
+    double trace_weight = 1.0;
     double speedup_vs_reference = 1.0;
     double relative_error = 0.0;
     bool accuracy_within_tolerance = true;
@@ -145,9 +194,12 @@ struct OperationOptimizationResult {
 
 struct OptimizationReport {
     std::string signature;
+    WorkloadKind workload_kind = WorkloadKind::custom;
+    std::string dataset_tag;
     ExecutionPlan placement;
     std::vector<OperationOptimizationResult> operations;
     SystemProfile system_profile;
+    GraphOptimizationSummary graph_optimization;
     bool loaded_from_cache = false;
 };
 
@@ -163,6 +215,7 @@ struct ExecutionFeedbackRecord {
 [[nodiscard]] std::string to_string(ExecutionNodeKind kind);
 [[nodiscard]] std::string to_string(ExecutionEdgeKind kind);
 [[nodiscard]] std::string to_string(ExecutionStrategy strategy);
+[[nodiscard]] std::string to_string(OptimizationPolicy policy);
 
 class ExecutionOptimizer {
 public:
@@ -174,6 +227,7 @@ public:
         double average_relative_error = 0.0;
         double average_prediction_scale = 1.0;
         double average_system_penalty_us = 0.0;
+        double average_reward = 0.0;
     };
 
     [[nodiscard]] static std::filesystem::path default_cache_path();

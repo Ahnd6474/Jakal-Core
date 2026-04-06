@@ -16,6 +16,7 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -216,8 +217,8 @@ public:
     }
 
     BackendRunResult run_elementwise(
-        const std::vector<float>& lhs,
-        const std::vector<float>& rhs,
+        const std::span<const float> lhs,
+        const std::span<const float> rhs,
         const bool low_precision) const {
         BackendRunResult result;
         result.output.resize(lhs.size(), 0.0f);
@@ -248,7 +249,7 @@ public:
         return result;
     }
 
-    BackendRunResult run_reduction(const std::vector<float>& input, const bool low_precision) const {
+    BackendRunResult run_reduction(const std::span<const float> input, const bool low_precision) const {
         BackendRunResult result;
         result.runtime_us = measure_us([&]() {
             const std::size_t workers = std::max<std::size_t>(1u, std::thread::hardware_concurrency());
@@ -284,8 +285,8 @@ public:
     }
 
     BackendRunResult run_matmul(
-        const std::vector<float>& lhs,
-        const std::vector<float>& rhs,
+        const std::span<const float> lhs,
+        const std::span<const float> rhs,
         const std::uint32_t rows,
         const std::uint32_t columns,
         const std::uint32_t depth,
@@ -326,7 +327,7 @@ public:
     }
 
     BackendRunResult run_conv3x3(
-        const std::vector<float>& input,
+        const std::span<const float> input,
         const std::uint32_t height,
         const std::uint32_t width,
         const bool low_precision) const {
@@ -360,7 +361,7 @@ public:
     }
 
     BackendRunResult run_resample(
-        const std::vector<float>& input,
+        const std::span<const float> input,
         const std::uint32_t src_h,
         const std::uint32_t src_w,
         const std::uint32_t dst_h,
@@ -809,6 +810,24 @@ private:
             : api_(api) {}
 
         ~DeviceContext() {
+            for (auto& [name, kernel] : strict_kernels) {
+                (void)name;
+                if (kernel != nullptr) {
+                    api_.release_kernel()(kernel);
+                }
+            }
+            for (auto& [name, kernel] : fast_kernels) {
+                (void)name;
+                if (kernel != nullptr) {
+                    api_.release_kernel()(kernel);
+                }
+            }
+            for (auto& [name, entry] : buffers) {
+                (void)name;
+                if (entry.memory != nullptr) {
+                    api_.release_mem_object()(entry.memory);
+                }
+            }
             if (strict_program != nullptr) {
                 api_.release_program()(strict_program);
             }
@@ -824,10 +843,19 @@ private:
         }
 
         const OpenClApi& api_;
+        struct BufferEntry {
+            cl_mem memory = nullptr;
+            size_t capacity = 0;
+            cl_mem_flags flags = 0;
+        };
         cl_context context = nullptr;
         cl_command_queue queue = nullptr;
         cl_program strict_program = nullptr;
         cl_program fast_program = nullptr;
+        std::unordered_map<std::string, cl_kernel> strict_kernels;
+        std::unordered_map<std::string, cl_kernel> fast_kernels;
+        std::unordered_map<std::string, BufferEntry> buffers;
+        std::mutex execution_mutex;
     };
 
     OpenClApi api_;
@@ -959,6 +987,82 @@ private:
         return buffer;
     }
 
+    cl_kernel ensure_kernel(
+        const std::shared_ptr<DeviceContext>& context,
+        const cl_program program,
+        const bool low_precision,
+        const char* kernel_name) const {
+        auto& kernels = low_precision ? context->fast_kernels : context->strict_kernels;
+        if (const auto existing = kernels.find(kernel_name); existing != kernels.end()) {
+            return existing->second;
+        }
+
+        cl_int error = CL_SUCCESS;
+        auto kernel = api_.create_kernel()(program, kernel_name, &error);
+        if (error != CL_SUCCESS || kernel == nullptr) {
+            return nullptr;
+        }
+        kernels.emplace(kernel_name, kernel);
+        return kernel;
+    }
+
+    cl_mem acquire_buffer(
+        const std::shared_ptr<DeviceContext>& context,
+        const std::string& key,
+        const cl_mem_flags flags,
+        const size_t bytes) const {
+        auto& entry = context->buffers[key];
+        if (entry.memory != nullptr && entry.capacity >= bytes && entry.flags == flags) {
+            return entry.memory;
+        }
+
+        if (entry.memory != nullptr) {
+            api_.release_mem_object()(entry.memory);
+            entry.memory = nullptr;
+            entry.capacity = 0;
+        }
+
+        entry.memory = create_buffer_or_null(context, flags, bytes);
+        if (entry.memory == nullptr) {
+            return nullptr;
+        }
+        entry.capacity = bytes;
+        entry.flags = flags;
+        return entry.memory;
+    }
+
+    bool write_buffer(
+        const std::shared_ptr<DeviceContext>& context,
+        const cl_mem buffer,
+        const std::span<const float> data) const {
+        return api_.enqueue_write_buffer()(
+                   context->queue,
+                   buffer,
+                   CL_TRUE,
+                   0,
+                   data.size_bytes(),
+                   data.data(),
+                   0,
+                   nullptr,
+                   nullptr) == CL_SUCCESS;
+    }
+
+    bool read_buffer(
+        const std::shared_ptr<DeviceContext>& context,
+        const cl_mem buffer,
+        std::span<float> data) const {
+        return api_.enqueue_read_buffer()(
+                   context->queue,
+                   buffer,
+                   CL_TRUE,
+                   0,
+                   data.size_bytes(),
+                   data.data(),
+                   0,
+                   nullptr,
+                   nullptr) == CL_SUCCESS;
+    }
+
     BackendRunResult failure(std::string message) const {
         BackendRunResult result;
         result.error = std::move(message);
@@ -968,8 +1072,8 @@ private:
 public:
     BackendRunResult run_elementwise(
         const HardwareGraph& graph,
-        const std::vector<float>& lhs,
-        const std::vector<float>& rhs,
+        const std::span<const float> lhs,
+        const std::span<const float> rhs,
         const bool low_precision) const {
         const auto context = acquire_context(graph);
         if (context == nullptr) {
@@ -983,25 +1087,23 @@ public:
         BackendRunResult result;
         result.output.resize(lhs.size(), 0.0f);
         result.runtime_us = measure_us([&]() {
+            std::scoped_lock execution_lock(context->execution_mutex);
             cl_int error = CL_SUCCESS;
-            cl_kernel kernel = api_.create_kernel()(program, "elementwise_map", &error);
+            cl_kernel kernel = ensure_kernel(context, program, low_precision, "elementwise_map");
             if (error != CL_SUCCESS || kernel == nullptr) {
                 return;
             }
 
-            cl_mem lhs_buffer = create_buffer_or_null(context, CL_MEM_READ_ONLY, lhs.size() * sizeof(float));
-            cl_mem rhs_buffer = create_buffer_or_null(context, CL_MEM_READ_ONLY, rhs.size() * sizeof(float));
-            cl_mem out_buffer = create_buffer_or_null(context, CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
+            cl_mem lhs_buffer = acquire_buffer(context, "elementwise.lhs", CL_MEM_READ_ONLY, lhs.size_bytes());
+            cl_mem rhs_buffer = acquire_buffer(context, "elementwise.rhs", CL_MEM_READ_ONLY, rhs.size_bytes());
+            cl_mem out_buffer = acquire_buffer(context, "elementwise.out", CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
             if (lhs_buffer == nullptr || rhs_buffer == nullptr || out_buffer == nullptr) {
-                if (lhs_buffer) api_.release_mem_object()(lhs_buffer);
-                if (rhs_buffer) api_.release_mem_object()(rhs_buffer);
-                if (out_buffer) api_.release_mem_object()(out_buffer);
-                api_.release_kernel()(kernel);
                 return;
             }
 
-            api_.enqueue_write_buffer()(context->queue, lhs_buffer, CL_TRUE, 0, lhs.size() * sizeof(float), lhs.data(), 0, nullptr, nullptr);
-            api_.enqueue_write_buffer()(context->queue, rhs_buffer, CL_TRUE, 0, rhs.size() * sizeof(float), rhs.data(), 0, nullptr, nullptr);
+            if (!write_buffer(context, lhs_buffer, lhs) || !write_buffer(context, rhs_buffer, rhs)) {
+                return;
+            }
             const cl_uint count = static_cast<cl_uint>(lhs.size());
             const cl_int low = low_precision ? 1 : 0;
             api_.set_kernel_arg()(kernel, 0, sizeof(cl_mem), &lhs_buffer);
@@ -1014,11 +1116,9 @@ public:
             const size_t rounded = ((global + local - 1u) / local) * local;
             api_.enqueue_nd_range_kernel()(context->queue, kernel, 1, nullptr, &rounded, &local, 0, nullptr, nullptr);
             api_.finish()(context->queue);
-            api_.enqueue_read_buffer()(context->queue, out_buffer, CL_TRUE, 0, result.output.size() * sizeof(float), result.output.data(), 0, nullptr, nullptr);
-            api_.release_mem_object()(lhs_buffer);
-            api_.release_mem_object()(rhs_buffer);
-            api_.release_mem_object()(out_buffer);
-            api_.release_kernel()(kernel);
+            if (!read_buffer(context, out_buffer, std::span<float>(result.output))) {
+                return;
+            }
             result.success = true;
         });
         return result;
@@ -1026,7 +1126,7 @@ public:
 
     BackendRunResult run_reduction(
         const HardwareGraph& graph,
-        const std::vector<float>& input,
+        const std::span<const float> input,
         const bool low_precision) const {
         const auto context = acquire_context(graph);
         if (context == nullptr) {
@@ -1039,9 +1139,9 @@ public:
 
         BackendRunResult result;
         result.runtime_us = measure_us([&]() {
-            cl_int error = CL_SUCCESS;
-            cl_kernel kernel = api_.create_kernel()(program, "reduce_sum", &error);
-            if (error != CL_SUCCESS || kernel == nullptr) {
+            std::scoped_lock execution_lock(context->execution_mutex);
+            cl_kernel kernel = ensure_kernel(context, program, low_precision, "reduce_sum");
+            if (kernel == nullptr) {
                 return;
             }
 
@@ -1052,16 +1152,16 @@ public:
             const size_t groups = global / local;
             std::vector<float> partials(groups, 0.0f);
 
-            cl_mem in_buffer = create_buffer_or_null(context, CL_MEM_READ_ONLY, input.size() * sizeof(float));
-            cl_mem partial_buffer = create_buffer_or_null(context, CL_MEM_WRITE_ONLY, partials.size() * sizeof(float));
+            cl_mem in_buffer = acquire_buffer(context, "reduction.in", CL_MEM_READ_ONLY, input.size_bytes());
+            cl_mem partial_buffer =
+                acquire_buffer(context, "reduction.partial", CL_MEM_WRITE_ONLY, partials.size() * sizeof(float));
             if (in_buffer == nullptr || partial_buffer == nullptr) {
-                if (in_buffer) api_.release_mem_object()(in_buffer);
-                if (partial_buffer) api_.release_mem_object()(partial_buffer);
-                api_.release_kernel()(kernel);
                 return;
             }
 
-            api_.enqueue_write_buffer()(context->queue, in_buffer, CL_TRUE, 0, input.size() * sizeof(float), input.data(), 0, nullptr, nullptr);
+            if (!write_buffer(context, in_buffer, input)) {
+                return;
+            }
             const cl_uint count = static_cast<cl_uint>(input.size());
             const cl_int low = low_precision ? 1 : 0;
             api_.set_kernel_arg()(kernel, 0, sizeof(cl_mem), &in_buffer);
@@ -1071,15 +1171,14 @@ public:
             api_.set_kernel_arg()(kernel, 4, local * sizeof(float), nullptr);
             api_.enqueue_nd_range_kernel()(context->queue, kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
             api_.finish()(context->queue);
-            api_.enqueue_read_buffer()(context->queue, partial_buffer, CL_TRUE, 0, partials.size() * sizeof(float), partials.data(), 0, nullptr, nullptr);
+            if (!read_buffer(context, partial_buffer, std::span<float>(partials))) {
+                return;
+            }
             float total = 0.0f;
             for (const auto value : partials) {
                 total = quantize_value(total + value, low_precision);
             }
             result.scalar_output = total;
-            api_.release_mem_object()(in_buffer);
-            api_.release_mem_object()(partial_buffer);
-            api_.release_kernel()(kernel);
             result.success = true;
         });
         return result;
@@ -1087,8 +1186,8 @@ public:
 
     BackendRunResult run_matmul(
         const HardwareGraph& graph,
-        const std::vector<float>& lhs,
-        const std::vector<float>& rhs,
+        const std::span<const float> lhs,
+        const std::span<const float> rhs,
         const std::uint32_t rows,
         const std::uint32_t columns,
         const std::uint32_t depth,
@@ -1105,25 +1204,22 @@ public:
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(rows) * columns, 0.0f);
         result.runtime_us = measure_us([&]() {
-            cl_int error = CL_SUCCESS;
-            cl_kernel kernel = api_.create_kernel()(program, "matmul_tiled", &error);
-            if (error != CL_SUCCESS || kernel == nullptr) {
+            std::scoped_lock execution_lock(context->execution_mutex);
+            cl_kernel kernel = ensure_kernel(context, program, low_precision, "matmul_tiled");
+            if (kernel == nullptr) {
                 return;
             }
 
-            cl_mem lhs_buffer = create_buffer_or_null(context, CL_MEM_READ_ONLY, lhs.size() * sizeof(float));
-            cl_mem rhs_buffer = create_buffer_or_null(context, CL_MEM_READ_ONLY, rhs.size() * sizeof(float));
-            cl_mem out_buffer = create_buffer_or_null(context, CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
+            cl_mem lhs_buffer = acquire_buffer(context, "matmul.lhs", CL_MEM_READ_ONLY, lhs.size_bytes());
+            cl_mem rhs_buffer = acquire_buffer(context, "matmul.rhs", CL_MEM_READ_ONLY, rhs.size_bytes());
+            cl_mem out_buffer = acquire_buffer(context, "matmul.out", CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
             if (lhs_buffer == nullptr || rhs_buffer == nullptr || out_buffer == nullptr) {
-                if (lhs_buffer) api_.release_mem_object()(lhs_buffer);
-                if (rhs_buffer) api_.release_mem_object()(rhs_buffer);
-                if (out_buffer) api_.release_mem_object()(out_buffer);
-                api_.release_kernel()(kernel);
                 return;
             }
 
-            api_.enqueue_write_buffer()(context->queue, lhs_buffer, CL_TRUE, 0, lhs.size() * sizeof(float), lhs.data(), 0, nullptr, nullptr);
-            api_.enqueue_write_buffer()(context->queue, rhs_buffer, CL_TRUE, 0, rhs.size() * sizeof(float), rhs.data(), 0, nullptr, nullptr);
+            if (!write_buffer(context, lhs_buffer, lhs) || !write_buffer(context, rhs_buffer, rhs)) {
+                return;
+            }
 
             const cl_uint row_count = rows;
             const cl_uint column_count = columns;
@@ -1145,11 +1241,9 @@ public:
                 ((static_cast<size_t>(rows) + local[1] - 1u) / local[1]) * local[1]};
             api_.enqueue_nd_range_kernel()(context->queue, kernel, 2, nullptr, global, local, 0, nullptr, nullptr);
             api_.finish()(context->queue);
-            api_.enqueue_read_buffer()(context->queue, out_buffer, CL_TRUE, 0, result.output.size() * sizeof(float), result.output.data(), 0, nullptr, nullptr);
-            api_.release_mem_object()(lhs_buffer);
-            api_.release_mem_object()(rhs_buffer);
-            api_.release_mem_object()(out_buffer);
-            api_.release_kernel()(kernel);
+            if (!read_buffer(context, out_buffer, std::span<float>(result.output))) {
+                return;
+            }
             result.success = true;
         });
         return result;
@@ -1157,7 +1251,7 @@ public:
 
     BackendRunResult run_conv3x3(
         const HardwareGraph& graph,
-        const std::vector<float>& input,
+        const std::span<const float> input,
         const std::uint32_t height,
         const std::uint32_t width,
         const bool low_precision) const {
@@ -1175,22 +1269,21 @@ public:
         const std::uint32_t out_width = width - 2u;
         result.output.resize(static_cast<std::size_t>(out_height) * out_width, 0.0f);
         result.runtime_us = measure_us([&]() {
-            cl_int error = CL_SUCCESS;
-            cl_kernel kernel = api_.create_kernel()(program, "conv3x3_valid", &error);
-            if (error != CL_SUCCESS || kernel == nullptr) {
+            std::scoped_lock execution_lock(context->execution_mutex);
+            cl_kernel kernel = ensure_kernel(context, program, low_precision, "conv3x3_valid");
+            if (kernel == nullptr) {
                 return;
             }
 
-            cl_mem in_buffer = create_buffer_or_null(context, CL_MEM_READ_ONLY, input.size() * sizeof(float));
-            cl_mem out_buffer = create_buffer_or_null(context, CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
+            cl_mem in_buffer = acquire_buffer(context, "conv.in", CL_MEM_READ_ONLY, input.size_bytes());
+            cl_mem out_buffer = acquire_buffer(context, "conv.out", CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
             if (in_buffer == nullptr || out_buffer == nullptr) {
-                if (in_buffer) api_.release_mem_object()(in_buffer);
-                if (out_buffer) api_.release_mem_object()(out_buffer);
-                api_.release_kernel()(kernel);
                 return;
             }
 
-            api_.enqueue_write_buffer()(context->queue, in_buffer, CL_TRUE, 0, input.size() * sizeof(float), input.data(), 0, nullptr, nullptr);
+            if (!write_buffer(context, in_buffer, input)) {
+                return;
+            }
             const cl_uint h = height;
             const cl_uint w = width;
             const cl_int low = low_precision ? 1 : 0;
@@ -1205,10 +1298,9 @@ public:
                 ((static_cast<size_t>(out_height) + local[1] - 1u) / local[1]) * local[1]};
             api_.enqueue_nd_range_kernel()(context->queue, kernel, 2, nullptr, global, local, 0, nullptr, nullptr);
             api_.finish()(context->queue);
-            api_.enqueue_read_buffer()(context->queue, out_buffer, CL_TRUE, 0, result.output.size() * sizeof(float), result.output.data(), 0, nullptr, nullptr);
-            api_.release_mem_object()(in_buffer);
-            api_.release_mem_object()(out_buffer);
-            api_.release_kernel()(kernel);
+            if (!read_buffer(context, out_buffer, std::span<float>(result.output))) {
+                return;
+            }
             result.success = true;
         });
         return result;
@@ -1216,7 +1308,7 @@ public:
 
     BackendRunResult run_resample(
         const HardwareGraph& graph,
-        const std::vector<float>& input,
+        const std::span<const float> input,
         const std::uint32_t src_h,
         const std::uint32_t src_w,
         const std::uint32_t dst_h,
@@ -1236,22 +1328,22 @@ public:
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(row_count) * dst_w, 0.0f);
         result.runtime_us = measure_us([&]() {
-            cl_int error = CL_SUCCESS;
-            cl_kernel kernel = api_.create_kernel()(program, "bilinear_resample", &error);
-            if (error != CL_SUCCESS || kernel == nullptr) {
+            std::scoped_lock execution_lock(context->execution_mutex);
+            cl_kernel kernel = ensure_kernel(context, program, low_precision, "bilinear_resample");
+            if (kernel == nullptr) {
                 return;
             }
 
-            cl_mem in_buffer = create_buffer_or_null(context, CL_MEM_READ_ONLY, input.size() * sizeof(float));
-            cl_mem out_buffer = create_buffer_or_null(context, CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
+            cl_mem in_buffer = acquire_buffer(context, "resample.in", CL_MEM_READ_ONLY, input.size_bytes());
+            cl_mem out_buffer =
+                acquire_buffer(context, "resample.out", CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
             if (in_buffer == nullptr || out_buffer == nullptr) {
-                if (in_buffer) api_.release_mem_object()(in_buffer);
-                if (out_buffer) api_.release_mem_object()(out_buffer);
-                api_.release_kernel()(kernel);
                 return;
             }
 
-            api_.enqueue_write_buffer()(context->queue, in_buffer, CL_TRUE, 0, input.size() * sizeof(float), input.data(), 0, nullptr, nullptr);
+            if (!write_buffer(context, in_buffer, input)) {
+                return;
+            }
             const cl_uint src_height = src_h;
             const cl_uint src_width = src_w;
             const cl_uint dst_height = dst_h;
@@ -1274,10 +1366,9 @@ public:
                 ((static_cast<size_t>(row_count) + local[1] - 1u) / local[1]) * local[1]};
             api_.enqueue_nd_range_kernel()(context->queue, kernel, 2, nullptr, global, local, 0, nullptr, nullptr);
             api_.finish()(context->queue);
-            api_.enqueue_read_buffer()(context->queue, out_buffer, CL_TRUE, 0, result.output.size() * sizeof(float), result.output.data(), 0, nullptr, nullptr);
-            api_.release_mem_object()(in_buffer);
-            api_.release_mem_object()(out_buffer);
-            api_.release_kernel()(kernel);
+            if (!read_buffer(context, out_buffer, std::span<float>(result.output))) {
+                return;
+            }
             result.success = true;
         });
         return result;
@@ -1345,9 +1436,12 @@ BackendRunResult dispatch_backend(
     switch (operation.operation.op_class) {
     case OperationClass::elementwise_map: {
         const auto begin = assignment.shard.start;
-        const auto end = begin + assignment.shard.count;
-        std::vector<float> lhs(data.input0.begin() + static_cast<std::ptrdiff_t>(begin), data.input0.begin() + static_cast<std::ptrdiff_t>(end));
-        std::vector<float> rhs(data.input1.begin() + static_cast<std::ptrdiff_t>(begin), data.input1.begin() + static_cast<std::ptrdiff_t>(end));
+        const std::span<const float> lhs(
+            data.input0.data() + static_cast<std::ptrdiff_t>(begin),
+            assignment.shard.count);
+        const std::span<const float> rhs(
+            data.input1.data() + static_cast<std::ptrdiff_t>(begin),
+            assignment.shard.count);
         if (graph.probe == "opencl" && opencl.available()) {
             auto result = opencl.run_elementwise(graph, lhs, rhs, low_precision);
             if (result.success) {
@@ -1358,8 +1452,9 @@ BackendRunResult dispatch_backend(
     }
     case OperationClass::reduction: {
         const auto begin = assignment.shard.start;
-        const auto end = begin + assignment.shard.count;
-        std::vector<float> slice(data.input0.begin() + static_cast<std::ptrdiff_t>(begin), data.input0.begin() + static_cast<std::ptrdiff_t>(end));
+        const std::span<const float> slice(
+            data.input0.data() + static_cast<std::ptrdiff_t>(begin),
+            assignment.shard.count);
         if (graph.probe == "opencl" && opencl.available()) {
             auto result = opencl.run_reduction(graph, slice, low_precision);
             if (result.success) {
@@ -1373,25 +1468,26 @@ BackendRunResult dispatch_backend(
         const auto columns = static_cast<std::uint32_t>(operation.operation.extents.at(1));
         const auto depth = static_cast<std::uint32_t>(operation.operation.extents.at(2));
         const auto row_begin = assignment.shard.start;
-        std::vector<float> lhs_slice(
-            data.input0.begin() + static_cast<std::ptrdiff_t>(row_begin * depth),
-            data.input0.begin() + static_cast<std::ptrdiff_t>((row_begin + rows) * depth));
+        const std::span<const float> lhs_slice(
+            data.input0.data() + static_cast<std::ptrdiff_t>(row_begin * depth),
+            static_cast<std::size_t>(rows) * depth);
+        const std::span<const float> rhs_slice(data.input1);
         if (graph.probe == "opencl" && opencl.available()) {
-            auto result = opencl.run_matmul(graph, lhs_slice, data.input1, rows, columns, depth, low_precision);
+            auto result = opencl.run_matmul(graph, lhs_slice, rhs_slice, rows, columns, depth, low_precision);
             if (result.success) {
                 return result;
             }
         }
-        return host.run_matmul(lhs_slice, data.input1, rows, columns, depth, low_precision);
+        return host.run_matmul(lhs_slice, rhs_slice, rows, columns, depth, low_precision);
     }
     case OperationClass::convolution_2d: {
         const auto width = static_cast<std::uint32_t>(operation.operation.extents.at(1));
         const auto input_row_begin = static_cast<std::uint32_t>(assignment.shard.start);
         const auto rows = static_cast<std::uint32_t>(assignment.shard.count);
         const auto input_height = rows + 2u;
-        std::vector<float> input_slice(
-            data.input0.begin() + static_cast<std::ptrdiff_t>(input_row_begin * width),
-            data.input0.begin() + static_cast<std::ptrdiff_t>((input_row_begin + input_height) * width));
+        const std::span<const float> input_slice(
+            data.input0.data() + static_cast<std::ptrdiff_t>(input_row_begin * width),
+            static_cast<std::size_t>(input_height) * width);
         if (graph.probe == "opencl" && opencl.available()) {
             auto result = opencl.run_conv3x3(graph, input_slice, input_height, width, low_precision);
             if (result.success) {
@@ -1408,13 +1504,14 @@ BackendRunResult dispatch_backend(
         const auto dst_w = static_cast<std::uint32_t>(operation.operation.extents.at(3));
         const auto row_offset = static_cast<std::uint32_t>(assignment.shard.start);
         const auto row_count = static_cast<std::uint32_t>(assignment.shard.count);
+        const std::span<const float> input(data.input0);
         if (graph.probe == "opencl" && opencl.available()) {
-            auto result = opencl.run_resample(graph, data.input0, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
+            auto result = opencl.run_resample(graph, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
             if (result.success) {
                 return result;
             }
         }
-        return host.run_resample(data.input0, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
+        return host.run_resample(input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
     }
     }
 }
@@ -1547,22 +1644,7 @@ DirectExecutionReport DirectExecutor::execute(
         std::vector<std::future<BackendRunResult>> futures;
         futures.reserve(assignments.size());
         const auto runtime_us = measure_us([&]() {
-            for (const auto& assignment : assignments) {
-                futures.push_back(std::async(
-                    std::launch::async,
-                    [&optimized, &operation_data, &host_backend, &opencl_backend, assignment]() {
-                        return dispatch_backend(assignment, optimized, operation_data, host_backend, opencl_backend);
-                    }));
-            }
-
-            for (std::size_t index = 0; index < assignments.size(); ++index) {
-                auto shard = futures[index].get();
-                if (!shard.success) {
-                    all_succeeded = false;
-                    continue;
-                }
-
-                const auto& assignment = assignments[index];
+            const auto merge_shard = [&](const BackendRunResult& shard, const DeviceAssignment& assignment) {
                 switch (optimized.operation.op_class) {
                 case OperationClass::elementwise_map:
                     std::copy(
@@ -1599,10 +1681,41 @@ DirectExecutionReport DirectExecutor::execute(
                     break;
                 }
                 }
+            };
+
+            if (assignments.size() == 1) {
+                const auto shard =
+                    dispatch_backend(assignments.front(), optimized, operation_data, host_backend, opencl_backend);
+                if (!shard.success) {
+                    all_succeeded = false;
+                    return;
+                }
+                merge_shard(shard, assignments.front());
+                return;
+            }
+
+            for (const auto& assignment : assignments) {
+                futures.push_back(std::async(
+                    std::launch::async,
+                    [&optimized, &operation_data, &host_backend, &opencl_backend, assignment]() {
+                        return dispatch_backend(assignment, optimized, operation_data, host_backend, opencl_backend);
+                    }));
+            }
+
+            for (std::size_t index = 0; index < assignments.size(); ++index) {
+                auto shard = futures[index].get();
+                if (!shard.success) {
+                    all_succeeded = false;
+                    continue;
+                }
+
+                merge_shard(shard, assignments[index]);
             }
         });
 
         record.runtime_us = runtime_us;
+        record.speedup_vs_reference =
+            record.runtime_us > 0.0 ? (record.reference_runtime_us / record.runtime_us) : 1.0;
         if (optimized.operation.op_class == OperationClass::reduction) {
             record.relative_error = scalar_relative_error(reference_scalar, merged_scalar);
         } else {
@@ -1610,9 +1723,13 @@ DirectExecutionReport DirectExecutor::execute(
         }
         record.verified = record.relative_error <= optimized.operation.max_relative_error;
         all_succeeded = all_succeeded && record.verified;
+        report.total_runtime_us += record.runtime_us;
+        report.total_reference_runtime_us += record.reference_runtime_us;
         report.operations.push_back(std::move(record));
     }
 
+    report.speedup_vs_reference =
+        report.total_runtime_us > 0.0 ? (report.total_reference_runtime_us / report.total_runtime_us) : 1.0;
     report.all_succeeded = all_succeeded;
     return report;
 }

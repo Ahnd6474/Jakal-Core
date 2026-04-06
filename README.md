@@ -23,7 +23,9 @@ Implemented now:
 - planner that partitions work from graph-derived summaries
 - execution-graph builder that maps global placements into signal-flow graphs
 - operation-family optimization across the discovered device set
-- validation microbenchmarks with latency and accuracy recording
+- direct host and OpenCL execution backends
+- canonical gaming and AI workload presets for optimization and validation
+- latency and accuracy recording for optimized execution runs
 - execution-setting cache persistence
 - plan cache persistence
 - minimal C ABI with graph node and edge inspection
@@ -31,7 +33,6 @@ Implemented now:
 
 Not implemented yet:
 
-- real kernel execution
 - tensor memory model
 - CUDA probe / execution path
 - Level Zero / OpenVINO / oneDNN probe and execution path
@@ -152,6 +153,12 @@ Current operation families:
 - 3x3 convolution
 - bilinear resample
 
+Canonical workload presets now compose these operations into larger domain-shaped suites instead of relying only on isolated microbenchmarks:
+
+- gaming upscaling and post-processing
+- AI vision inference
+- AI training-step surrogate
+
 For each operation family, the optimizer:
 
 1. generates a small candidate set of execution settings
@@ -163,7 +170,7 @@ For each operation family, the optimizer:
 
 The chosen execution settings are persisted so later runs can rebuild the same execution graph without re-searching from scratch.
 
-Validation is still lightweight. The benchmark path is a correctness and shape-validation loop, not a full backend execution engine.
+The current validation path runs the direct executor and records aggregate runtime against a single-path reference implementation. This is still an early execution engine, but it is no longer limited to shape-only microbenchmarks.
 
 ## Low-spec track and learning cache
 
@@ -171,7 +178,7 @@ The optimizer now always captures a lightweight system profile and can switch in
 
 Inputs reflected in the surrogate cost:
 
-- cold vs warm execution
+- numeric readiness and stability state
 - battery and battery-saver state
 - available memory and paging risk
 - sustained slowdown estimated from prior runs
@@ -190,6 +197,17 @@ The optimizer also keeps a lightweight shape-bucket performance cache:
 - value = running averages for latency, prediction scale, error, and system penalty
 
 This cache is used by default and grows only with the distinct shapes and environment buckets actually observed. It is meant to stay lightweight while making repeated runs better over time.
+
+The candidate search now supports multiple lightweight optimization policies:
+
+- `heuristic_greedy`: static graph-cost objective
+- `learned_greedy`: graph-cost objective corrected by accumulated measurements
+- `trace_replay`: stronger reuse of preset-specific historical traces
+- `ucb_explore`: bounded exploration when a workload shape has not been seen yet
+- `reinforce_softmax`: reward-weighted ranking inspired by policy-gradient updates
+- `spsa_local_search`: one-step simultaneous perturbation refinement of execution knobs
+
+The runtime starts with exploration when a preset is unseen, then shifts toward learned or trace-driven ranking as observations accumulate.
 
 ## Build
 

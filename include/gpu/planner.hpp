@@ -14,12 +14,15 @@ enum class WorkloadKind {
     custom,
     inference,
     image,
-    tensor
+    tensor,
+    gaming,
+    training
 };
 
 struct WorkloadSpec {
     std::string name;
     WorkloadKind kind = WorkloadKind::custom;
+    std::string dataset_tag;
     std::uint64_t working_set_bytes = 0;
     std::uint64_t host_exchange_bytes = 0;
     double estimated_flops = 0.0;

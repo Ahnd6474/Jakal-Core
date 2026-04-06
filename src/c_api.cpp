@@ -264,6 +264,7 @@ int gpu_runtime_plan(
     const gpu::WorkloadSpec cpp_workload{
         workload->name == nullptr ? std::string("unnamed") : std::string(workload->name),
         parse_workload_kind(workload->kind),
+        "",
         workload->working_set_bytes,
         workload->host_exchange_bytes,
         workload->estimated_flops,

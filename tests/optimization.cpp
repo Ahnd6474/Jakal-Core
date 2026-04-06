@@ -1,5 +1,6 @@
 #include "gpu/device.hpp"
 #include "gpu/runtime.hpp"
+#include "gpu/workloads.hpp"
 
 #include <filesystem>
 #include <iostream>
@@ -60,6 +61,7 @@ int main() {
     gpu::RuntimeOptions options;
     options.cache_path = plan_cache;
     options.execution_cache_path = exec_cache;
+    options.enable_opencl_probe = false;
 
     gpu::Runtime runtime(options);
 
@@ -71,6 +73,7 @@ int main() {
     const gpu::WorkloadSpec workload{
         "optimization-suite",
         gpu::WorkloadKind::tensor,
+        "",
         512ull * 1024ull * 1024ull,
         128ull * 1024ull * 1024ull,
         4.0e12,
@@ -106,6 +109,10 @@ int main() {
             std::cerr << "Benchmark missing surrogate metadata for " << result.operation.name << ".\n";
             return 1;
         }
+        if (result.benchmark.optimizer_name.empty() || result.benchmark.objective_score <= 0.0) {
+            std::cerr << "Benchmark missing optimizer metadata for " << result.operation.name << ".\n";
+            return 1;
+        }
         if (!result.benchmark.accuracy_within_tolerance) {
             std::cerr << "Accuracy drift exceeded tolerance for " << result.operation.name << ".\n";
             return 1;
@@ -122,8 +129,8 @@ int main() {
         std::cerr << "Expected cached execution settings on second optimize call.\n";
         return 1;
     }
-    if (second.system_profile.cold_start) {
-        std::cerr << "Expected warm execution path on second optimize call.\n";
+    if (second.system_profile.readiness_score <= 0.0) {
+        std::cerr << "Expected non-zero readiness score on second optimize call.\n";
         return 1;
     }
 
@@ -150,6 +157,21 @@ int main() {
     if (!saw_backend) {
         std::cerr << "Expected direct execution to use at least one backend.\n";
         return 1;
+    }
+
+    for (const auto& preset : gpu::canonical_workload_presets()) {
+        const auto macro_report = runtime.optimize(preset.workload);
+        if (macro_report.operations.empty()) {
+            std::cerr << "Canonical workload optimization failed: " << preset.workload.name << ".\n";
+            return 1;
+        }
+        if (macro_report.system_profile.readiness_score < 0.0 ||
+            macro_report.system_profile.readiness_score > 1.0 ||
+            macro_report.system_profile.stability_score < 0.0 ||
+            macro_report.system_profile.stability_score > 1.0) {
+            std::cerr << "Canonical workload system metrics out of range: " << preset.workload.name << ".\n";
+            return 1;
+        }
     }
 
     std::cout << "operations=" << first.operations.size()

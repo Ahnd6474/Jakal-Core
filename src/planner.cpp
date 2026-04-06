@@ -47,6 +47,7 @@ std::string build_signature(const WorkloadSpec& workload, const std::vector<Hard
     std::ostringstream signature;
     signature << workload.name << '|'
               << to_string(workload.kind) << '|'
+              << workload.dataset_tag << '|'
               << workload.working_set_bytes << '|'
               << workload.host_exchange_bytes << '|'
               << std::fixed << std::setprecision(3) << workload.estimated_flops << '|'
@@ -208,6 +209,10 @@ std::string to_string(WorkloadKind kind) {
         return "image";
     case WorkloadKind::tensor:
         return "tensor";
+    case WorkloadKind::gaming:
+        return "gaming";
+    case WorkloadKind::training:
+        return "training";
     case WorkloadKind::custom:
     default:
         return "custom";

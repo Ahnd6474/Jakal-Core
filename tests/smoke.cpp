@@ -3,7 +3,9 @@
 #include <iostream>
 
 int main() {
-    gpu::Runtime runtime;
+    gpu::RuntimeOptions options;
+    options.enable_opencl_probe = false;
+    gpu::Runtime runtime(options);
 
     if (runtime.devices().empty()) {
         std::cerr << "No hardware graphs discovered.\n";
@@ -24,6 +26,7 @@ int main() {
     const gpu::WorkloadSpec workload{
         "smoke",
         gpu::WorkloadKind::tensor,
+        "",
         128ull * 1024ull * 1024ull,
         64ull * 1024ull * 1024ull,
         2.0e11,

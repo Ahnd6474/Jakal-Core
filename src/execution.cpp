@@ -12,6 +12,7 @@
 #include <limits>
 #include <numeric>
 #include <sstream>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -80,11 +81,14 @@ std::string summarize_graph_set(const std::vector<HardwareGraph>& graphs) {
 
 std::string performance_key(
     const std::string& graph_set_signature,
+    const WorkloadSpec& workload,
     const SystemProfile& system,
     const std::string& shape_bucket,
     const ExecutionConfig& config) {
     std::ostringstream stream;
     stream << graph_set_signature << '|'
+           << to_string(workload.kind) << '|'
+           << workload.dataset_tag << '|'
            << shape_bucket << '|'
            << system.low_spec_mode << '|'
            << system.on_battery << '|'
@@ -99,9 +103,56 @@ std::string performance_key(
            << config.tile_x << '|'
            << config.tile_y << '|'
            << config.tile_k << '|'
+           << config.logical_partitions << '|'
            << config.overlap_transfers << '|'
-           << config.use_low_precision;
+           << config.use_low_precision << '|'
+           << std::fixed << std::setprecision(3)
+           << config.queue_depth_scale << '|'
+           << config.stage_scale << '|'
+           << config.tile_scale << '|'
+           << config.overlap_ratio << '|'
+           << config.partition_intensity << '|'
+           << config.precision_mix;
     return stream.str();
+}
+
+double preset_trace_weight(const WorkloadSpec& workload) {
+    double weight = workload.dataset_tag.empty() ? 1.0 : 1.35;
+    switch (workload.kind) {
+    case WorkloadKind::gaming:
+        weight *= 1.20;
+        break;
+    case WorkloadKind::training:
+        weight *= 1.15;
+        break;
+    case WorkloadKind::inference:
+        weight *= 1.10;
+        break;
+    case WorkloadKind::image:
+    case WorkloadKind::tensor:
+    case WorkloadKind::custom:
+    default:
+        break;
+    }
+    return weight;
+}
+
+double clamp_unit(const double value) {
+    return std::clamp(value, 0.0, 1.0);
+}
+
+double clamp_scale(const double value) {
+    return std::clamp(value, 0.50, 2.00);
+}
+
+ContinuousExecutionState clamp_state(ContinuousExecutionState state) {
+    state.queue_depth_scale = clamp_scale(state.queue_depth_scale);
+    state.stage_scale = clamp_scale(state.stage_scale);
+    state.tile_scale = clamp_scale(state.tile_scale);
+    state.overlap_ratio = clamp_unit(state.overlap_ratio);
+    state.partition_intensity = clamp_unit(state.partition_intensity);
+    state.precision_mix = clamp_unit(state.precision_mix);
+    return state;
 }
 
 double aggregate_execution_score(const std::vector<HardwareGraph>& graphs) {
@@ -176,6 +227,8 @@ SystemProfile capture_system_profile(const WorkloadSpec& workload, const std::ve
 
     profile.amortization_gain = profile.low_spec_mode ? 0.80 : 0.90;
     profile.initialization_penalty_us = profile.low_spec_mode ? 1800.0 : 900.0;
+    profile.stability_score =
+        clamp_unit((1.0 / profile.sustained_slowdown) * (1.0 - (0.30 * std::min(profile.paging_risk, 1.0))));
     return profile;
 }
 
@@ -375,6 +428,9 @@ double expected_relative_error(const OperationSpec& operation, const ExecutionCo
     if (config.strategy == ExecutionStrategy::sharded) {
         error += operation.reduction_like ? 3.0e-4 : 1.5e-4;
     }
+    if (config.logical_partitions > 1) {
+        error += operation.reduction_like ? 2.0e-4 : 5.0e-5;
+    }
     if (operation.reduction_like) {
         error += 1.0e-4;
     }
@@ -411,9 +467,17 @@ std::string build_config_signature(const std::string& report_signature, const Ex
            << config.tile_x << '|'
            << config.tile_y << '|'
            << config.tile_k << '|'
+           << config.logical_partitions << '|'
            << config.overlap_transfers << '|'
            << config.use_low_precision << '|'
-           << std::fixed << std::setprecision(6) << config.target_error_tolerance;
+           << std::fixed << std::setprecision(6) << config.target_error_tolerance << '|'
+           << std::setprecision(3)
+           << config.queue_depth_scale << '|'
+           << config.stage_scale << '|'
+           << config.tile_scale << '|'
+           << config.overlap_ratio << '|'
+           << config.partition_intensity << '|'
+           << config.precision_mix;
     return stream.str();
 }
 
@@ -422,6 +486,68 @@ std::uint32_t choose_queue_depth(const HardwareGraphSummary& summary) {
         return 1;
     }
     return std::clamp(summary.queue_slots / 32u, 1u, 8u);
+}
+
+std::uint32_t choose_logical_partitions(
+    const HardwareGraphSummary& summary,
+    const OperationSpec& operation,
+    const double partition_intensity) {
+    if (!operation.parallelizable) {
+        return 1;
+    }
+
+    const std::uint32_t structural_parallelism =
+        std::max({summary.execution_objects, summary.resident_contexts, summary.lanes_per_object / 8u, 1u});
+    const std::uint32_t queue_parallelism = std::max(summary.queue_slots / 64u, 1u);
+    const std::uint32_t max_partitions = std::clamp(std::max(structural_parallelism, queue_parallelism), 1u, 8u);
+    if (max_partitions == 1u) {
+        return 1u;
+    }
+    return 1u + static_cast<std::uint32_t>(std::llround(partition_intensity * static_cast<double>(max_partitions - 1u)));
+}
+
+bool supports_low_precision(const HardwareGraphSummary& summary);
+
+std::uint32_t scale_tile(const std::uint32_t base, const double scale, const std::uint32_t multiple, const std::uint32_t min_value, const std::uint32_t max_value) {
+    if (base == 0) {
+        return 0;
+    }
+    auto scaled = static_cast<std::uint32_t>(std::llround(static_cast<double>(base) * scale));
+    scaled = std::max(min_value, scaled);
+    if (multiple > 1u) {
+        scaled = round_up_to_multiple(scaled, multiple);
+    }
+    return std::clamp(scaled, min_value, max_value);
+}
+
+void apply_continuous_state(
+    const ContinuousExecutionState& state,
+    const OperationSpec& operation,
+    const HardwareGraphSummary& summary,
+    ExecutionConfig& config) {
+    config.queue_depth_scale = state.queue_depth_scale;
+    config.stage_scale = state.stage_scale;
+    config.tile_scale = state.tile_scale;
+    config.overlap_ratio = state.overlap_ratio;
+    config.partition_intensity = state.partition_intensity;
+    config.precision_mix = state.precision_mix;
+
+    config.queue_depth = std::clamp(
+        static_cast<std::uint32_t>(std::llround(static_cast<double>(std::max(config.queue_depth, 1u)) * state.queue_depth_scale)),
+        1u,
+        8u);
+    config.stages = std::clamp(
+        static_cast<std::uint32_t>(std::llround(static_cast<double>(std::max(config.stages, 1u)) * state.stage_scale)),
+        1u,
+        4u);
+    config.tile_x = scale_tile(config.tile_x, state.tile_scale, operation.matrix_friendly ? 16u : 8u, 8u, 4096u);
+    config.tile_y = scale_tile(config.tile_y, state.tile_scale, operation.matrix_friendly ? 8u : 1u, 1u, 1024u);
+    config.tile_k = scale_tile(config.tile_k, state.tile_scale, operation.matrix_friendly ? 16u : 4u, 4u, 1024u);
+    config.logical_partitions = choose_logical_partitions(summary, operation, state.partition_intensity);
+    config.overlap_transfers = config.overlap_transfers || state.overlap_ratio >= 0.35;
+    if (state.precision_mix >= 0.55 && supports_low_precision(summary) && operation.max_relative_error >= 4.0e-4) {
+        config.use_low_precision = true;
+    }
 }
 
 double compute_initialization_penalty_us(
@@ -474,6 +600,9 @@ double compute_surrogate_penalty_us(
         penalty += static_cast<double>(config.participating_devices.size() - 1) * 250.0;
         penalty += static_cast<double>(std::max(config.queue_depth, 1u) - 1u) * 18.0;
     }
+    if (config.logical_partitions > 1u) {
+        penalty += static_cast<double>(config.logical_partitions - 1u) * (system.low_spec_mode ? 55.0 : 24.0);
+    }
     if (system.low_spec_mode && config.strategy == ExecutionStrategy::sharded) {
         penalty += 500.0;
     }
@@ -486,6 +615,9 @@ double compute_surrogate_penalty_us(
     if (system.low_spec_mode && config.use_low_precision) {
         penalty -= 60.0;
     }
+    penalty -= config.overlap_ratio * (system.low_spec_mode ? 45.0 : 20.0);
+    penalty += (1.0 - system.readiness_score) * (system.initialization_penalty_us * 0.15);
+    penalty += (1.0 - system.stability_score) * 240.0;
     return std::max(0.0, penalty);
 }
 
@@ -525,6 +657,7 @@ std::vector<ExecutionConfig> build_candidate_configs(
     const ExecutionPlan& placement,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     const SystemProfile& system,
+    const ContinuousExecutionState* continuous_state,
     const std::string& report_signature) {
     std::vector<ExecutionConfig> candidates;
     if (placement.allocations.empty()) {
@@ -544,6 +677,9 @@ std::vector<ExecutionConfig> build_candidate_configs(
             }
             if (config.stages == 0) {
                 config.stages = summary.supports_asynchronous_dispatch ? 2u : 1u;
+            }
+            if (continuous_state != nullptr) {
+                apply_continuous_state(*continuous_state, operation, summary, config);
             }
         }
         config.signature = build_config_signature(report_signature, config);
@@ -736,7 +872,9 @@ ExecutionGraph build_execution_graph(
     const std::string global_sink_id = operation.name + ".sink";
     const std::string global_sync_id = operation.name + ".sync";
     const bool needs_sync =
-        config.participating_devices.size() > 1 || config.strategy != ExecutionStrategy::single_device;
+        config.participating_devices.size() > 1 ||
+        config.logical_partitions > 1 ||
+        config.strategy != ExecutionStrategy::single_device;
 
     if (needs_sync) {
         add_node(ExecutionNode{
@@ -778,137 +916,145 @@ ExecutionGraph build_execution_graph(
              HardwareObjectRole::global_memory,
              HardwareObjectRole::host_memory});
 
-        if (control_node != nullptr) {
-            config.mapped_structural_nodes.push_back(control_node->id);
-        }
-        if (compute_node != nullptr) {
-            config.mapped_structural_nodes.push_back(compute_node->id);
-        }
-        if (storage_node != nullptr) {
-            config.mapped_structural_nodes.push_back(storage_node->id);
-        }
-
         const double ratio = ratios.contains(device_uid) ? ratios.at(device_uid) : 1.0;
-        const std::uint64_t input_share = static_cast<std::uint64_t>(std::ceil(static_cast<double>(operation.input_bytes) * ratio));
-        const std::uint64_t output_share = operation.reduction_like
-                                               ? operation.output_bytes
-                                               : static_cast<std::uint64_t>(std::ceil(static_cast<double>(operation.output_bytes) * ratio));
-        const double flops_share = operation.estimated_flops * ratio;
-        const double compute_latency_us =
-            (flops_share / (estimate_device_gflops(summary, operation, config.use_low_precision) * 1.0e9)) *
-            kMicrosecondsPerSecond;
+        const auto partitions = std::max(config.logical_partitions, 1u);
+        for (std::uint32_t partition = 0; partition < partitions; ++partition) {
+            const double partition_ratio = ratio / static_cast<double>(partitions);
+            const std::uint64_t input_share =
+                static_cast<std::uint64_t>(std::ceil(static_cast<double>(operation.input_bytes) * partition_ratio));
+            const std::uint64_t output_share = operation.reduction_like
+                                                   ? operation.output_bytes
+                                                   : static_cast<std::uint64_t>(
+                                                         std::ceil(static_cast<double>(operation.output_bytes) * partition_ratio));
+            const double flops_share = operation.estimated_flops * partition_ratio;
+            const double compute_latency_us =
+                (flops_share / (estimate_device_gflops(summary, operation, config.use_low_precision) * 1.0e9)) *
+                kMicrosecondsPerSecond;
 
-        const std::string prefix = operation.name + "." + device_uid;
-        const std::string source_id = prefix + ".source";
-        const std::string dispatch_id = prefix + ".dispatch";
-        const std::string compute_id = prefix + ".compute";
-        const std::string aggregate_id = prefix + ".aggregate";
+            if (control_node != nullptr) {
+                config.mapped_structural_nodes.push_back(control_node->id + "#p" + std::to_string(partition));
+            }
+            if (compute_node != nullptr) {
+                config.mapped_structural_nodes.push_back(compute_node->id + "#p" + std::to_string(partition));
+            }
+            if (storage_node != nullptr) {
+                config.mapped_structural_nodes.push_back(storage_node->id + "#p" + std::to_string(partition));
+            }
 
-        add_node(ExecutionNode{
-            source_id,
-            hardware->presentation_name + "-source",
-            device_uid,
-            storage_node == nullptr ? std::string() : storage_node->id,
-            ExecutionNodeKind::source,
-            input_share,
-            0.0,
-            0.0});
+            const std::string partition_suffix =
+                config.logical_partitions > 1 ? (".part" + std::to_string(partition)) : std::string();
+            const std::string prefix = operation.name + "." + device_uid + partition_suffix;
+            const std::string source_id = prefix + ".source";
+            const std::string dispatch_id = prefix + ".dispatch";
+            const std::string compute_id = prefix + ".compute";
+            const std::string aggregate_id = prefix + ".aggregate";
 
-        add_node(ExecutionNode{
-            dispatch_id,
-            hardware->presentation_name + "-dispatch",
-            device_uid,
-            control_node == nullptr ? std::string() : control_node->id,
-            ExecutionNodeKind::dispatch,
-            0,
-            0.0,
-            dispatch_cost_us(summary)});
-
-        add_node(ExecutionNode{
-            compute_id,
-            hardware->presentation_name + "-compute",
-            device_uid,
-            compute_node == nullptr ? std::string() : compute_node->id,
-            ExecutionNodeKind::compute,
-            output_share,
-            flops_share,
-            std::max(0.01, compute_latency_us)});
-
-        add_edge(ExecutionEdge{
-            source_id,
-            dispatch_id,
-            ExecutionEdgeKind::dataflow,
-            true,
-            input_share,
-            transfer_cost_us(input_share, summary),
-            config.overlap_transfers ? 0.35 : 0.0});
-
-        add_edge(ExecutionEdge{
-            dispatch_id,
-            compute_id,
-            ExecutionEdgeKind::control,
-            true,
-            0,
-            dispatch_cost_us(summary),
-            0.0});
-
-        if (operation.reduction_like) {
             add_node(ExecutionNode{
-                aggregate_id,
-                hardware->presentation_name + "-aggregate",
+                source_id,
+                hardware->presentation_name + partition_suffix + "-source",
+                device_uid,
+                storage_node == nullptr ? std::string() : storage_node->id,
+                ExecutionNodeKind::source,
+                input_share,
+                0.0,
+                0.0});
+
+            add_node(ExecutionNode{
+                dispatch_id,
+                hardware->presentation_name + partition_suffix + "-dispatch",
+                device_uid,
+                control_node == nullptr ? std::string() : control_node->id,
+                ExecutionNodeKind::dispatch,
+                0,
+                0.0,
+                dispatch_cost_us(summary)});
+
+            add_node(ExecutionNode{
+                compute_id,
+                hardware->presentation_name + partition_suffix + "-compute",
                 device_uid,
                 compute_node == nullptr ? std::string() : compute_node->id,
-                ExecutionNodeKind::aggregate,
-                operation.output_bytes,
-                static_cast<double>(operation.output_bytes),
-                sync_cost_us(summary) * 0.5});
+                ExecutionNodeKind::compute,
+                output_share,
+                flops_share,
+                std::max(0.01, compute_latency_us)});
 
             add_edge(ExecutionEdge{
-                compute_id,
-                aggregate_id,
-                ExecutionEdgeKind::aggregation,
+                source_id,
+                dispatch_id,
+                ExecutionEdgeKind::dataflow,
                 true,
-                output_share,
-                transfer_cost_us(output_share, summary) * 0.5,
-                config.overlap_transfers ? 0.20 : 0.0});
+                input_share,
+                transfer_cost_us(input_share, summary),
+                std::max(config.overlap_ratio, config.overlap_transfers ? 0.35 : 0.0)});
 
-            if (needs_sync) {
-                add_edge(ExecutionEdge{
+            add_edge(ExecutionEdge{
+                dispatch_id,
+                compute_id,
+                ExecutionEdgeKind::control,
+                true,
+                0,
+                dispatch_cost_us(summary),
+                0.0});
+
+            if (operation.reduction_like) {
+                add_node(ExecutionNode{
                     aggregate_id,
+                    hardware->presentation_name + partition_suffix + "-aggregate",
+                    device_uid,
+                    compute_node == nullptr ? std::string() : compute_node->id,
+                    ExecutionNodeKind::aggregate,
+                    operation.output_bytes,
+                    static_cast<double>(operation.output_bytes),
+                    sync_cost_us(summary) * 0.5});
+
+                add_edge(ExecutionEdge{
+                    compute_id,
+                    aggregate_id,
+                    ExecutionEdgeKind::aggregation,
+                    true,
+                    output_share,
+                    transfer_cost_us(output_share, summary) * 0.5,
+                    config.overlap_ratio * 0.5});
+
+                if (needs_sync) {
+                    add_edge(ExecutionEdge{
+                        aggregate_id,
+                        global_sync_id,
+                        ExecutionEdgeKind::dependency,
+                        true,
+                        operation.output_bytes,
+                        sync_cost_us(summary),
+                        0.0});
+                } else {
+                    add_edge(ExecutionEdge{
+                        aggregate_id,
+                        global_sink_id,
+                        ExecutionEdgeKind::dataflow,
+                        true,
+                        operation.output_bytes,
+                        transfer_cost_us(operation.output_bytes, summary),
+                        0.0});
+                }
+            } else if (needs_sync) {
+                add_edge(ExecutionEdge{
+                    compute_id,
                     global_sync_id,
                     ExecutionEdgeKind::dependency,
                     true,
-                    operation.output_bytes,
-                    sync_cost_us(summary),
-                    0.0});
+                    output_share,
+                    transfer_cost_us(output_share, summary),
+                    config.overlap_ratio * 0.7});
             } else {
                 add_edge(ExecutionEdge{
-                    aggregate_id,
+                    compute_id,
                     global_sink_id,
                     ExecutionEdgeKind::dataflow,
                     true,
-                    operation.output_bytes,
-                    transfer_cost_us(operation.output_bytes, summary),
-                    0.0});
+                    output_share,
+                    transfer_cost_us(output_share, summary),
+                    config.overlap_ratio * 0.7});
             }
-        } else if (needs_sync) {
-            add_edge(ExecutionEdge{
-                compute_id,
-                global_sync_id,
-                ExecutionEdgeKind::dependency,
-                true,
-                output_share,
-                transfer_cost_us(output_share, summary),
-                config.overlap_transfers ? 0.25 : 0.0});
-        } else {
-            add_edge(ExecutionEdge{
-                compute_id,
-                global_sink_id,
-                ExecutionEdgeKind::dataflow,
-                true,
-                output_share,
-                transfer_cost_us(output_share, summary),
-                config.overlap_transfers ? 0.25 : 0.0});
         }
     }
 
@@ -1212,6 +1358,385 @@ BenchmarkRecord benchmark_operation(
     return record;
 }
 
+struct CandidateEvaluation {
+    ExecutionConfig config;
+    ExecutionGraph graph;
+    BenchmarkRecord benchmark;
+    OptimizationPolicy policy = OptimizationPolicy::heuristic_greedy;
+    bool spsa_refined = false;
+    double heuristic_objective = std::numeric_limits<double>::max();
+    double learned_objective = std::numeric_limits<double>::max();
+    double trace_objective = std::numeric_limits<double>::max();
+    double explore_objective = std::numeric_limits<double>::max();
+    double reinforce_objective = std::numeric_limits<double>::max();
+    std::uint32_t observations = 0;
+};
+
+OperationOptimizationResult optimize_operation(
+    const std::string& report_signature,
+    const OperationSpec& operation,
+    const WorkloadSpec& workload,
+    const ExecutionPlan& placement,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    const SystemProfile& system,
+    const std::unordered_map<std::string, ExecutionOptimizer::PerformanceSummary>& performance_cache,
+    const std::unordered_map<std::string, bool>& warmed_devices,
+    const std::string& graph_set_signature,
+    const ExecutionConfig* cached_config,
+    const ContinuousExecutionState* continuous_state);
+
+std::optional<ExecutionConfig> make_spsa_candidate(
+    const ExecutionConfig& seed,
+    const std::string& report_signature,
+    const OperationSpec& operation,
+    const ExecutionPlan& placement,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    const SystemProfile& system,
+    const std::unordered_map<std::string, bool>& warmed_devices) {
+    auto score_of = [&](ExecutionConfig candidate) {
+        auto graph = build_execution_graph(report_signature, operation, candidate, placement, graph_lookup);
+        const double penalty = compute_surrogate_penalty_us(operation, candidate, system, warmed_devices);
+        return (graph.predicted_latency_us * system.sustained_slowdown) + penalty;
+    };
+
+    const std::uint64_t hash = std::hash<std::string>{}(seed.signature + "|" + operation.name);
+    const int sign0 = (hash & 1ull) == 0 ? 1 : -1;
+    const int sign1 = (hash & 2ull) == 0 ? 1 : -1;
+    const int sign2 = (hash & 4ull) == 0 ? 1 : -1;
+    const int sign3 = (hash & 8ull) == 0 ? 1 : -1;
+    const int sign4 = (hash & 16ull) == 0 ? 1 : -1;
+
+    auto plus = seed;
+    auto minus = seed;
+    const std::uint32_t tile_step = operation.matrix_friendly ? 16u : 32u;
+    plus.queue_depth = std::clamp<int>(static_cast<int>(plus.queue_depth) + sign0, 1, 8);
+    minus.queue_depth = std::clamp<int>(static_cast<int>(minus.queue_depth) - sign0, 1, 8);
+    plus.stages = std::clamp<int>(static_cast<int>(plus.stages) + sign1, 1, 4);
+    minus.stages = std::clamp<int>(static_cast<int>(minus.stages) - sign1, 1, 4);
+    plus.tile_x = std::max<std::uint32_t>(8u, plus.tile_x + (sign2 > 0 ? tile_step : 0u));
+    minus.tile_x = std::max<std::uint32_t>(8u, minus.tile_x + (sign2 < 0 ? tile_step : 0u));
+    plus.tile_y = std::max<std::uint32_t>(1u, plus.tile_y + (sign3 > 0 ? tile_step / 2u : 0u));
+    minus.tile_y = std::max<std::uint32_t>(1u, minus.tile_y + (sign3 < 0 ? tile_step / 2u : 0u));
+    plus.tile_k = std::max<std::uint32_t>(4u, plus.tile_k + (sign4 > 0 ? tile_step : 0u));
+    minus.tile_k = std::max<std::uint32_t>(4u, minus.tile_k + (sign4 < 0 ? tile_step : 0u));
+    plus.signature = build_config_signature(report_signature, plus);
+    minus.signature = build_config_signature(report_signature, minus);
+
+    const double plus_score = score_of(plus);
+    const double minus_score = score_of(minus);
+    auto refined = plus_score < minus_score ? plus : minus;
+    refined.signature = build_config_signature(report_signature, refined);
+    if (refined.signature == seed.signature) {
+        return std::nullopt;
+    }
+    return refined;
+}
+
+OptimizationPolicy select_policy_for_workload(
+    const WorkloadSpec& workload,
+    const std::vector<CandidateEvaluation>& evaluations) {
+    std::uint32_t max_observations = 0;
+    std::uint32_t min_observations = std::numeric_limits<std::uint32_t>::max();
+    for (const auto& evaluation : evaluations) {
+        max_observations = std::max(max_observations, evaluation.observations);
+        min_observations = std::min(min_observations, evaluation.observations);
+    }
+    if (min_observations == std::numeric_limits<std::uint32_t>::max()) {
+        min_observations = 0;
+    }
+
+    if (!workload.dataset_tag.empty() && max_observations >= kLearningWarmupSamples) {
+        return OptimizationPolicy::trace_replay;
+    }
+    if (!workload.dataset_tag.empty() && max_observations >= 1) {
+        return OptimizationPolicy::reinforce_softmax;
+    }
+    if (max_observations == 0 && min_observations == 0) {
+        return OptimizationPolicy::ucb_explore;
+    }
+    if ((evaluations.size() > 1 && std::any_of(
+            evaluations.begin(),
+            evaluations.end(),
+            [](const CandidateEvaluation& evaluation) { return evaluation.spsa_refined; })) &&
+        max_observations == 0) {
+        return OptimizationPolicy::spsa_local_search;
+    }
+    if (!workload.dataset_tag.empty() || max_observations > 0) {
+        return OptimizationPolicy::learned_greedy;
+    }
+    return OptimizationPolicy::heuristic_greedy;
+}
+
+double objective_for_policy(const CandidateEvaluation& evaluation, const OptimizationPolicy policy) {
+    switch (policy) {
+    case OptimizationPolicy::learned_greedy:
+        return evaluation.learned_objective;
+    case OptimizationPolicy::trace_replay:
+        return evaluation.trace_objective;
+    case OptimizationPolicy::ucb_explore:
+        return evaluation.explore_objective;
+    case OptimizationPolicy::reinforce_softmax:
+        return evaluation.reinforce_objective;
+    case OptimizationPolicy::spsa_local_search:
+        return evaluation.spsa_refined ? evaluation.learned_objective : (evaluation.learned_objective * 1.05);
+    case OptimizationPolicy::heuristic_greedy:
+    default:
+        return evaluation.heuristic_objective;
+    }
+}
+
+struct GraphStateEvaluation {
+    ContinuousExecutionState state;
+    double total_objective_us = 0.0;
+    std::uint32_t logical_partitions = 0;
+    std::vector<OperationOptimizationResult> operations;
+};
+
+ContinuousExecutionState default_continuous_state(const WorkloadSpec& workload, const SystemProfile& system) {
+    ContinuousExecutionState state;
+    state.queue_depth_scale = system.low_spec_mode ? 0.85 : 1.05;
+    state.stage_scale = system.low_spec_mode ? 0.90 : 1.10;
+    state.tile_scale = workload.matrix_friendly ? 1.10 : 1.00;
+    state.overlap_ratio = workload.latency_sensitive ? 0.25 : 0.45;
+    state.partition_intensity = system.low_spec_mode ? 0.20 : 0.35;
+    state.precision_mix = workload.matrix_friendly ? 0.60 : 0.35;
+    return clamp_state(state);
+}
+
+GraphStateEvaluation evaluate_global_state(
+    const ContinuousExecutionState& state,
+    const std::string& report_signature,
+    const WorkloadSpec& workload,
+    const ExecutionPlan& placement,
+    const std::vector<OperationSpec>& operations,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    const SystemProfile& system,
+    const std::unordered_map<std::string, ExecutionOptimizer::PerformanceSummary>& performance_cache,
+    const std::unordered_map<std::string, bool>& warmed_devices,
+    const std::string& graph_set_signature,
+    const std::unordered_map<std::string, ExecutionConfig>* cached_configs,
+    const bool keep_operations) {
+    GraphStateEvaluation evaluation;
+    evaluation.state = clamp_state(state);
+    if (keep_operations) {
+        evaluation.operations.reserve(operations.size());
+    }
+
+    for (const auto& operation : operations) {
+        const ExecutionConfig* cached_config = nullptr;
+        if (cached_configs != nullptr) {
+            if (const auto it = cached_configs->find(operation.name); it != cached_configs->end()) {
+                cached_config = &it->second;
+            }
+        }
+        auto optimized = optimize_operation(
+            report_signature,
+            operation,
+            workload,
+            placement,
+            graph_lookup,
+            system,
+            performance_cache,
+            warmed_devices,
+            graph_set_signature,
+            cached_config,
+            &evaluation.state);
+        if (optimized.config.signature.empty()) {
+            continue;
+        }
+        evaluation.total_objective_us += optimized.benchmark.objective_score;
+        evaluation.logical_partitions += optimized.config.logical_partitions;
+        if (keep_operations) {
+            evaluation.operations.push_back(std::move(optimized));
+        }
+    }
+
+    return evaluation;
+}
+
+GraphOptimizationSummary optimize_graph_continuous_state(
+    const std::string& report_signature,
+    const WorkloadSpec& workload,
+    const ExecutionPlan& placement,
+    const std::vector<OperationSpec>& operations,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    const SystemProfile& system,
+    const std::unordered_map<std::string, ExecutionOptimizer::PerformanceSummary>& performance_cache,
+    const std::unordered_map<std::string, bool>& warmed_devices,
+    const std::string& graph_set_signature,
+    const std::unordered_map<std::string, ExecutionConfig>* cached_configs) {
+    constexpr std::array<double, 6> kDeltas{0.15, 0.15, 0.12, 0.10, 0.12, 0.10};
+    constexpr double kBeta1 = 0.9;
+    constexpr double kBeta2 = 0.999;
+    constexpr double kEpsilon = 1.0e-8;
+
+    GraphOptimizationSummary summary;
+    summary.optimizer_name = "adam_surrogate";
+    auto state = default_continuous_state(workload, system);
+    summary.initial_state = state;
+
+    const auto initial = evaluate_global_state(
+        state,
+        report_signature,
+        workload,
+        placement,
+        operations,
+        graph_lookup,
+        system,
+        performance_cache,
+        warmed_devices,
+        graph_set_signature,
+        cached_configs,
+        false);
+    summary.initial_objective_us = initial.total_objective_us;
+
+    std::array<double, 6> m{};
+    std::array<double, 6> v{};
+    double learning_rate = system.low_spec_mode ? 0.06 : 0.08;
+    double best_objective = initial.total_objective_us;
+    auto best_state = state;
+
+    for (std::uint32_t pass_index = 1; pass_index <= 6u; ++pass_index) {
+        std::array<double, 6> gradient{};
+
+        for (std::size_t dim = 0; dim < gradient.size(); ++dim) {
+            auto plus = state;
+            auto minus = state;
+            switch (dim) {
+            case 0:
+                plus.queue_depth_scale += kDeltas[dim];
+                minus.queue_depth_scale -= kDeltas[dim];
+                break;
+            case 1:
+                plus.stage_scale += kDeltas[dim];
+                minus.stage_scale -= kDeltas[dim];
+                break;
+            case 2:
+                plus.tile_scale += kDeltas[dim];
+                minus.tile_scale -= kDeltas[dim];
+                break;
+            case 3:
+                plus.overlap_ratio += kDeltas[dim];
+                minus.overlap_ratio -= kDeltas[dim];
+                break;
+            case 4:
+                plus.partition_intensity += kDeltas[dim];
+                minus.partition_intensity -= kDeltas[dim];
+                break;
+            case 5:
+            default:
+                plus.precision_mix += kDeltas[dim];
+                minus.precision_mix -= kDeltas[dim];
+                break;
+            }
+
+            const auto plus_eval = evaluate_global_state(
+                clamp_state(plus),
+                report_signature,
+                workload,
+                placement,
+                operations,
+                graph_lookup,
+                system,
+                performance_cache,
+                warmed_devices,
+                graph_set_signature,
+                cached_configs,
+                false);
+            const auto minus_eval = evaluate_global_state(
+                clamp_state(minus),
+                report_signature,
+                workload,
+                placement,
+                operations,
+                graph_lookup,
+                system,
+                performance_cache,
+                warmed_devices,
+                graph_set_signature,
+                cached_configs,
+                false);
+            gradient[dim] = (plus_eval.total_objective_us - minus_eval.total_objective_us) / (2.0 * kDeltas[dim]);
+        }
+
+        double gradient_norm = 0.0;
+        for (double value : gradient) {
+            gradient_norm += value * value;
+        }
+        gradient_norm = std::sqrt(gradient_norm);
+
+        for (std::size_t dim = 0; dim < gradient.size(); ++dim) {
+            m[dim] = (kBeta1 * m[dim]) + ((1.0 - kBeta1) * gradient[dim]);
+            v[dim] = (kBeta2 * v[dim]) + ((1.0 - kBeta2) * gradient[dim] * gradient[dim]);
+        }
+
+        const double bias1 = 1.0 - std::pow(kBeta1, static_cast<double>(pass_index));
+        const double bias2 = 1.0 - std::pow(kBeta2, static_cast<double>(pass_index));
+        auto proposed = state;
+        for (std::size_t dim = 0; dim < gradient.size(); ++dim) {
+            const double m_hat = m[dim] / std::max(bias1, kEpsilon);
+            const double v_hat = v[dim] / std::max(bias2, kEpsilon);
+            const double update = learning_rate * m_hat / (std::sqrt(v_hat) + kEpsilon);
+            switch (dim) {
+            case 0:
+                proposed.queue_depth_scale -= update;
+                break;
+            case 1:
+                proposed.stage_scale -= update;
+                break;
+            case 2:
+                proposed.tile_scale -= update;
+                break;
+            case 3:
+                proposed.overlap_ratio -= update;
+                break;
+            case 4:
+                proposed.partition_intensity -= update;
+                break;
+            case 5:
+            default:
+                proposed.precision_mix -= update;
+                break;
+            }
+        }
+        proposed = clamp_state(proposed);
+
+        const auto proposed_eval = evaluate_global_state(
+            proposed,
+            report_signature,
+            workload,
+            placement,
+            operations,
+            graph_lookup,
+            system,
+            performance_cache,
+            warmed_devices,
+            graph_set_signature,
+            cached_configs,
+            false);
+        if (proposed_eval.total_objective_us < best_objective) {
+            best_objective = proposed_eval.total_objective_us;
+            best_state = proposed;
+            state = proposed;
+            learning_rate = std::min(0.12, learning_rate * 1.05);
+        } else {
+            learning_rate = std::max(0.02, learning_rate * 0.5);
+        }
+
+        summary.passes.push_back(GraphOptimizationPass{
+            pass_index,
+            proposed_eval.total_objective_us,
+            gradient_norm,
+            learning_rate,
+            state});
+    }
+
+    summary.final_state = best_state;
+    summary.final_objective_us = best_objective;
+    summary.converged = best_objective <= (summary.initial_objective_us * 0.995);
+    return summary;
+}
+
 ExecutionStrategy parse_strategy(const std::string_view value) {
     if (value == "sharded") {
         return ExecutionStrategy::sharded;
@@ -1235,12 +1760,14 @@ OperationOptimizationResult optimize_operation(
     const std::unordered_map<std::string, ExecutionOptimizer::PerformanceSummary>& performance_cache,
     const std::unordered_map<std::string, bool>& warmed_devices,
     const std::string& graph_set_signature,
-    const ExecutionConfig* cached_config) {
+    const ExecutionConfig* cached_config,
+    const ContinuousExecutionState* continuous_state) {
     std::vector<ExecutionConfig> candidates;
     if (cached_config != nullptr) {
         candidates.push_back(*cached_config);
     }
-    const auto generated = build_candidate_configs(operation, workload, placement, graph_lookup, system, report_signature);
+    const auto generated =
+        build_candidate_configs(operation, workload, placement, graph_lookup, system, continuous_state, report_signature);
     for (const auto& candidate : generated) {
         const auto duplicate = std::find_if(
             candidates.begin(),
@@ -1257,17 +1784,47 @@ OperationOptimizationResult optimize_operation(
         return {};
     }
 
+    std::string spsa_signature;
+    if (const auto spsa_candidate = make_spsa_candidate(
+            candidates.front(),
+            report_signature,
+            operation,
+            placement,
+            graph_lookup,
+            system,
+            warmed_devices);
+        spsa_candidate.has_value()) {
+        const auto duplicate = std::find_if(
+            candidates.begin(),
+            candidates.end(),
+            [&](const ExecutionConfig& existing) {
+                return existing.signature == spsa_candidate->signature;
+            });
+        if (duplicate == candidates.end()) {
+            spsa_signature = spsa_candidate->signature;
+            candidates.push_back(*spsa_candidate);
+        }
+    }
+
     const auto shape_bucket = shape_bucket_for(operation);
+    const double trace_weight = preset_trace_weight(workload);
+    std::vector<CandidateEvaluation> evaluations;
+    evaluations.reserve(candidates.size());
 
-    double best_objective = std::numeric_limits<double>::max();
-    OperationOptimizationResult best;
-
+    double log_observation_budget = 1.0;
     for (auto candidate : candidates) {
         auto graph = build_execution_graph(report_signature, operation, candidate, placement, graph_lookup);
         const double system_penalty_us = compute_surrogate_penalty_us(operation, candidate, system, warmed_devices);
         double learning_scale = 1.0;
-        if (const auto it = performance_cache.find(performance_key(graph_set_signature, system, shape_bucket, candidate));
+        std::uint32_t observations = 0;
+        double historical_latency_us = 0.0;
+        double average_reward = 0.0;
+        if (const auto it =
+                performance_cache.find(performance_key(graph_set_signature, workload, system, shape_bucket, candidate));
             it != performance_cache.end()) {
+            observations = it->second.observations;
+            historical_latency_us = it->second.average_effective_latency_us;
+            average_reward = it->second.average_reward;
             learning_scale = std::clamp(it->second.average_prediction_scale, 0.50, 2.50);
             if (it->second.observations < kLearningWarmupSamples) {
                 learning_scale *= 0.97;
@@ -1288,24 +1845,66 @@ OperationOptimizationResult optimize_operation(
             surrogate_latency_us,
             system_penalty_us);
 
-        double objective = surrogate_latency_us;
+        double heuristic_objective = surrogate_latency_us;
         if (!benchmark.simulated) {
-            objective = std::min(objective, benchmark.validation_latency_us);
+            heuristic_objective = std::min(heuristic_objective, benchmark.validation_latency_us);
         }
         if (!benchmark.accuracy_within_tolerance) {
             const double tolerance = std::max(candidate.target_error_tolerance, 1.0e-9);
-            objective *= 10.0 + (benchmark.relative_error / tolerance);
+            heuristic_objective *= 10.0 + (benchmark.relative_error / tolerance);
         }
 
-        if (objective < best_objective) {
-            best_objective = objective;
-            best.operation = operation;
-            best.config = std::move(candidate);
-            best.graph = std::move(graph);
-            best.benchmark = std::move(benchmark);
-        }
+        const double learned_objective =
+            (heuristic_objective * 0.55) + (benchmark.effective_latency_us * 0.45);
+        const double trace_objective =
+            observations == 0
+                ? learned_objective
+                : ((historical_latency_us * trace_weight) + learned_objective) / (trace_weight + 1.0);
+        log_observation_budget += static_cast<double>(observations + 1u);
+        const double exploration_bonus =
+            learned_objective * 0.35 *
+            std::sqrt(std::log(log_observation_budget + 1.0) / static_cast<double>(observations + 1u));
+        const double explore_objective = std::max(0.01, learned_objective - exploration_bonus);
+        const double preference_scale = std::exp(std::clamp(average_reward, -1.5, 1.5));
+        const double reinforce_objective = learned_objective / std::max(0.20, preference_scale);
+
+        benchmark.trace_weight = trace_weight;
+        evaluations.push_back(CandidateEvaluation{
+            std::move(candidate),
+            std::move(graph),
+            std::move(benchmark),
+            OptimizationPolicy::heuristic_greedy,
+            !spsa_signature.empty() && candidate.signature == spsa_signature,
+            heuristic_objective,
+            learned_objective,
+            trace_objective,
+            explore_objective,
+            reinforce_objective,
+            observations});
     }
 
+    if (evaluations.empty()) {
+        return {};
+    }
+
+    const auto selected_policy = select_policy_for_workload(workload, evaluations);
+    const auto winner = std::min_element(
+        evaluations.begin(),
+        evaluations.end(),
+        [&](const CandidateEvaluation& left, const CandidateEvaluation& right) {
+            return objective_for_policy(left, selected_policy) < objective_for_policy(right, selected_policy);
+        });
+
+    OperationOptimizationResult best;
+    best.operation = operation;
+    best.config = winner->config;
+    best.graph = std::move(winner->graph);
+    best.benchmark = std::move(winner->benchmark);
+    best.benchmark.optimizer_name = to_string(selected_policy);
+    if (winner->spsa_refined) {
+        best.benchmark.optimizer_name += "+spsa";
+    }
+    best.benchmark.objective_score = objective_for_policy(*winner, selected_policy);
     return best;
 }
 
@@ -1317,7 +1916,8 @@ void update_performance_summary(
     const double effective_latency_us,
     const double relative_error,
     const double predicted_latency_us,
-    const double system_penalty_us) {
+    const double system_penalty_us,
+    const double reward) {
     auto& summary = performance_cache[key];
     summary.shape_bucket = shape_bucket;
     summary.config = config;
@@ -1333,6 +1933,8 @@ void update_performance_summary(
         (prediction_scale - summary.average_prediction_scale) / sample_count;
     summary.average_system_penalty_us +=
         (system_penalty_us - summary.average_system_penalty_us) / sample_count;
+    summary.average_reward +=
+        (reward - summary.average_reward) / sample_count;
 }
 
 void update_device_learning_state(
@@ -1419,7 +2021,168 @@ std::string to_string(const ExecutionStrategy strategy) {
     }
 }
 
+std::string to_string(const OptimizationPolicy policy) {
+    switch (policy) {
+    case OptimizationPolicy::heuristic_greedy:
+        return "heuristic_greedy";
+    case OptimizationPolicy::learned_greedy:
+        return "learned_greedy";
+    case OptimizationPolicy::trace_replay:
+        return "trace_replay";
+    case OptimizationPolicy::ucb_explore:
+        return "ucb_explore";
+    case OptimizationPolicy::reinforce_softmax:
+        return "reinforce_softmax";
+    case OptimizationPolicy::spsa_local_search:
+        return "spsa_local_search";
+    default:
+        return "heuristic_greedy";
+    }
+}
+
 std::vector<OperationSpec> default_operation_suite(const WorkloadSpec& workload) {
+    const auto make_elementwise = [](
+                                      const std::string& name,
+                                      const std::uint64_t elements,
+                                      const double tolerance = 5.0e-4) {
+        return OperationSpec{
+            name,
+            OperationClass::elementwise_map,
+            {elements},
+            elements * sizeof(float) * 2ull,
+            elements * sizeof(float),
+            0,
+            static_cast<double>(elements) * 3.0,
+            tolerance,
+            true,
+            false,
+            true,
+            false};
+    };
+
+    const auto make_reduction = [](
+                                    const std::string& name,
+                                    const std::uint64_t elements,
+                                    const double tolerance = 1.0e-3) {
+        return OperationSpec{
+            name,
+            OperationClass::reduction,
+            {elements},
+            elements * sizeof(float),
+            sizeof(float),
+            32ull * kKiB,
+            static_cast<double>(elements),
+            tolerance,
+            true,
+            true,
+            false,
+            false};
+    };
+
+    const auto make_matmul = [](
+                                 const std::string& name,
+                                 const std::uint32_t m,
+                                 const std::uint32_t n,
+                                 const std::uint32_t k,
+                                 const double tolerance = 2.0e-3) {
+        return OperationSpec{
+            name,
+            OperationClass::matmul,
+            {m, n, k},
+            2ull * m * k * sizeof(float),
+            1ull * m * n * sizeof(float),
+            0,
+            2.0 * static_cast<double>(m) * static_cast<double>(n) * static_cast<double>(k),
+            tolerance,
+            true,
+            false,
+            false,
+            true};
+    };
+
+    const auto make_convolution = [](
+                                      const std::string& name,
+                                      const std::uint32_t height,
+                                      const std::uint32_t width,
+                                      const double tolerance = 2.0e-3) {
+        return OperationSpec{
+            name,
+            OperationClass::convolution_2d,
+            {height, width},
+            1ull * height * width * sizeof(float),
+            1ull * (height - 2u) * (width - 2u) * sizeof(float),
+            9ull * sizeof(float),
+            18.0 * static_cast<double>(height - 2u) * static_cast<double>(width - 2u),
+            tolerance,
+            true,
+            false,
+            true,
+            false};
+    };
+
+    const auto make_resample = [](
+                                   const std::string& name,
+                                   const std::uint32_t src_h,
+                                   const std::uint32_t src_w,
+                                   const std::uint32_t dst_h,
+                                   const std::uint32_t dst_w,
+                                   const double tolerance = 1.5e-3) {
+        return OperationSpec{
+            name,
+            OperationClass::resample_2d,
+            {src_h, src_w, dst_h, dst_w},
+            1ull * src_h * src_w * sizeof(float),
+            1ull * dst_h * dst_w * sizeof(float),
+            0,
+            8.0 * static_cast<double>(dst_h) * static_cast<double>(dst_w),
+            tolerance,
+            true,
+            false,
+            true,
+            false};
+    };
+
+    if (workload.dataset_tag == "gaming-fsr-like-720p-to-1080p") {
+        constexpr std::uint32_t src_h = 720u;
+        constexpr std::uint32_t src_w = 1280u;
+        constexpr std::uint32_t dst_h = 1080u;
+        constexpr std::uint32_t dst_w = 1920u;
+        return {
+            make_elementwise("frame-pre-tonemap", src_h * src_w),
+            make_elementwise("reactive-mask", src_h * src_w),
+            make_reduction("exposure-luma", src_h * src_w, 1.2e-3),
+            make_convolution("history-reconstruction", src_h, src_w),
+            make_convolution("detail-sharpen", src_h, src_w),
+            make_resample("upscale-resolve", src_h, src_w, dst_h, dst_w),
+            make_elementwise("post-tonemap", dst_h * dst_w)};
+    }
+
+    if (workload.dataset_tag == "ai-vision-inference-224") {
+        return {
+            make_convolution("stem-conv3x3", 224u, 224u),
+            make_matmul("patch-proj", 196u, 384u, 384u),
+            make_matmul("attention-qkv", 196u, 384u, 384u),
+            make_reduction("attention-score-reduce", 196ull * 384ull, 1.5e-3),
+            make_matmul("mlp-up", 196u, 768u, 384u),
+            make_elementwise("mlp-activation", 196ull * 768ull, 7.5e-4),
+            make_matmul("mlp-down", 196u, 384u, 768u),
+            make_reduction("token-pool", 196ull * 384ull, 1.5e-3)};
+    }
+
+    if (workload.dataset_tag == "ai-transformer-train-step-lite") {
+        return {
+            make_matmul("fwd-proj", 128u, 384u, 384u),
+            make_elementwise("fwd-activation", 128ull * 384ull, 7.5e-4),
+            make_matmul("fwd-head", 128u, 384u, 384u),
+            make_reduction("loss-reduce", 128ull * 384ull, 1.5e-3),
+            make_elementwise("loss-scale", 128ull * 384ull, 7.5e-4),
+            make_matmul("grad-head", 384u, 384u, 128u, 2.5e-3),
+            make_matmul("grad-input", 128u, 384u, 384u, 2.5e-3),
+            make_reduction("grad-norm", 384ull * 384ull, 1.5e-3),
+            make_elementwise("adam-moment", 384ull * 384ull, 7.5e-4),
+            make_elementwise("adam-update", 384ull * 384ull, 7.5e-4)};
+    }
+
     const std::uint64_t working_set =
         workload.working_set_bytes == 0 ? (32ull * kMiB) : workload.working_set_bytes;
     const std::uint64_t sample_bytes = clamp_u64(working_set / 12ull, 2ull * kMiB, 16ull * kMiB);
@@ -1516,10 +2279,24 @@ std::vector<OperationSpec> default_operation_suite(const WorkloadSpec& workload)
         false};
 
     switch (workload.kind) {
+    case WorkloadKind::gaming:
+        return {
+            make_elementwise("frame-pre-tonemap", 1280ull * 720ull),
+            make_reduction("exposure-luma", 1280ull * 720ull, 1.2e-3),
+            make_convolution("history-reconstruction", 720u, 1280u),
+            make_resample("upscale-resolve", 720u, 1280u, 1080u, 1920u),
+            make_elementwise("post-tonemap", 1920ull * 1080ull)};
     case WorkloadKind::image:
         return {elementwise, convolution, resample};
     case WorkloadKind::inference:
         return {elementwise, reduction, matmul, convolution};
+    case WorkloadKind::training:
+        return {
+            make_matmul("fwd-proj", 128u, matmul_side * 4u, matmul_side * 4u),
+            make_elementwise("fwd-activation", 128ull * matmul_side * 4ull, 7.5e-4),
+            make_matmul("grad-input", 128u, matmul_side * 4u, matmul_side * 4u, 2.5e-3),
+            make_reduction("grad-norm", static_cast<std::uint64_t>(matmul_side) * matmul_side * 16ull, 1.5e-3),
+            make_elementwise("adam-update", static_cast<std::uint64_t>(matmul_side) * matmul_side * 16ull, 7.5e-4)};
     case WorkloadKind::tensor:
         return {elementwise, reduction, matmul, convolution, resample};
     case WorkloadKind::custom:
@@ -1547,6 +2324,8 @@ OptimizationReport ExecutionOptimizer::optimize(
     load_cache();
 
     OptimizationReport report;
+    report.workload_kind = workload.kind;
+    report.dataset_tag = workload.dataset_tag;
     report.placement = placement;
     report.system_profile = capture_system_profile(workload, graphs);
     if (!device_sustained_slowdown_.empty()) {
@@ -1558,7 +2337,13 @@ OptimizationReport ExecutionOptimizer::optimize(
         report.system_profile.sustained_slowdown *=
             std::max(1.0, total_slowdown / static_cast<double>(device_sustained_slowdown_.size()));
     }
-    report.system_profile.cold_start = warmed_devices_.empty();
+    const double warmed_fraction =
+        graphs.empty() ? 0.0 : (static_cast<double>(warmed_devices_.size()) / static_cast<double>(graphs.size()));
+    report.system_profile.readiness_score = clamp_unit(
+        (0.12 + (0.88 * warmed_fraction * report.system_profile.amortization_gain)) /
+        std::max(report.system_profile.sustained_slowdown, 1.0));
+    report.system_profile.stability_score = clamp_unit(
+        report.system_profile.stability_score * (0.85 + (0.15 * warmed_fraction)));
 
     const auto operations = default_operation_suite(workload);
     report.signature = build_report_signature(workload, placement, operations);
@@ -1592,6 +2377,19 @@ OptimizationReport ExecutionOptimizer::optimize(
     std::vector<CachedConfig> persisted_configs;
     persisted_configs.reserve(operations.size());
 
+    std::unordered_map<std::string, ExecutionConfig> cache_input = cached_by_operation;
+    report.graph_optimization = optimize_graph_continuous_state(
+        report.signature,
+        workload,
+        placement,
+        operations,
+        graph_lookup,
+        report.system_profile,
+        performance_cache_,
+        warmed_devices_,
+        graph_set_signature,
+        fully_cached ? &cache_input : nullptr);
+
     for (const auto& operation : operations) {
         const auto cached_it = cached_by_operation.find(operation.name);
         const ExecutionConfig* cached_config = cached_it == cached_by_operation.end() ? nullptr : &cached_it->second;
@@ -1605,13 +2403,15 @@ OptimizationReport ExecutionOptimizer::optimize(
             performance_cache_,
             warmed_devices_,
             graph_set_signature,
-            cached_config);
+            cached_config,
+            &report.graph_optimization.final_state);
         if (result.config.signature.empty()) {
             continue;
         }
 
         const auto perf_key = performance_key(
             graph_set_signature,
+            workload,
             report.system_profile,
             result.benchmark.shape_bucket,
             result.config);
@@ -1623,7 +2423,8 @@ OptimizationReport ExecutionOptimizer::optimize(
             result.benchmark.effective_latency_us,
             result.benchmark.relative_error,
             result.graph.predicted_latency_us,
-            result.benchmark.system_penalty_us);
+            result.benchmark.system_penalty_us,
+            std::log(std::max(result.benchmark.speedup_vs_reference, 1.0e-6)));
         update_device_learning_state(
             warmed_devices_,
             device_sustained_slowdown_,
@@ -1634,6 +2435,7 @@ OptimizationReport ExecutionOptimizer::optimize(
         persisted_configs.push_back(CachedConfig{
             operation.name,
             result.config});
+        report.graph_optimization.total_logical_partitions += result.config.logical_partitions;
         report.operations.push_back(std::move(result));
     }
 
@@ -1660,6 +2462,17 @@ void ExecutionOptimizer::ingest_execution_feedback(
     }
 
     const auto graph_set_signature = summarize_graph_set(graphs);
+    const WorkloadSpec feedback_workload{
+        report.signature,
+        report.workload_kind,
+        report.dataset_tag,
+        0,
+        0,
+        0.0,
+        1,
+        false,
+        false,
+        false};
     for (const auto& optimized : report.operations) {
         const auto feedback_it = feedback_by_operation.find(optimized.operation.name);
         if (feedback_it == feedback_by_operation.end()) {
@@ -1672,6 +2485,7 @@ void ExecutionOptimizer::ingest_execution_feedback(
             std::max(0.0, effective_latency_us - std::max(optimized.graph.predicted_latency_us, 0.0));
         const auto perf_key = performance_key(
             graph_set_signature,
+            feedback_workload,
             report.system_profile,
             optimized.benchmark.shape_bucket,
             optimized.config);
@@ -1683,7 +2497,8 @@ void ExecutionOptimizer::ingest_execution_feedback(
             effective_latency_us,
             record.relative_error,
             optimized.graph.predicted_latency_us,
-            observed_penalty_us);
+            observed_penalty_us,
+            std::log(std::max(record.reference_runtime_us / effective_latency_us, 1.0e-6)));
         update_device_learning_state(
             warmed_devices_,
             device_sustained_slowdown_,
@@ -1749,7 +2564,7 @@ void ExecutionOptimizer::load_cache() {
         }
 
         const auto fields = split_tab(line);
-        if (fields.size() != 18) {
+        if (fields.size() != 19) {
             continue;
         }
 
@@ -1772,6 +2587,7 @@ void ExecutionOptimizer::load_cache() {
             summary.average_relative_error = std::stod(fields[15]);
             summary.average_prediction_scale = std::stod(fields[16]);
             summary.average_system_penalty_us = std::stod(fields[17]);
+            summary.average_reward = std::stod(fields[18]);
             performance_cache_[fields[0]] = std::move(summary);
         } catch (const std::exception&) {
             continue;
@@ -1817,7 +2633,7 @@ void ExecutionOptimizer::persist_cache() const {
     }
 
     performance_output
-        << "# key\tshape_bucket\toperation\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\toverlap\tlow_precision\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_system_penalty\n";
+        << "# key\tshape_bucket\toperation\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\toverlap\tlow_precision\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_system_penalty\tavg_reward\n";
     for (const auto& [key, summary] : performance_cache_) {
         performance_output << key << '\t'
                            << summary.shape_bucket << '\t'
@@ -1836,7 +2652,8 @@ void ExecutionOptimizer::persist_cache() const {
                            << summary.average_effective_latency_us << '\t'
                            << summary.average_relative_error << '\t'
                            << summary.average_prediction_scale << '\t'
-                           << summary.average_system_penalty_us << '\n';
+                           << summary.average_system_penalty_us << '\t'
+                           << summary.average_reward << '\n';
     }
 }
 
