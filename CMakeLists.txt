@@ -16,11 +16,13 @@ add_library(gpu_runtime
     src/gpu_toolkit.cpp
     src/executors/common_scheduler.cpp
     src/executors/direct_backends.cpp
+    src/executors/native_gpu_backends.cpp
     src/planner.cpp
     src/workloads.cpp
     src/runtime.cpp
     src/c_api.cpp
     src/backends/cpu_backend.cpp
+    src/backends/native_gpu_probes.cpp
     src/backends/opencl_backend.cpp)
 
 add_library(gpu::runtime ALIAS gpu_runtime)
@@ -48,6 +50,9 @@ if(GPU_BUILD_EXAMPLES)
 
     add_executable(gpu_profile_workloads examples/profile_workloads.cpp)
     target_link_libraries(gpu_profile_workloads PRIVATE gpu::runtime)
+
+    add_executable(gpu_explore_cpu_dl examples/explore_cpu_dl.cpp)
+    target_link_libraries(gpu_explore_cpu_dl PRIVATE gpu::runtime)
 endif()
 
 if(GPU_BUILD_TESTS)

@@ -115,6 +115,79 @@ void fill_graph_edge_info(const gpu::HardwareGraphEdge& edge, gpu_graph_edge_inf
     out_edge->latency_us = edge.latency_us;
 }
 
+void fill_optimization_info(const gpu::OptimizationReport& report, gpu_optimization_info* out_optimization) {
+    if (out_optimization == nullptr) {
+        return;
+    }
+
+    copy_string(report.signature, out_optimization->signature, sizeof(out_optimization->signature));
+    copy_string(gpu::to_string(report.workload_kind), out_optimization->workload_kind, sizeof(out_optimization->workload_kind));
+    copy_string(report.dataset_tag, out_optimization->dataset_tag, sizeof(out_optimization->dataset_tag));
+    out_optimization->operation_count = static_cast<unsigned long long>(report.operations.size());
+    out_optimization->tensor_count = static_cast<unsigned long long>(report.workload_graph.tensors.size());
+    out_optimization->dependency_count = static_cast<unsigned long long>(report.workload_graph.dependencies.size());
+    out_optimization->readiness_score = report.system_profile.readiness_score;
+    out_optimization->stability_score = report.system_profile.stability_score;
+    out_optimization->sustained_slowdown = report.system_profile.sustained_slowdown;
+    out_optimization->loaded_from_cache = report.loaded_from_cache ? 1 : 0;
+}
+
+void fill_operation_optimization_info(
+    const gpu::OperationOptimizationResult& operation,
+    gpu_operation_optimization_info* out_operation) {
+    if (out_operation == nullptr) {
+        return;
+    }
+
+    copy_string(operation.operation.name, out_operation->operation_name, sizeof(out_operation->operation_name));
+    copy_string(gpu::to_string(operation.config.strategy), out_operation->strategy, sizeof(out_operation->strategy));
+    copy_string(operation.config.primary_device_uid, out_operation->primary_device_uid, sizeof(out_operation->primary_device_uid));
+    out_operation->logical_partitions = operation.config.logical_partitions;
+    out_operation->participating_device_count = static_cast<unsigned int>(operation.config.participating_devices.size());
+    out_operation->predicted_latency_us = operation.graph.predicted_latency_us;
+    out_operation->predicted_speedup_vs_reference = operation.graph.predicted_speedup_vs_reference;
+    out_operation->predicted_transfer_latency_us = operation.graph.predicted_transfer_latency_us;
+    out_operation->predicted_memory_pressure = operation.graph.predicted_memory_pressure;
+    out_operation->peak_resident_bytes = operation.graph.peak_resident_bytes;
+    out_operation->target_error_tolerance = operation.config.target_error_tolerance;
+    out_operation->use_low_precision = operation.config.use_low_precision ? 1 : 0;
+}
+
+void fill_execution_info(const gpu::DirectExecutionReport& report, gpu_execution_info* out_execution) {
+    if (out_execution == nullptr) {
+        return;
+    }
+
+    copy_string(report.optimization.signature, out_execution->signature, sizeof(out_execution->signature));
+    out_execution->operation_count = static_cast<unsigned long long>(report.operations.size());
+    out_execution->total_runtime_us = report.total_runtime_us;
+    out_execution->total_reference_runtime_us = report.total_reference_runtime_us;
+    out_execution->speedup_vs_reference = report.speedup_vs_reference;
+    out_execution->all_succeeded = report.all_succeeded ? 1 : 0;
+}
+
+void fill_execution_operation_info(
+    const gpu::OperationExecutionRecord& operation,
+    gpu_execution_operation_info* out_operation) {
+    if (out_operation == nullptr) {
+        return;
+    }
+
+    copy_string(operation.operation_name, out_operation->operation_name, sizeof(out_operation->operation_name));
+    copy_string(operation.backend_name, out_operation->backend_name, sizeof(out_operation->backend_name));
+    copy_string(operation.requested_gpu_vendor, out_operation->requested_gpu_vendor, sizeof(out_operation->requested_gpu_vendor));
+    copy_string(operation.requested_gpu_backend, out_operation->requested_gpu_backend, sizeof(out_operation->requested_gpu_backend));
+    out_operation->runtime_us = operation.runtime_us;
+    out_operation->reference_runtime_us = operation.reference_runtime_us;
+    out_operation->speedup_vs_reference = operation.speedup_vs_reference;
+    out_operation->relative_error = operation.relative_error;
+    out_operation->verified = operation.verified ? 1 : 0;
+    out_operation->used_host = operation.used_host ? 1 : 0;
+    out_operation->used_opencl = operation.used_opencl ? 1 : 0;
+    out_operation->used_multiple_devices = operation.used_multiple_devices ? 1 : 0;
+    out_operation->logical_partitions_used = operation.logical_partitions_used;
+}
+
 gpu::WorkloadKind parse_workload_kind(const char* kind) {
     if (kind == nullptr) {
         return gpu::WorkloadKind::custom;
@@ -129,6 +202,12 @@ gpu::WorkloadKind parse_workload_kind(const char* kind) {
     }
     if (value == "tensor") {
         return gpu::WorkloadKind::tensor;
+    }
+    if (value == "gaming") {
+        return gpu::WorkloadKind::gaming;
+    }
+    if (value == "training") {
+        return gpu::WorkloadKind::training;
     }
     return gpu::WorkloadKind::custom;
 }
@@ -288,6 +367,82 @@ int gpu_runtime_plan(
         fill_device_info(plan.allocations[index].device, &entries[index].device);
         entries[index].ratio = plan.allocations[index].ratio;
         entries[index].score = plan.allocations[index].score;
+    }
+
+    return 0;
+}
+
+int gpu_runtime_optimize(
+    gpu_runtime_t* runtime,
+    const gpu_workload_spec* workload,
+    gpu_optimization_info* out_optimization,
+    gpu_operation_optimization_info* operations,
+    size_t capacity,
+    size_t* out_count) {
+    if (runtime == nullptr || workload == nullptr || out_count == nullptr) {
+        return -1;
+    }
+
+    const gpu::WorkloadSpec cpp_workload{
+        workload->name == nullptr ? std::string("unnamed") : std::string(workload->name),
+        parse_workload_kind(workload->kind),
+        "",
+        workload->working_set_bytes,
+        workload->host_exchange_bytes,
+        workload->estimated_flops,
+        workload->batch_size,
+        workload->latency_sensitive != 0,
+        workload->prefer_unified_memory != 0,
+        workload->matrix_friendly != 0};
+
+    const auto report = runtime->runtime.optimize(cpp_workload);
+    *out_count = report.operations.size();
+    fill_optimization_info(report, out_optimization);
+
+    if (operations == nullptr || capacity < report.operations.size()) {
+        return -2;
+    }
+
+    for (size_t index = 0; index < report.operations.size(); ++index) {
+        fill_operation_optimization_info(report.operations[index], &operations[index]);
+    }
+
+    return 0;
+}
+
+int gpu_runtime_execute(
+    gpu_runtime_t* runtime,
+    const gpu_workload_spec* workload,
+    gpu_execution_info* out_execution,
+    gpu_execution_operation_info* operations,
+    size_t capacity,
+    size_t* out_count) {
+    if (runtime == nullptr || workload == nullptr || out_count == nullptr) {
+        return -1;
+    }
+
+    const gpu::WorkloadSpec cpp_workload{
+        workload->name == nullptr ? std::string("unnamed") : std::string(workload->name),
+        parse_workload_kind(workload->kind),
+        "",
+        workload->working_set_bytes,
+        workload->host_exchange_bytes,
+        workload->estimated_flops,
+        workload->batch_size,
+        workload->latency_sensitive != 0,
+        workload->prefer_unified_memory != 0,
+        workload->matrix_friendly != 0};
+
+    const auto report = runtime->runtime.execute(cpp_workload);
+    *out_count = report.operations.size();
+    fill_execution_info(report, out_execution);
+
+    if (operations == nullptr || capacity < report.operations.size()) {
+        return -2;
+    }
+
+    for (size_t index = 0; index < report.operations.size(); ++index) {
+        fill_execution_operation_info(report.operations[index], &operations[index]);
     }
 
     return 0;

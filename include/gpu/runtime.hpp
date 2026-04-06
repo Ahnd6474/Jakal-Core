@@ -15,6 +15,9 @@ namespace gpu {
 struct RuntimeOptions {
     bool enable_host_probe = true;
     bool enable_opencl_probe = true;
+    bool enable_level_zero_probe = true;
+    bool enable_cuda_probe = true;
+    bool enable_rocm_probe = true;
     std::filesystem::path cache_path;
     std::filesystem::path execution_cache_path;
 };

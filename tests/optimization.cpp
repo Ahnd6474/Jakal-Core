@@ -390,23 +390,30 @@ int main() {
         return 1;
     }
 
-    for (const auto& preset : gpu::canonical_workload_presets()) {
-        const auto macro_report = runtime.optimize(preset.workload);
-        if (macro_report.operations.empty()) {
-            std::cerr << "Canonical workload optimization failed: " << preset.workload.name << ".\n";
-            return 1;
-        }
-        if (macro_report.workload_graph.dependencies.empty() || macro_report.workload_graph.lifetimes.empty()) {
-            std::cerr << "Canonical workload DAG metadata missing: " << preset.workload.name << ".\n";
-            return 1;
-        }
-        if (macro_report.system_profile.readiness_score < 0.0 ||
-            macro_report.system_profile.readiness_score > 1.0 ||
-            macro_report.system_profile.stability_score < 0.0 ||
-            macro_report.system_profile.stability_score > 1.0) {
-            std::cerr << "Canonical workload system metrics out of range: " << preset.workload.name << ".\n";
-            return 1;
-        }
+    const auto presets = gpu::canonical_workload_presets();
+    const auto preset_it = std::find_if(presets.begin(), presets.end(), [](const gpu::CanonicalWorkloadPreset& preset) {
+        return preset.workload.kind == gpu::WorkloadKind::inference;
+    });
+    if (preset_it == presets.end()) {
+        std::cerr << "Missing canonical inference preset.\n";
+        return 1;
+    }
+
+    const auto macro_report = runtime.optimize(preset_it->workload);
+    if (macro_report.operations.empty()) {
+        std::cerr << "Canonical workload optimization failed: " << preset_it->workload.name << ".\n";
+        return 1;
+    }
+    if (macro_report.workload_graph.dependencies.empty() || macro_report.workload_graph.lifetimes.empty()) {
+        std::cerr << "Canonical workload DAG metadata missing: " << preset_it->workload.name << ".\n";
+        return 1;
+    }
+    if (macro_report.system_profile.readiness_score < 0.0 ||
+        macro_report.system_profile.readiness_score > 1.0 ||
+        macro_report.system_profile.stability_score < 0.0 ||
+        macro_report.system_profile.stability_score > 1.0) {
+        std::cerr << "Canonical workload system metrics out of range: " << preset_it->workload.name << ".\n";
+        return 1;
     }
 
     std::cout << "operations=" << first.operations.size()

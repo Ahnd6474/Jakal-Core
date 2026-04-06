@@ -86,6 +86,15 @@ Runtime::Runtime(RuntimeOptions options)
     if (options_.enable_opencl_probe) {
         probes_.push_back(make_opencl_probe());
     }
+    if (options_.enable_level_zero_probe) {
+        probes_.push_back(make_level_zero_probe());
+    }
+    if (options_.enable_cuda_probe) {
+        probes_.push_back(make_cuda_probe());
+    }
+    if (options_.enable_rocm_probe) {
+        probes_.push_back(make_rocm_probe());
+    }
     refresh_hardware();
 }
 

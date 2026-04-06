@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #include <utility>
 
 namespace gpu {
@@ -281,6 +282,70 @@ std::vector<CanonicalWorkloadPreset> canonical_workload_presets() {
             "single-device reference kernels"}};
 }
 
+std::vector<CpuDeepLearningExplorationPreset> cpu_deep_learning_exploration_presets() {
+    return {
+        CpuDeepLearningExplorationPreset{
+            WorkloadSpec{
+                "llm-prefill-context-lite",
+                WorkloadKind::inference,
+                "llm-prefill-context-lite",
+                896ull * kMiB,
+                48ull * kMiB,
+                2.8e11,
+                1,
+                false,
+                false,
+                true},
+            "Longer-context transformer prefill surrogate with several medium GEMMs plus norm and reduction stages.",
+            "Large projection work should stay on GPU, but norm, score reduction, and logits post-process can be candidates for host execution or overlap.",
+            "Most matmuls avoid the host while lighter reductions and elementwise stages can land on the CPU without hurting total latency."},
+        CpuDeepLearningExplorationPreset{
+            WorkloadSpec{
+                "llm-decode-token-lite",
+                WorkloadKind::inference,
+                "llm-decode-token-lite",
+                640ull * kMiB,
+                12ull * kMiB,
+                3.8e10,
+                1,
+                true,
+                true,
+                true},
+            "Single-token decode surrogate with tiny GEMMs, persistent KV cache, and strict latency sensitivity.",
+            "Batch-1 decode is where the CPU may become useful again because dispatch overhead can dominate very small GEMMs and cache-touching work.",
+            "The planner or executor chooses host or mixed execution for several decode stages instead of forcing every op through a GPU path."},
+        CpuDeepLearningExplorationPreset{
+            WorkloadSpec{
+                "llm-kv-cache-update-lite",
+                WorkloadKind::inference,
+                "llm-kv-cache-update-lite",
+                1024ull * kMiB,
+                192ull * kMiB,
+                4.5e10,
+                1,
+                true,
+                true,
+                false},
+            "KV-cache maintenance surrogate with persistent cache pages, cache-window scans, and lightweight attention bookkeeping.",
+            "CPU and unified memory may be better for cache paging, eviction, and scan-heavy work than pushing every update through a discrete device.",
+            "Persistent cache tensors remain host-visible and the runtime keeps a meaningful fraction of cache maintenance work on the CPU side."},
+        CpuDeepLearningExplorationPreset{
+            WorkloadSpec{
+                "llm-int4-dequant-lite",
+                WorkloadKind::inference,
+                "llm-int4-dequant-lite",
+                768ull * kMiB,
+                96ull * kMiB,
+                7.2e10,
+                4,
+                true,
+                true,
+                true},
+            "Quantized weight pipeline surrogate with unpack, dequantize, fused matmul, and residual update stages.",
+            "CPU-side unpacking or dequant staging may reduce GPU pressure if it overlaps well with the main matrix multiply.",
+            "Elementwise unpack and dequant stages show as host-friendly while the main fused matmul still prefers GPU or mixed placement."}};
+}
+
 WorkloadGraph default_workload_graph(const WorkloadSpec& workload) {
     WorkloadGraph graph;
     graph.signature = workload.name + "|" + to_string(workload.kind) + "|" + workload.dataset_tag;
@@ -327,6 +392,109 @@ WorkloadGraph default_workload_graph(const WorkloadSpec& workload) {
             make_convolution("detail-sharpen", src_h, src_w, {"history-reconstruct"}, {"detail-sharp"}, {"detail-sharpen.ws"}),
             make_resample("upscale-resolve", src_h, src_w, dst_h, dst_w, {"detail-sharp"}, {"frame-upscaled"}),
             make_elementwise("post-tonemap", dst_h * dst_w, {"frame-upscaled", "exposure-luma"}, {"present-frame"})};
+    } else if (workload.dataset_tag == "llm-prefill-context-lite") {
+        constexpr std::uint32_t token_count = 192u;
+        constexpr std::uint32_t hidden = 320u;
+        constexpr std::uint32_t qkv = hidden * 3u;
+        constexpr std::uint32_t mlp = 896u;
+        constexpr std::uint32_t vocab_slice = 512u;
+        add_tensor(graph, "token-embeddings", 1ull * token_count * hidden * sizeof(float), "", {"token-rmsnorm"}, false, false, true);
+        add_tensor(graph, "rms-weights", 1ull * hidden * sizeof(float), "", {"token-rmsnorm"}, true, false, true, "weights");
+        add_tensor(graph, "normed-tokens", 1ull * token_count * hidden * sizeof(float), "token-rmsnorm", {"attention-qkv"});
+        add_tensor(graph, "qkv-weights", 1ull * hidden * qkv * sizeof(float), "", {"attention-qkv"}, true, false, true, "weights");
+        add_tensor(graph, "qkv-out", 1ull * token_count * qkv * sizeof(float), "attention-qkv", {"attention-score-reduce", "context-proj"});
+        add_tensor(graph, "attn-score", sizeof(float), "attention-score-reduce", {"mlp-gate", "logits-proj"}, true);
+        add_tensor(graph, "context-weights", 1ull * hidden * hidden * sizeof(float), "", {"context-proj"}, true, false, true, "weights");
+        add_tensor(graph, "context-out", 1ull * token_count * hidden * sizeof(float), "context-proj", {"mlp-up"});
+        add_tensor(graph, "mlp-up-weights", 1ull * hidden * mlp * sizeof(float), "", {"mlp-up"}, true, false, true, "weights");
+        add_tensor(graph, "mlp-up-out", 1ull * token_count * mlp * sizeof(float), "mlp-up", {"mlp-gate"});
+        add_tensor(graph, "mlp-gated", 1ull * token_count * mlp * sizeof(float), "mlp-gate", {"mlp-down"});
+        add_tensor(graph, "mlp-down-weights", 1ull * hidden * mlp * sizeof(float), "", {"mlp-down"}, true, false, true, "weights");
+        add_tensor(graph, "decode-state", 1ull * token_count * hidden * sizeof(float), "mlp-down", {"logits-proj"});
+        add_tensor(graph, "logits-weights", 1ull * hidden * vocab_slice * sizeof(float), "", {"logits-proj"}, true, false, true, "weights");
+        add_tensor(graph, "logits-out", 1ull * token_count * vocab_slice * sizeof(float), "logits-proj", {"logits-max"});
+        add_tensor(graph, "token-logit-max", sizeof(float), "logits-max", {});
+        graph.operations = {
+            make_elementwise("token-rmsnorm", token_count * hidden, {"token-embeddings", "rms-weights"}, {"normed-tokens"}),
+            make_matmul("attention-qkv", token_count, qkv, hidden, {"normed-tokens", "qkv-weights"}, {"qkv-out"}),
+            make_reduction("attention-score-reduce", token_count * qkv, {"qkv-out"}, {"attn-score"}, {}, 1.5e-3),
+            make_matmul("context-proj", token_count, hidden, hidden, {"qkv-out", "context-weights"}, {"context-out"}),
+            make_matmul("mlp-up", token_count, mlp, hidden, {"context-out", "mlp-up-weights"}, {"mlp-up-out"}),
+            make_elementwise("mlp-gate", token_count * mlp, {"mlp-up-out", "attn-score"}, {"mlp-gated"}, {}, 7.5e-4),
+            make_matmul("mlp-down", token_count, hidden, mlp, {"mlp-gated", "mlp-down-weights"}, {"decode-state"}),
+            make_matmul("logits-proj", token_count, vocab_slice, hidden, {"decode-state", "logits-weights"}, {"logits-out"}),
+            make_reduction("logits-max", token_count * vocab_slice, {"logits-out"}, {"token-logit-max"}, {}, 1.5e-3)};
+    } else if (workload.dataset_tag == "llm-decode-token-lite") {
+        constexpr std::uint32_t token_count = 1u;
+        constexpr std::uint32_t hidden = 320u;
+        constexpr std::uint32_t qkv = hidden * 3u;
+        constexpr std::uint32_t mlp = 896u;
+        constexpr std::uint32_t cache_tokens = 2048u;
+        add_tensor(graph, "decode-token", 1ull * hidden * sizeof(float), "", {"decode-rmsnorm"}, false, false, true);
+        add_tensor(graph, "decode-rms-weights", 1ull * hidden * sizeof(float), "", {"decode-rmsnorm"}, true, false, true, "weights");
+        add_tensor(graph, "decode-normed", 1ull * hidden * sizeof(float), "decode-rmsnorm", {"decode-qkv"});
+        add_tensor(graph, "decode-qkv-weights", 1ull * hidden * qkv * sizeof(float), "", {"decode-qkv"}, true, false, true, "weights");
+        add_tensor(graph, "decode-qkv-out", 1ull * qkv * sizeof(float), "decode-qkv", {"kv-append", "decode-score-reduce", "decode-context"});
+        add_tensor(graph, "kv-cache", 1ull * cache_tokens * hidden * 2ull * sizeof(float), "", {"kv-append", "decode-score-reduce", "decode-context"}, true, false, true, "cache");
+        add_tensor(graph, "kv-cache-next", 1ull * cache_tokens * hidden * 2ull * sizeof(float), "kv-append", {"decode-context"}, true, false, true, "cache");
+        add_tensor(graph, "decode-score", sizeof(float), "decode-score-reduce", {"decode-mlp-gate", "decode-sample"}, true);
+        add_tensor(graph, "decode-context-weights", 1ull * hidden * hidden * sizeof(float), "", {"decode-context"}, true, false, true, "weights");
+        add_tensor(graph, "decode-context-out", 1ull * hidden * sizeof(float), "decode-context", {"decode-mlp-up"});
+        add_tensor(graph, "decode-mlp-up-weights", 1ull * hidden * mlp * sizeof(float), "", {"decode-mlp-up"}, true, false, true, "weights");
+        add_tensor(graph, "decode-mlp-up-out", 1ull * mlp * sizeof(float), "decode-mlp-up", {"decode-mlp-gate"});
+        add_tensor(graph, "decode-mlp-gated", 1ull * mlp * sizeof(float), "decode-mlp-gate", {"decode-mlp-down"});
+        add_tensor(graph, "decode-mlp-down-weights", 1ull * hidden * mlp * sizeof(float), "", {"decode-mlp-down"}, true, false, true, "weights");
+        add_tensor(graph, "decode-state", 1ull * hidden * sizeof(float), "decode-mlp-down", {"decode-sample"});
+        add_tensor(graph, "sampled-logit", sizeof(float), "decode-sample", {});
+        graph.operations = {
+            make_elementwise("decode-rmsnorm", hidden, {"decode-token", "decode-rms-weights"}, {"decode-normed"}),
+            make_matmul("decode-qkv", token_count, qkv, hidden, {"decode-normed", "decode-qkv-weights"}, {"decode-qkv-out"}),
+            make_elementwise("kv-append", hidden * 2u, {"decode-qkv-out", "kv-cache"}, {"kv-cache-next"}, {}, 7.5e-4),
+            make_reduction("decode-score-reduce", static_cast<std::uint64_t>(cache_tokens) * hidden, {"decode-qkv-out", "kv-cache"}, {"decode-score"}, {}, 1.5e-3),
+            make_matmul("decode-context", token_count, hidden, hidden, {"decode-qkv-out", "decode-context-weights", "kv-cache-next"}, {"decode-context-out"}),
+            make_matmul("decode-mlp-up", token_count, mlp, hidden, {"decode-context-out", "decode-mlp-up-weights"}, {"decode-mlp-up-out"}),
+            make_elementwise("decode-mlp-gate", mlp, {"decode-mlp-up-out", "decode-score"}, {"decode-mlp-gated"}, {}, 7.5e-4),
+            make_matmul("decode-mlp-down", token_count, hidden, mlp, {"decode-mlp-gated", "decode-mlp-down-weights"}, {"decode-state"}),
+            make_reduction("decode-sample", hidden, {"decode-state", "decode-score"}, {"sampled-logit"}, {}, 1.5e-3)};
+    } else if (workload.dataset_tag == "llm-kv-cache-update-lite") {
+        constexpr std::uint32_t cache_tokens = 4096u;
+        constexpr std::uint32_t hidden = 256u;
+        constexpr std::uint32_t cache_scan = 8192u;
+        add_tensor(graph, "cache-pages", 1ull * cache_tokens * hidden * sizeof(float), "", {"cache-window-scan", "cache-page-read"}, true, false, true, "cache");
+        add_tensor(graph, "cache-metadata", 1ull * cache_tokens * sizeof(float), "", {"cache-window-scan", "cache-evict-score"}, true, false, true, "cache-meta");
+        add_tensor(graph, "query-state", 1ull * hidden * sizeof(float), "", {"cache-page-read", "cache-value-merge"}, false, false, true);
+        add_tensor(graph, "scan-score", sizeof(float), "cache-window-scan", {"cache-page-read", "cache-value-merge"}, true);
+        add_tensor(graph, "cache-page", 1ull * hidden * sizeof(float), "cache-page-read", {"cache-rope-rotate", "cache-value-merge"});
+        add_tensor(graph, "cache-rotated", 1ull * hidden * sizeof(float), "cache-rope-rotate", {"cache-value-merge"});
+        add_tensor(graph, "cache-merged", 1ull * hidden * sizeof(float), "cache-value-merge", {"cache-evict-score", "cache-writeback"});
+        add_tensor(graph, "evict-score", sizeof(float), "cache-evict-score", {"cache-writeback"}, true);
+        add_tensor(graph, "cache-pages-next", 1ull * cache_tokens * hidden * sizeof(float), "cache-writeback", {}, true, false, true, "cache");
+        graph.operations = {
+            make_reduction("cache-window-scan", static_cast<std::uint64_t>(cache_scan) * hidden, {"cache-pages", "cache-metadata"}, {"scan-score"}, {}, 1.5e-3),
+            make_elementwise("cache-page-read", hidden, {"cache-pages", "query-state", "scan-score"}, {"cache-page"}),
+            make_elementwise("cache-rope-rotate", hidden, {"cache-page", "query-state"}, {"cache-rotated"}, {}, 7.5e-4),
+            make_elementwise("cache-value-merge", hidden, {"cache-rotated", "query-state", "scan-score"}, {"cache-merged"}, {}, 7.5e-4),
+            make_reduction("cache-evict-score", static_cast<std::uint64_t>(cache_tokens), {"cache-merged", "cache-metadata"}, {"evict-score"}, {}, 1.5e-3),
+            make_elementwise("cache-writeback", hidden, {"cache-merged", "evict-score", "cache-pages"}, {"cache-pages-next"}, {}, 7.5e-4)};
+    } else if (workload.dataset_tag == "llm-int4-dequant-lite") {
+        constexpr std::uint32_t token_count = 16u;
+        constexpr std::uint32_t hidden = 256u;
+        constexpr std::uint32_t blocks = hidden * hidden;
+        add_tensor(graph, "quant-input", 1ull * token_count * hidden * sizeof(float), "", {"unpack-nibbles"}, false, false, true);
+        add_tensor(graph, "packed-weights", 1ull * blocks, "", {"unpack-nibbles"}, true, false, true, "weights-packed");
+        add_tensor(graph, "quant-scales", 1ull * hidden * sizeof(float), "", {"dequant-blocks"}, true, false, true, "weights-meta");
+        add_tensor(graph, "unpacked-weights", 1ull * blocks * sizeof(float), "unpack-nibbles", {"dequant-blocks"});
+        add_tensor(graph, "dequant-weights", 1ull * blocks * sizeof(float), "dequant-blocks", {"fused-int4-matmul"});
+        add_tensor(graph, "fused-out", 1ull * token_count * hidden * sizeof(float), "fused-int4-matmul", {"residual-add", "logit-reduce"});
+        add_tensor(graph, "residual-state", 1ull * token_count * hidden * sizeof(float), "", {"residual-add"}, true, false, true);
+        add_tensor(graph, "residual-out", 1ull * token_count * hidden * sizeof(float), "residual-add", {"logit-reduce"});
+        add_tensor(graph, "block-max", sizeof(float), "logit-reduce", {});
+        graph.operations = {
+            make_elementwise("unpack-nibbles", blocks, {"quant-input", "packed-weights"}, {"unpacked-weights"}, {}, 7.5e-4),
+            make_elementwise("dequant-blocks", blocks, {"unpacked-weights", "quant-scales"}, {"dequant-weights"}, {}, 7.5e-4),
+            make_matmul("fused-int4-matmul", token_count, hidden, hidden, {"quant-input", "dequant-weights"}, {"fused-out"}),
+            make_elementwise("residual-add", token_count * hidden, {"fused-out", "residual-state"}, {"residual-out"}, {}, 7.5e-4),
+            make_reduction("logit-reduce", token_count * hidden, {"residual-out"}, {"block-max"}, {}, 1.5e-3)};
     } else if (workload.dataset_tag == "ai-vision-inference-224" || workload.kind == WorkloadKind::inference) {
         constexpr std::uint32_t image_side = 224u;
         constexpr std::uint32_t token_count = 196u;

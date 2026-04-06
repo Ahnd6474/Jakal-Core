@@ -21,7 +21,8 @@ enum class GpuBackendKind {
     opencl,
     level_zero,
     vulkan_compute,
-    cuda
+    cuda,
+    rocm
 };
 
 struct GpuL0Capabilities {

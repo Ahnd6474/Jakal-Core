@@ -96,6 +96,15 @@ double hardware_weight(const HardwareGraphSummary& summary) {
 }
 
 GpuVendorFamily infer_vendor_from_graph(const HardwareGraph& graph) {
+    if (graph.probe == "level-zero") {
+        return GpuVendorFamily::intel;
+    }
+    if (graph.probe == "cuda") {
+        return GpuVendorFamily::nvidia;
+    }
+    if (graph.probe == "rocm") {
+        return GpuVendorFamily::amd;
+    }
     if (contains_case_insensitive(graph.presentation_name, "intel") ||
         contains_case_insensitive(graph.presentation_name, "iris") ||
         contains_case_insensitive(graph.presentation_name, "arc")) {
@@ -205,6 +214,9 @@ public:
     [[nodiscard]] bool matches(const HardwareGraph& graph) const override {
         if (!looks_like_gpu_graph(graph)) {
             return false;
+        }
+        if (graph.probe == "level-zero") {
+            return true;
         }
         return contains_case_insensitive(graph.presentation_name, "intel") ||
                contains_case_insensitive(graph.presentation_name, "iris") ||
@@ -353,6 +365,9 @@ public:
         if (!looks_like_gpu_graph(graph)) {
             return false;
         }
+        if (graph.probe == "cuda") {
+            return true;
+        }
         return contains_case_insensitive(graph.presentation_name, "nvidia") ||
                contains_case_insensitive(graph.presentation_name, "geforce") ||
                contains_case_insensitive(graph.presentation_name, "rtx") ||
@@ -411,6 +426,85 @@ public:
     }
 };
 
+class RocmGpuL0Adapter final : public IGpuL0Adapter {
+public:
+    [[nodiscard]] std::string id() const override { return "gpu-l0.rocm"; }
+    [[nodiscard]] GpuVendorFamily vendor() const override { return GpuVendorFamily::amd; }
+    [[nodiscard]] GpuBackendKind backend_kind() const override { return GpuBackendKind::rocm; }
+    [[nodiscard]] bool available() const override {
+#if defined(_WIN32)
+        return library_present({"amdhip64.dll"});
+#else
+        return library_present({"libamdhip64.so", "libamdhip64.so.6", "libhiprtc.so"});
+#endif
+    }
+
+    [[nodiscard]] bool matches(const HardwareGraph& graph) const override {
+        if (!looks_like_gpu_graph(graph)) {
+            return false;
+        }
+        if (graph.probe == "rocm") {
+            return true;
+        }
+        return contains_case_insensitive(graph.presentation_name, "amd") ||
+               contains_case_insensitive(graph.presentation_name, "radeon") ||
+               contains_case_insensitive(graph.presentation_name, "instinct") ||
+               contains_case_insensitive(graph.presentation_name, "rocm") ||
+               contains_case_insensitive(graph.presentation_name, "hip");
+    }
+
+    [[nodiscard]] GpuL0Binding describe(const HardwareGraph& graph) const override {
+        const auto summary = summarize_graph(graph);
+        GpuL0Binding binding;
+        binding.device_uid = graph.uid;
+        binding.graph_fingerprint = structural_fingerprint(graph);
+        binding.adapter_id = id();
+        binding.presentation_name = graph.presentation_name;
+        binding.vendor = vendor();
+        binding.backend = backend_kind();
+        binding.capabilities.adapter_available = available();
+        binding.capabilities.direct_command_submission = true;
+        binding.capabilities.explicit_memory_import = true;
+        binding.capabilities.timeline_synchronization = true;
+        binding.capabilities.binary_module_loading = true;
+        binding.capabilities.kernel_specialization = true;
+        binding.capabilities.subgroup_matrix = summary.matrix_units > 0 || summary.supports_fp16 || summary.supports_int8;
+        binding.capabilities.unified_memory = summary.unified_address_space;
+        binding.capabilities.persistent_kernel_cache = true;
+        binding.capabilities.asynchronous_dispatch = true;
+        binding.capabilities.preferred_queue_batch = 6u;
+        binding.capabilities.preferred_workgroup = std::clamp(summary.lanes_per_object * 8u, 64u, 512u);
+        binding.capabilities.estimated_launch_latency_us = std::max(3.0, summary.dispatch_latency_us * 0.62);
+        binding.capabilities.estimated_host_read_gbps = std::max(summary.host_read_gbps, 24.0);
+        binding.capabilities.estimated_host_write_gbps = std::max(summary.host_write_gbps, 24.0);
+
+        double score = 0.86;
+        score += summary.supports_fp16 ? 0.05 : 0.0;
+        score += summary.supports_int8 ? 0.04 : 0.0;
+        if (!binding.capabilities.adapter_available) {
+            score -= 0.45;
+        }
+        binding.suitability_score = score;
+        return binding;
+    }
+
+    [[nodiscard]] GpuL0LaunchTuning suggest_tuning(
+        const HardwareGraph& graph,
+        const GpuL0WorkloadTraits& workload) const override {
+        const auto summary = summarize_graph(graph);
+        GpuL0LaunchTuning tuning;
+        tuning.workgroup_x = std::clamp(summary.lanes_per_object * 8u, 64u, 512u);
+        tuning.workgroup_y = workload.matrix_friendly ? 2u : 1u;
+        tuning.workgroup_z = 1u;
+        tuning.queue_batch = workload.latency_sensitive ? 3u : 6u;
+        tuning.staging_window = summary.unified_address_space ? 1u : 3u;
+        tuning.prefer_vectorized_io = true;
+        tuning.prefer_persistent_modules = true;
+        tuning.prefer_shared_host_staging = summary.unified_address_space;
+        return tuning;
+    }
+};
+
 }  // namespace
 
 std::string to_string(const GpuVendorFamily vendor_family) {
@@ -437,6 +531,8 @@ std::string to_string(const GpuBackendKind backend_kind) {
         return "vulkan-compute";
     case GpuBackendKind::cuda:
         return "cuda";
+    case GpuBackendKind::rocm:
+        return "rocm";
     }
     return "unknown";
 }
@@ -445,6 +541,7 @@ std::vector<std::unique_ptr<IGpuL0Adapter>> make_default_gpu_l0_adapters() {
     std::vector<std::unique_ptr<IGpuL0Adapter>> adapters;
     adapters.push_back(std::make_unique<LevelZeroGpuL0Adapter>());
     adapters.push_back(std::make_unique<CudaGpuL0Adapter>());
+    adapters.push_back(std::make_unique<RocmGpuL0Adapter>());
     adapters.push_back(std::make_unique<VulkanGpuL0Adapter>());
     adapters.push_back(std::make_unique<OpenClGpuL0Adapter>());
     return adapters;

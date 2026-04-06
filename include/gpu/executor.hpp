@@ -11,6 +11,7 @@ namespace gpu {
 struct OperationExecutionRecord {
     std::string operation_name;
     std::string backend_name;
+    std::string backend_error;
     std::string requested_gpu_vendor;
     std::string requested_gpu_backend;
     std::vector<std::string> participating_devices;
