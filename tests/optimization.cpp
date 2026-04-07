@@ -150,6 +150,135 @@ jakal::HardwareGraph make_manual_gpu_graph(
     return graph;
 }
 
+jakal::HardwareGraph make_manual_host_graph() {
+    jakal::HardwareGraph graph;
+    graph.uid = "host:test:0";
+    graph.probe = "host";
+    graph.presentation_name = "Test CPU";
+
+    graph.nodes.push_back({"root", "root", "", jakal::HardwareObjectDomain::control, jakal::HardwareObjectRole::root});
+    graph.nodes.push_back({"queue", "queue", "root", jakal::HardwareObjectDomain::control, jakal::HardwareObjectRole::queue});
+    graph.nodes.back().control.supports_asynchronous_dispatch = false;
+    graph.nodes.push_back({"core-cluster", "core-cluster", "root", jakal::HardwareObjectDomain::compute, jakal::HardwareObjectRole::cluster});
+    graph.nodes.back().compute.execution_width = 16;
+    graph.nodes.back().compute.clock_mhz = 4200;
+    graph.nodes.back().compute.supports_fp16 = true;
+    graph.nodes.push_back({"host-memory", "host-memory", "root", jakal::HardwareObjectDomain::storage, jakal::HardwareObjectRole::host_memory});
+    graph.nodes.back().storage.capacity_bytes = 32ull * 1024ull * 1024ull * 1024ull;
+    graph.nodes.back().storage.unified_address_space = true;
+    graph.nodes.back().storage.coherent_with_host = true;
+    graph.nodes.back().storage.shared_host_bytes = graph.nodes.back().storage.capacity_bytes;
+
+    graph.edges.push_back({"root", "queue", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "core-cluster", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "host-memory", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"queue", "core-cluster", jakal::GraphEdgeSemantics::dispatches, true, 1.0, 0.0, 12.0});
+    graph.edges.push_back({"host-memory", "core-cluster", jakal::GraphEdgeSemantics::feeds, true, 1.0, 64.0, 8.0});
+    jakal::materialize_graph_costs(graph);
+    return graph;
+}
+
+bool verify_partition_strategies() {
+    const auto plan_cache = unique_temp_file("partition-plan-test");
+    const auto exec_cache = unique_temp_file("partition-exec-test");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const std::vector<jakal::HardwareGraph> graphs{
+        make_manual_host_graph(),
+        make_manual_gpu_graph("gpu:test:0", "Intel Arc A770", true, true, true)};
+
+    auto make_workload = [](const jakal::PartitionStrategy strategy) {
+        return jakal::WorkloadSpec{
+            "llm-decode-token-lite",
+            jakal::WorkloadKind::inference,
+            "llm-decode-token-lite",
+            640ull * 1024ull * 1024ull,
+            12ull * 1024ull * 1024ull,
+            3.8e10,
+            1,
+            true,
+            true,
+            true,
+            strategy};
+    };
+    const auto find_operation = [](const jakal::OptimizationReport& report, const std::string& name)
+        -> const jakal::OperationOptimizationResult* {
+        const auto it = std::find_if(report.operations.begin(), report.operations.end(), [&](const auto& result) {
+            return result.operation.name == name;
+        });
+        return it == report.operations.end() ? nullptr : &*it;
+    };
+
+    const auto role_split = optimizer.optimize(
+        make_workload(jakal::PartitionStrategy::role_split),
+        planner.build_plan(make_workload(jakal::PartitionStrategy::role_split), graphs),
+        graphs);
+    const auto* role_qkv = find_operation(role_split, "decode-qkv");
+    const auto* role_kv = find_operation(role_split, "kv-append");
+    if (role_qkv == nullptr || role_kv == nullptr) {
+        return false;
+    }
+    if (role_qkv->config.primary_device_uid != "gpu:test:0" ||
+        role_qkv->config.participating_devices.size() != 1u ||
+        role_kv->config.primary_device_uid != "host:test:0") {
+        return false;
+    }
+
+    const auto projection_sharded = optimizer.optimize(
+        make_workload(jakal::PartitionStrategy::projection_sharded),
+        planner.build_plan(make_workload(jakal::PartitionStrategy::projection_sharded), graphs),
+        graphs);
+    const auto* sharded_qkv = find_operation(projection_sharded, "decode-qkv");
+    if (sharded_qkv == nullptr) {
+        return false;
+    }
+    if (sharded_qkv->config.strategy != jakal::ExecutionStrategy::sharded ||
+        sharded_qkv->config.participating_devices.size() != 2u ||
+        sharded_qkv->config.logical_partitions != 4u) {
+        return false;
+    }
+
+    const auto tpu_like_plan = planner.build_plan(make_workload(jakal::PartitionStrategy::tpu_like), graphs);
+    if (tpu_like_plan.allocations.size() != 2u ||
+        tpu_like_plan.allocations.front().device.uid != "host:test:0" ||
+        tpu_like_plan.allocations.back().device.uid != "gpu:test:0") {
+        return false;
+    }
+    if (tpu_like_plan.allocations.front().ratio >= tpu_like_plan.allocations.back().ratio) {
+        return false;
+    }
+
+    const auto tpu_like = optimizer.optimize(make_workload(jakal::PartitionStrategy::tpu_like), tpu_like_plan, graphs);
+    const auto* tpu_qkv = find_operation(tpu_like, "decode-qkv");
+    const auto* tpu_reduce = find_operation(tpu_like, "decode-score-reduce");
+    const auto* tpu_kv = find_operation(tpu_like, "kv-append");
+    if (tpu_qkv == nullptr || tpu_reduce == nullptr || tpu_kv == nullptr) {
+        return false;
+    }
+    if (tpu_qkv->config.primary_device_uid != "gpu:test:0" ||
+        tpu_qkv->config.strategy != jakal::ExecutionStrategy::overlapped ||
+        tpu_qkv->config.logical_partitions != 4u ||
+        tpu_qkv->config.queue_depth < 3u ||
+        tpu_qkv->config.stages < 3u) {
+        return false;
+    }
+    if (tpu_reduce->config.primary_device_uid != "gpu:test:0" ||
+        tpu_reduce->config.strategy != jakal::ExecutionStrategy::overlapped) {
+        return false;
+    }
+    if (tpu_kv->config.primary_device_uid != "host:test:0" ||
+        tpu_kv->config.participating_devices.size() != 1u) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    return true;
+}
+
 bool verify_gpu_direct_variants() {
     const struct VariantCase {
         std::string name;
@@ -370,6 +499,7 @@ bool verify_operation_variant_registry() {
 }  // namespace
 
 int main() {
+    std::cerr << "stage: init\n";
     const auto plan_cache = unique_temp_file("gpu-runtime-plan-test");
     const auto exec_cache = unique_temp_file("gpu-runtime-exec-test");
 
@@ -379,6 +509,7 @@ int main() {
     options.enable_opencl_probe = false;
 
     jakal::Runtime runtime(options);
+    std::cerr << "stage: runtime\n";
 
     if (runtime.devices().empty()) {
         std::cerr << "No hardware graphs discovered.\n";
@@ -398,6 +529,7 @@ int main() {
         true};
 
     const auto first = runtime.optimize(workload);
+    std::cerr << "stage: first-optimize\n";
     if (first.operations.empty()) {
         std::cerr << "No operation optimizations created.\n";
         return 1;
@@ -483,6 +615,7 @@ int main() {
     }
 
     const auto second = runtime.optimize(workload);
+    std::cerr << "stage: second-optimize\n";
     if (!second.loaded_from_cache) {
         std::cerr << "Expected cached execution settings on second optimize call.\n";
         return 1;
@@ -492,22 +625,32 @@ int main() {
         return 1;
     }
 
+    std::cerr << "stage: verify-cost\n";
     if (!verify_cost_propagation()) {
         std::cerr << "Aggressive-to-hierarchy cost propagation check failed.\n";
         return 1;
     }
+    std::cerr << "stage: verify-toolkit\n";
     if (!verify_jakal_toolkit_index()) {
         std::cerr << "GPU L0 toolkit ranking check failed.\n";
         return 1;
     }
+    std::cerr << "stage: verify-direct\n";
     if (!verify_gpu_direct_variants()) {
         std::cerr << "GPU direct variant execution check failed.\n";
         return 1;
     }
+    std::cerr << "stage: verify-registry\n";
     if (!verify_operation_variant_registry()) {
         std::cerr << "Operation variant registry check failed.\n";
         return 1;
     }
+    std::cerr << "stage: registry\n";
+    if (!verify_partition_strategies()) {
+        std::cerr << "CPU/GPU partition strategy check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: partition\n";
 
     const auto presets = jakal::canonical_workload_presets();
     const auto preset_it = std::find_if(presets.begin(), presets.end(), [](const jakal::CanonicalWorkloadPreset& preset) {
@@ -519,6 +662,7 @@ int main() {
     }
 
     const auto macro_report = runtime.optimize(preset_it->workload);
+    std::cerr << "stage: macro\n";
     if (macro_report.operations.empty()) {
         std::cerr << "Canonical workload optimization failed: " << preset_it->workload.name << ".\n";
         return 1;

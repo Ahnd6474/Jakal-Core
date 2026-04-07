@@ -19,6 +19,15 @@ enum class WorkloadKind {
     training
 };
 
+enum class PartitionStrategy {
+    auto_balanced,
+    blind_sharded,
+    role_split,
+    reduce_on_gpu,
+    projection_sharded,
+    tpu_like
+};
+
 struct WorkloadSpec {
     std::string name;
     WorkloadKind kind = WorkloadKind::custom;
@@ -30,6 +39,7 @@ struct WorkloadSpec {
     bool latency_sensitive = false;
     bool prefer_unified_memory = false;
     bool matrix_friendly = false;
+    PartitionStrategy partition_strategy = PartitionStrategy::auto_balanced;
 };
 
 struct PlanAllocation {
@@ -45,6 +55,7 @@ struct ExecutionPlan {
 };
 
 std::string to_string(WorkloadKind kind);
+std::string to_string(PartitionStrategy strategy);
 
 class Planner {
 public:

@@ -18,6 +18,11 @@ constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 constexpr double kMiB = 1024.0 * 1024.0;
 constexpr double kKiB = 1024.0;
 
+struct PartitionAllocationBias {
+    double host_ratio = 0.0;
+    double accelerator_ratio = 1.0;
+};
+
 struct ScoreComponents {
     double parallel_score = 0.0;
     double memory_score = 0.0;
@@ -54,13 +59,40 @@ std::string build_signature(const WorkloadSpec& workload, const std::vector<Hard
               << workload.batch_size << '|'
               << workload.latency_sensitive << '|'
               << workload.prefer_unified_memory << '|'
-              << workload.matrix_friendly;
+              << workload.matrix_friendly << '|'
+              << to_string(workload.partition_strategy);
 
     for (const auto& fingerprint : fingerprints) {
         signature << '|' << fingerprint;
     }
 
     return signature.str();
+}
+
+bool is_host_graph(const HardwareGraph& graph) {
+    return graph.probe == "host";
+}
+
+bool uses_explicit_partition_strategy(const WorkloadSpec& workload) {
+    return workload.partition_strategy != PartitionStrategy::auto_balanced;
+}
+
+PartitionAllocationBias partition_allocation_bias(const PartitionStrategy strategy) {
+    switch (strategy) {
+    case PartitionStrategy::blind_sharded:
+        return {0.35, 0.65};
+    case PartitionStrategy::role_split:
+        return {0.30, 0.70};
+    case PartitionStrategy::reduce_on_gpu:
+        return {0.20, 0.80};
+    case PartitionStrategy::projection_sharded:
+        return {0.25, 0.75};
+    case PartitionStrategy::tpu_like:
+        return {0.12, 0.88};
+    case PartitionStrategy::auto_balanced:
+    default:
+        return {0.0, 1.0};
+    }
 }
 
 double compute_weight_from_workload(const WorkloadSpec& workload) {
@@ -219,6 +251,24 @@ std::string to_string(WorkloadKind kind) {
     }
 }
 
+std::string to_string(const PartitionStrategy strategy) {
+    switch (strategy) {
+    case PartitionStrategy::blind_sharded:
+        return "blind_sharded";
+    case PartitionStrategy::role_split:
+        return "role_split";
+    case PartitionStrategy::reduce_on_gpu:
+        return "reduce_on_gpu";
+    case PartitionStrategy::projection_sharded:
+        return "projection_sharded";
+    case PartitionStrategy::tpu_like:
+        return "tpu_like";
+    case PartitionStrategy::auto_balanced:
+    default:
+        return "auto_balanced";
+    }
+}
+
 Planner::Planner(std::filesystem::path cache_path)
     : cache_path_(std::move(cache_path)) {}
 
@@ -366,6 +416,52 @@ ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vecto
     if (total_ratio > 0.0) {
         for (auto& candidate : candidates) {
             candidate.ratio /= total_ratio;
+        }
+    }
+
+    if (uses_explicit_partition_strategy(workload)) {
+        const auto host_graph_it = std::find_if(graphs.begin(), graphs.end(), [](const HardwareGraph& graph) {
+            return is_host_graph(graph);
+        });
+        const auto accelerator_graph_it = std::find_if(graphs.begin(), graphs.end(), [](const HardwareGraph& graph) {
+            return !is_host_graph(graph);
+        });
+        if (host_graph_it != graphs.end() && accelerator_graph_it != graphs.end()) {
+            const auto score_for_graph = [&](const HardwareGraph& graph) {
+                const auto candidate_it = std::find_if(candidates.begin(), candidates.end(), [&](const Candidate& candidate) {
+                    return candidate.graph.uid == graph.uid;
+                });
+                if (candidate_it != candidates.end()) {
+                    return std::max(candidate_it->score, candidate_it->cap);
+                }
+
+                const auto components = score_graph(graph, workload);
+                double score = (components.parallel_score * compute_weight) +
+                               (components.memory_score * memory_weight);
+                score *= components.graph_bonus;
+                score /= (1.0 + (components.transfer_penalty * (workload.latency_sensitive ? 1.4 : 0.8)));
+                if (components.memory_fit_cap < 0.05) {
+                    score *= components.memory_fit_cap;
+                }
+                return std::max(score, components.memory_fit_cap);
+            };
+
+            const auto bias = partition_allocation_bias(workload.partition_strategy);
+            const double total = std::max(1.0e-9, bias.host_ratio + bias.accelerator_ratio);
+            const double host_score = score_for_graph(*host_graph_it);
+            const double accelerator_score = score_for_graph(*accelerator_graph_it);
+
+            candidates.clear();
+            candidates.push_back(Candidate{
+                *host_graph_it,
+                host_score,
+                bias.host_ratio / total,
+                1.0});
+            candidates.push_back(Candidate{
+                *accelerator_graph_it,
+                accelerator_score,
+                bias.accelerator_ratio / total,
+                1.0});
         }
     }
 

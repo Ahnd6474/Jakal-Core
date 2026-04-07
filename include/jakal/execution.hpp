@@ -263,6 +263,19 @@ struct BenchmarkRecord {
     bool simulated = false;
 };
 
+struct PerformanceSummary {
+    std::string shape_bucket;
+    ExecutionConfig config;
+    std::uint32_t observations = 0;
+    double average_effective_latency_us = 0.0;
+    double average_relative_error = 0.0;
+    double average_prediction_scale = 1.0;
+    double average_calibration_ratio = 1.0;
+    double average_system_penalty_us = 0.0;
+    double average_validation_spread_us = 0.0;
+    double average_reward = 0.0;
+};
+
 struct OperationOptimizationResult {
     OperationSpec operation;
     ExecutionConfig config;
@@ -274,6 +287,7 @@ struct OptimizationReport {
     std::string signature;
     WorkloadKind workload_kind = WorkloadKind::custom;
     std::string dataset_tag;
+    PartitionStrategy partition_strategy = PartitionStrategy::auto_balanced;
     WorkloadGraph workload_graph;
     ExecutionPlan placement;
     std::vector<OperationOptimizationResult> operations;
@@ -296,27 +310,71 @@ struct ExecutionFeedbackRecord {
     std::uint32_t logical_partitions_used = 1;
 };
 
+struct CachedExecutionConfig {
+    std::string operation_name;
+    ExecutionConfig config;
+};
+
+using CachedConfig = CachedExecutionConfig;
+
 [[nodiscard]] std::string to_string(OperationClass op_class);
 [[nodiscard]] std::string to_string(ExecutionNodeKind kind);
 [[nodiscard]] std::string to_string(ExecutionEdgeKind kind);
 [[nodiscard]] std::string to_string(ExecutionStrategy strategy);
 [[nodiscard]] std::string to_string(OptimizationPolicy policy);
 
+class BootstrapExecutionOptimizer {
+public:
+    explicit BootstrapExecutionOptimizer(std::filesystem::path cache_path);
+
+    void load_cache();
+    [[nodiscard]] bool has_full_cache(
+        const std::string& report_signature,
+        const std::vector<OperationSpec>& operations,
+        const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+        std::unordered_map<std::string, ExecutionConfig>* cached_by_operation);
+    void store_configs(const std::string& report_signature, std::vector<CachedExecutionConfig> configs);
+    void persist_cache() const;
+
+private:
+    std::filesystem::path cache_path_;
+    bool cache_loaded_ = false;
+    std::unordered_map<std::string, std::vector<CachedExecutionConfig>> cache_;
+};
+
+class AdaptiveExecutionOptimizer {
+public:
+    explicit AdaptiveExecutionOptimizer(std::filesystem::path cache_path);
+
+    void load_cache();
+    void persist_cache() const;
+    void apply_runtime_state(SystemProfile& profile, const std::vector<HardwareGraph>& graphs) const;
+    [[nodiscard]] bool should_use_lightweight_path(const std::string& report_signature, bool fully_cached) const;
+    [[nodiscard]] bool should_reoptimize(const std::string& report_signature) const;
+    [[nodiscard]] bool should_reoptimize_operation(
+        const std::string& report_signature,
+        const std::string& operation_name) const;
+    [[nodiscard]] const std::unordered_map<std::string, PerformanceSummary>& performance_cache() const;
+    [[nodiscard]] const std::unordered_map<std::string, double>& backend_penalty_cache() const;
+    [[nodiscard]] const std::unordered_map<std::string, bool>& warmed_devices() const;
+    void ingest_execution_feedback(
+        const OptimizationReport& report,
+        const std::vector<ExecutionFeedbackRecord>& feedback,
+        const std::vector<HardwareGraph>& graphs);
+
+private:
+    std::filesystem::path performance_cache_path_;
+    bool cache_loaded_ = false;
+    std::unordered_map<std::string, PerformanceSummary> performance_cache_;
+    std::unordered_map<std::string, double> device_sustained_slowdown_;
+    std::unordered_map<std::string, bool> warmed_devices_;
+    std::unordered_map<std::string, double> backend_penalty_cache_;
+    std::unordered_map<std::string, std::uint32_t> reoptimization_pressure_;
+    std::unordered_map<std::string, std::uint32_t> operation_reoptimization_pressure_;
+};
+
 class ExecutionOptimizer {
 public:
-    struct PerformanceSummary {
-        std::string shape_bucket;
-        ExecutionConfig config;
-        std::uint32_t observations = 0;
-        double average_effective_latency_us = 0.0;
-        double average_relative_error = 0.0;
-        double average_prediction_scale = 1.0;
-        double average_calibration_ratio = 1.0;
-        double average_system_penalty_us = 0.0;
-        double average_validation_spread_us = 0.0;
-        double average_reward = 0.0;
-    };
-
     [[nodiscard]] static std::filesystem::path default_cache_path();
 
     explicit ExecutionOptimizer(std::filesystem::path cache_path = default_cache_path());
@@ -331,22 +389,8 @@ public:
         const std::vector<HardwareGraph>& graphs);
 
 private:
-    struct CachedConfig {
-        std::string operation_name;
-        ExecutionConfig config;
-    };
-
-    void load_cache();
-    void persist_cache() const;
-
-    std::filesystem::path cache_path_;
-    std::filesystem::path performance_cache_path_;
-    bool cache_loaded_ = false;
-    std::unordered_map<std::string, std::vector<CachedConfig>> cache_;
-    std::unordered_map<std::string, PerformanceSummary> performance_cache_;
-    std::unordered_map<std::string, double> device_sustained_slowdown_;
-    std::unordered_map<std::string, bool> warmed_devices_;
-    std::unordered_map<std::string, double> backend_penalty_cache_;
+    BootstrapExecutionOptimizer bootstrap_optimizer_;
+    AdaptiveExecutionOptimizer adaptive_optimizer_;
 };
 
 [[nodiscard]] std::vector<OperationSpec> default_operation_suite(const WorkloadSpec& workload);

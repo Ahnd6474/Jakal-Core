@@ -94,5 +94,10 @@ if(JAKAL_CORE_BUILD_TESTS)
     target_link_libraries(jakal_optimization PRIVATE jakal::core)
 
     add_test(NAME jakal_optimization COMMAND jakal_optimization)
+
+    add_executable(jakal_partition_strategies tests/partition_strategies.cpp)
+    target_link_libraries(jakal_partition_strategies PRIVATE jakal::core)
+
+    add_test(NAME jakal_partition_strategies COMMAND jakal_partition_strategies)
 endif()
 
