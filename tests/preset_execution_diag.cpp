@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
         options.execution_cache_path = unique_temp_file("jakal-preset-diag-exec");
 
         std::string mode = argc > 1 ? argv[1] : "cpu-dl";
+        std::string selected_name = argc > 2 ? argv[2] : "";
         std::cout << "init-runtime\n" << std::flush;
         jakal::Runtime runtime(options);
         std::cout << "runtime-ready devices=" << runtime.devices().size() << '\n' << std::flush;
@@ -29,6 +30,11 @@ int main(int argc, char** argv) {
         if (mode == "cpu-dl") {
             const auto presets = jakal::cpu_deep_learning_exploration_presets();
             for (const auto& preset : presets) {
+                if (!selected_name.empty() &&
+                    preset.workload.name != selected_name &&
+                    preset.workload.dataset_tag != selected_name) {
+                    continue;
+                }
                 std::cout << "execute " << preset.workload.name << '\n' << std::flush;
                 const auto report = runtime.execute(preset.workload);
                 std::cout << "done " << preset.workload.name
@@ -41,6 +47,11 @@ int main(int argc, char** argv) {
         } else {
             const auto presets = jakal::canonical_workload_presets();
             for (const auto& preset : presets) {
+                if (!selected_name.empty() &&
+                    preset.workload.name != selected_name &&
+                    preset.workload.dataset_tag != selected_name) {
+                    continue;
+                }
                 std::cout << "execute " << preset.workload.name << '\n' << std::flush;
                 const auto report = runtime.execute(preset.workload);
                 std::cout << "done " << preset.workload.name

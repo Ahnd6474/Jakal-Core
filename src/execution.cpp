@@ -1311,6 +1311,48 @@ void apply_auto_accelerator_data_parallel_policy(
     }
 }
 
+void stabilize_level_zero_host_mix_policy(
+    const OperationSpec& operation,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    ExecutionConfig& config) {
+    if (config.participating_devices.size() < 2u) {
+        return;
+    }
+
+    const bool host_present = std::any_of(
+        config.participating_devices.begin(),
+        config.participating_devices.end(),
+        [&](const std::string& uid) {
+            return is_host_graph(find_graph(graph_lookup, uid));
+        });
+    if (!host_present) {
+        return;
+    }
+
+    std::string level_zero_uid;
+    for (const auto& uid : config.participating_devices) {
+        const auto* graph = find_graph(graph_lookup, uid);
+        if (graph != nullptr && graph->probe == "level-zero") {
+            level_zero_uid = uid;
+            break;
+        }
+    }
+    if (level_zero_uid.empty()) {
+        return;
+    }
+
+    if (operation.op_class != OperationClass::matmul &&
+        operation.op_class != OperationClass::convolution_2d) {
+        return;
+    }
+
+    config.primary_device_uid = level_zero_uid;
+    config.participating_devices = {level_zero_uid};
+    config.strategy = ExecutionStrategy::single_device;
+    config.logical_partitions = 1u;
+    config.overlap_transfers = false;
+}
+
 double llm_cpu_policy_bias_us(
     const WorkloadSpec& workload,
     const OperationSpec& operation,
@@ -1566,6 +1608,7 @@ std::vector<ExecutionConfig> build_candidate_configs(
             apply_llm_cpu_execution_policy(workload, operation, graph, config);
             apply_auto_accelerator_data_parallel_policy(workload, operation, placement, graph_lookup, config);
             apply_partition_strategy_execution_policy(workload, operation, placement, graph_lookup, config);
+            stabilize_level_zero_host_mix_policy(operation, graph_lookup, config);
         }
         config.signature = build_config_signature(report_signature, config);
         const auto duplicate = std::find_if(

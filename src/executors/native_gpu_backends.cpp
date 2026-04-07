@@ -896,19 +896,26 @@ private:
             std::filesystem::create_directories(temp_dir, ignore_error);
             const auto source_path = temp_dir / "jakal_level_zero_native.cl";
             const std::string output_name = "jakal_level_zero_native";
+            const auto output_spv = temp_dir / "jakal_level_zero_native.spv";
             const auto output_bin = temp_dir / "jakal_level_zero_native.bin";
             if (write_text_file(source_path, kOpenClProgramSource)) {
                 std::string command =
 #if defined(_WIN32)
                     "powershell -NoProfile -Command \"& '" + ocloc->string() + "' compile -file '" + source_path.string() +
-                    "' -device adl-p --format zebin -output_no_suffix -output '" + output_name +
+                    "' -device xe-lp -output_no_suffix -output '" + output_name +
                     "' -out_dir '" + temp_dir.string() + "'\"";
 #else
                     "\"" + ocloc->string() + "\" compile -file \"" + source_path.string() +
-                    "\" -device adl-p --format zebin -output_no_suffix -output \"" + output_name +
+                    "\" -device xe-lp -output_no_suffix -output \"" + output_name +
                     "\" -out_dir \"" + temp_dir.string() + "\"";
 #endif
                 if (run_command(command) == 0) {
+                    const auto spirv = read_binary_file(output_spv);
+                    if (!spirv.empty()) {
+                        cached_binary_.bytes = spirv;
+                        cached_binary_.format = ZE_MODULE_FORMAT_IL_SPIRV;
+                        return cached_binary_;
+                    }
                     const auto bytes = read_binary_file(output_bin);
                     if (!bytes.empty()) {
                         cached_binary_.bytes = bytes;
