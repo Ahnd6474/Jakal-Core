@@ -116,7 +116,7 @@ int main() {
 
         write_manifest(manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, true, weight_asset_path);
         write_manifest(runtime_manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, false);
-        write_manifest(blocked_manifest_path, 1ull << 50u, 16ull * 1024ull, false);
+        write_manifest(blocked_manifest_path, 1ull << 50u, 4ull * 1024ull * 1024ull * 1024ull, true);
         write_manifest(missing_asset_manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, true, missing_weight_asset_path);
 
         const auto manifest = jakal::load_workload_manifest(manifest_path);
@@ -156,8 +156,22 @@ int main() {
             std::cerr << "managed execute did not produce asset prefetch plan\n";
             return 1;
         }
+        if (manifest_managed.asset_prefetch.total_host_io_bytes != 16ull * 1024ull ||
+            manifest_managed.asset_prefetch.total_host_to_device_bytes != 0u) {
+            std::cerr << "managed execute asset queue accounting mismatch\n";
+            return 1;
+        }
+        if (manifest_managed.asset_prefetch.entries.front().queue_hint != "host_io" ||
+            manifest_managed.asset_prefetch.entries.front().target_residency != "auto") {
+            std::cerr << "managed execute asset queue hint mismatch\n";
+            return 1;
+        }
         if (!manifest_managed.kernel_coverage.all_supported) {
             std::cerr << "host-only managed path should have full kernel coverage\n";
+            return 1;
+        }
+        if (manifest_managed.residency_sequence.actions.empty()) {
+            std::cerr << "managed execute did not emit residency sequence\n";
             return 1;
         }
 
@@ -187,6 +201,20 @@ int main() {
         }
         if (blocked.memory_preflight.devices.empty()) {
             std::cerr << "memory preflight did not capture device reservations\n";
+            return 1;
+        }
+        if (blocked.residency_sequence.actions.empty()) {
+            std::cerr << "blocked managed path did not emit residency sequence\n";
+            return 1;
+        }
+        if (blocked.memory_preflight.predicted_spill_bytes != blocked.residency_sequence.spill_bytes ||
+            blocked.memory_preflight.predicted_reload_bytes != blocked.residency_sequence.reload_bytes ||
+            blocked.memory_preflight.forced_spill_count != blocked.residency_sequence.forced_spill_count) {
+            std::cerr << "memory preflight and residency sequence drifted\n";
+            return 1;
+        }
+        if (blocked.memory_preflight.predicted_spill_bytes == 0u && blocked.memory_preflight.forced_spill_count == 0u) {
+            std::cerr << "blocked managed path did not predict spill pressure\n";
             return 1;
         }
 

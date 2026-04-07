@@ -110,16 +110,22 @@ struct AssetPrefetchEntry {
     std::filesystem::path path;
     std::string tensor_id;
     std::string device_uid;
+    std::uint64_t file_offset = 0;
     std::uint64_t bytes = 0;
+    std::string queue_hint = "host_io";
+    std::string target_residency = "auto";
     bool exists_on_disk = false;
     bool preload_required = true;
     bool persistent = true;
     bool host_visible = false;
+    bool pin_host_staging = false;
 };
 
 struct AssetPrefetchReport {
     std::vector<AssetPrefetchEntry> entries;
     std::uint64_t total_prefetch_bytes = 0;
+    std::uint64_t total_host_io_bytes = 0;
+    std::uint64_t total_host_to_device_bytes = 0;
     bool missing_required_assets = false;
     std::string summary;
 };

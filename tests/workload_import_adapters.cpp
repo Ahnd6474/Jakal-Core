@@ -58,31 +58,17 @@ void pad_stream_to_alignment(std::ostream& output, const std::uint64_t alignment
     }
 }
 
-void write_tiny_gguf_file(const std::filesystem::path& path) {
-    struct TensorBlob {
-        std::string name;
-        std::vector<std::uint64_t> dims;
-        std::uint32_t type = 0u;
-        std::vector<std::uint8_t> data;
-    };
+struct GgufTensorBlob {
+    std::string name;
+    std::vector<std::uint64_t> dims;
+    std::uint32_t type = 0u;
+    std::vector<std::uint8_t> data;
+};
 
-    std::vector<TensorBlob> tensors;
-    tensors.push_back(TensorBlob{
-        "blk.0.attn_q.weight",
-        {320u, 320u},
-        2u,
-        std::vector<std::uint8_t>(40960u, 0x11u)});
-    tensors.push_back(TensorBlob{
-        "blk.0.ffn_up.weight",
-        {320u, 896u},
-        1u,
-        std::vector<std::uint8_t>(320u * 896u * 2u, 0x22u)});
-    tensors.push_back(TensorBlob{
-        "output.weight",
-        {320u, 320u},
-        1u,
-        std::vector<std::uint8_t>(320u * 320u * 2u, 0x33u)});
-
+void write_gguf_file(
+    const std::filesystem::path& path,
+    const std::string& model_name,
+    const std::vector<GgufTensorBlob>& tensors) {
     constexpr std::uint32_t version = 3u;
     constexpr std::uint64_t alignment = 32u;
 
@@ -101,7 +87,7 @@ void write_tiny_gguf_file(const std::filesystem::path& path) {
     write_binary_value<std::uint64_t>(output, 7u);
 
     write_gguf_string_metadata(output, "general.architecture", "llama");
-    write_gguf_string_metadata(output, "general.name", "tiny-gguf");
+    write_gguf_string_metadata(output, "general.name", model_name);
     write_gguf_u32_metadata(output, "general.alignment", static_cast<std::uint32_t>(alignment));
     write_gguf_u32_metadata(output, "llama.context_length", 1024u);
     write_gguf_u32_metadata(output, "llama.embedding_length", 320u);
@@ -122,6 +108,56 @@ void write_tiny_gguf_file(const std::filesystem::path& path) {
     for (const auto& tensor : tensors) {
         output.write(reinterpret_cast<const char*>(tensor.data.data()), static_cast<std::streamsize>(tensor.data.size()));
     }
+}
+
+void write_tiny_gguf_file(const std::filesystem::path& path) {
+    std::vector<GgufTensorBlob> tensors;
+    tensors.push_back(GgufTensorBlob{
+        "blk.0.attn_q.weight",
+        {320u, 320u},
+        2u,
+        std::vector<std::uint8_t>(40960u, 0x11u)});
+    tensors.push_back(GgufTensorBlob{
+        "blk.0.ffn_up.weight",
+        {320u, 896u},
+        1u,
+        std::vector<std::uint8_t>(320u * 896u * 2u, 0x22u)});
+    tensors.push_back(GgufTensorBlob{
+        "output.weight",
+        {320u, 320u},
+        1u,
+        std::vector<std::uint8_t>(320u * 320u * 2u, 0x33u)});
+    write_gguf_file(path, "tiny-gguf", tensors);
+}
+
+void write_tiny_sharded_gguf_files(
+    const std::filesystem::path& first_path,
+    const std::filesystem::path& second_path) {
+    write_gguf_file(
+        first_path,
+        "tiny-gguf-sharded",
+        {
+            GgufTensorBlob{
+                "blk.0.attn_q.weight",
+                {320u, 320u},
+                2u,
+                std::vector<std::uint8_t>(40960u, 0x11u)},
+            GgufTensorBlob{
+                "blk.0.ffn_up.weight",
+                {320u, 896u},
+                1u,
+                std::vector<std::uint8_t>(320u * 896u * 2u, 0x22u)},
+        });
+    write_gguf_file(
+        second_path,
+        "tiny-gguf-sharded",
+        {
+            GgufTensorBlob{
+                "output.weight",
+                {320u, 320u},
+                1u,
+                std::vector<std::uint8_t>(320u * 320u * 2u, 0x33u)},
+        });
 }
 
 void append_varint(std::vector<std::uint8_t>& out, std::uint64_t value) {
@@ -222,6 +258,33 @@ std::vector<std::uint8_t> make_onnx_tensor_i64(
     return message;
 }
 
+std::vector<std::uint8_t> make_onnx_string_map_entry(const std::string& key, const std::string& value) {
+    std::vector<std::uint8_t> message;
+    append_string_field(message, 1u, key);
+    append_string_field(message, 2u, value);
+    return message;
+}
+
+std::vector<std::uint8_t> make_onnx_external_tensor(
+    const std::string& name,
+    const std::uint32_t elem_type,
+    const std::vector<std::uint64_t>& dims,
+    const std::string& location,
+    const std::uint64_t offset,
+    const std::uint64_t length) {
+    std::vector<std::uint8_t> message;
+    for (const auto dim : dims) {
+        append_varint_field(message, 1u, dim);
+    }
+    append_varint_field(message, 2u, elem_type);
+    append_string_field(message, 8u, name);
+    append_bytes_field(message, 13u, make_onnx_string_map_entry("location", location));
+    append_bytes_field(message, 13u, make_onnx_string_map_entry("offset", std::to_string(offset)));
+    append_bytes_field(message, 13u, make_onnx_string_map_entry("length", std::to_string(length)));
+    append_varint_field(message, 14u, 1u);
+    return message;
+}
+
 std::vector<std::uint8_t> make_onnx_attribute_int(const std::string& name, const std::int64_t value) {
     std::vector<std::uint8_t> message;
     append_string_field(message, 1u, name);
@@ -310,6 +373,98 @@ void write_tiny_onnx_file(const std::filesystem::path& path) {
     append_bytes_field(graph, 12u, make_onnx_value_info("pooled", 1u, {1u}));
     append_bytes_field(graph, 13u, make_onnx_value_info("stem_out", 1u, {1u, 1u, 222u, 222u}));
     append_bytes_field(graph, 13u, make_onnx_value_info("patch_out", 1u, {196u, 192u}));
+
+    std::vector<std::uint8_t> model;
+    append_varint_field(model, 1u, 9u);
+    append_string_field(model, 2u, "jakal-tests");
+    append_bytes_field(model, 7u, graph);
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(model.data()), static_cast<std::streamsize>(model.size()));
+}
+
+void write_tiny_external_onnx_file(
+    const std::filesystem::path& path,
+    const std::filesystem::path& external_data_path) {
+    std::vector<std::uint8_t> graph;
+    append_bytes_field(
+        graph,
+        1u,
+        make_onnx_node(
+            "external_proj",
+            "Gemm",
+            {"token", "proj_w_ext"},
+            {"scores"},
+            {make_onnx_attribute_int("transB", 1)}));
+    append_string_field(graph, 2u, "external_forward");
+    append_bytes_field(
+        graph,
+        5u,
+        make_onnx_external_tensor(
+            "proj_w_ext",
+            1u,
+            {6u, 4u},
+            external_data_path.filename().string(),
+            0u,
+            6u * 4u * 4u));
+    append_bytes_field(graph, 11u, make_onnx_value_info("token", 1u, {1u, 4u}));
+    append_bytes_field(graph, 12u, make_onnx_value_info("scores", 1u, {1u, 6u}));
+
+    std::vector<std::uint8_t> model;
+    append_varint_field(model, 1u, 9u);
+    append_string_field(model, 2u, "jakal-tests");
+    append_bytes_field(model, 7u, graph);
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(model.data()), static_cast<std::streamsize>(model.size()));
+}
+
+void write_tiny_shared_external_onnx_file(
+    const std::filesystem::path& path,
+    const std::filesystem::path& external_data_path) {
+    std::vector<std::uint8_t> graph;
+    append_bytes_field(
+        graph,
+        1u,
+        make_onnx_node(
+            "shared_proj_a",
+            "Gemm",
+            {"token", "proj_w_a"},
+            {"hidden"},
+            {make_onnx_attribute_int("transB", 1)}));
+    append_bytes_field(
+        graph,
+        1u,
+        make_onnx_node(
+            "shared_proj_b",
+            "Gemm",
+            {"hidden", "proj_w_b"},
+            {"scores"},
+            {make_onnx_attribute_int("transB", 1)}));
+    append_string_field(graph, 2u, "shared_external_forward");
+    append_bytes_field(
+        graph,
+        5u,
+        make_onnx_external_tensor(
+            "proj_w_a",
+            1u,
+            {6u, 4u},
+            external_data_path.filename().string(),
+            0u,
+            6u * 4u * 4u));
+    append_bytes_field(
+        graph,
+        5u,
+        make_onnx_external_tensor(
+            "proj_w_b",
+            1u,
+            {5u, 6u},
+            external_data_path.filename().string(),
+            6u * 4u * 4u,
+            5u * 6u * 4u));
+    append_bytes_field(graph, 11u, make_onnx_value_info("token", 1u, {1u, 4u}));
+    append_bytes_field(graph, 12u, make_onnx_value_info("scores", 1u, {1u, 5u}));
+    append_bytes_field(graph, 13u, make_onnx_value_info("hidden", 1u, {1u, 6u}));
 
     std::vector<std::uint8_t> model;
     append_varint_field(model, 1u, 9u);
@@ -655,6 +810,10 @@ std::string ggml_export_text() {
 
 int main() {
     const auto onnx_path = unique_temp_file("workload-import-onnx", ".onnx");
+    const auto external_onnx_path = unique_temp_file("workload-import-onnx-external", ".onnx");
+    const auto external_data_path = unique_temp_file("workload-import-onnx-external-weights", ".bin");
+    const auto shared_external_onnx_path = unique_temp_file("workload-import-onnx-external-shared", ".onnx");
+    const auto shared_external_data_path = unique_temp_file("workload-import-onnx-external-shared-weights", ".bin");
     const auto resize_onnx_path = unique_temp_file("workload-import-onnx-resize", ".onnx");
     const auto shape_onnx_path = unique_temp_file("workload-import-onnx-shape", ".onnx");
     const auto graph_ops_onnx_path = unique_temp_file("workload-import-onnx-graph-ops", ".onnx");
@@ -664,9 +823,26 @@ int main() {
     const auto pytorch_path = unique_temp_file("workload-import-torch", ".workload");
     const auto ggml_path = unique_temp_file("workload-import-ggml", ".workload");
     const auto gguf_path = unique_temp_file("workload-import-gguf", ".gguf");
+    const auto shard_nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto gguf_shard_1_path = std::filesystem::temp_directory_path() /
+                                   ("workload-import-gguf-sharded-" + std::to_string(shard_nonce) + "-00001-of-00002.gguf");
+    const auto gguf_shard_2_path = std::filesystem::temp_directory_path() /
+                                   ("workload-import-gguf-sharded-" + std::to_string(shard_nonce) + "-00002-of-00002.gguf");
     const auto telemetry_path = unique_temp_file("workload-import-runtime", ".telemetry.tsv");
 
     write_tiny_onnx_file(onnx_path);
+    {
+        std::ofstream external_output(external_data_path, std::ios::binary | std::ios::trunc);
+        std::string payload(6u * 4u * 4u, '\x6a');
+        external_output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    }
+    write_tiny_external_onnx_file(external_onnx_path, external_data_path);
+    {
+        std::ofstream shared_external_output(shared_external_data_path, std::ios::binary | std::ios::trunc);
+        std::string payload((6u * 4u * 4u) + (5u * 6u * 4u), '\x51');
+        shared_external_output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    }
+    write_tiny_shared_external_onnx_file(shared_external_onnx_path, shared_external_data_path);
     write_tiny_resize_onnx_file(resize_onnx_path);
     write_tiny_shape_inference_onnx_file(shape_onnx_path);
     write_tiny_graph_ops_onnx_file(graph_ops_onnx_path);
@@ -676,6 +852,7 @@ int main() {
     write_text_file(pytorch_path, pytorch_export_text());
     write_text_file(ggml_path, ggml_export_text());
     write_tiny_gguf_file(gguf_path);
+    write_tiny_sharded_gguf_files(gguf_shard_1_path, gguf_shard_2_path);
 
     try {
         const auto onnx = jakal::load_workload_source(onnx_path);
@@ -704,6 +881,50 @@ int main() {
         }
         if (onnx.workload.working_set_bytes == 0u || onnx.workload.estimated_flops <= 0.0) {
             std::cerr << "onnx source import workload metadata missing\n";
+            return 1;
+        }
+
+        const auto external_onnx = jakal::load_workload_source(external_onnx_path);
+        if (external_onnx.assets.size() != 1u || external_onnx.assets.front().bytes != 96u) {
+            std::cerr << "onnx external data asset mapping mismatch\n";
+            return 1;
+        }
+        if (external_onnx.assets.front().tensor_ids.size() != 1u ||
+            external_onnx.assets.front().tensor_ids.front() != "proj_w_ext") {
+            std::cerr << "onnx external data tensor binding mismatch\n";
+            return 1;
+        }
+        if (external_onnx.graph.operations.size() != 1u ||
+            external_onnx.graph.operations.front().extents.size() != 3u ||
+            external_onnx.graph.operations.front().extents[0] != 1u ||
+            external_onnx.graph.operations.front().extents[1] != 6u ||
+            external_onnx.graph.operations.front().extents[2] != 4u) {
+            std::cerr << "onnx external data extent inference mismatch\n";
+            return 1;
+        }
+        if (external_onnx.assets.front().file_offset != 0u) {
+            std::cerr << "onnx external data file offset mismatch\n";
+            return 1;
+        }
+
+        const auto shared_external_onnx = jakal::load_workload_source(shared_external_onnx_path);
+        if (shared_external_onnx.assets.size() != 2u) {
+            std::cerr << "onnx shared external blob asset count mismatch\n";
+            return 1;
+        }
+        if (shared_external_onnx.assets[0].path != shared_external_data_path ||
+            shared_external_onnx.assets[1].path != shared_external_data_path ||
+            shared_external_onnx.assets[0].file_offset != 0u ||
+            shared_external_onnx.assets[1].file_offset != 96u) {
+            std::cerr << "onnx shared external blob offset mapping mismatch\n";
+            return 1;
+        }
+        if (shared_external_onnx.graph.operations.size() != 2u ||
+            shared_external_onnx.graph.operations[0].extents.size() != 3u ||
+            shared_external_onnx.graph.operations[1].extents.size() != 3u ||
+            shared_external_onnx.graph.operations[0].extents[1] != 6u ||
+            shared_external_onnx.graph.operations[1].extents[1] != 5u) {
+            std::cerr << "onnx shared external blob extent inference mismatch\n";
             return 1;
         }
 
@@ -918,6 +1139,26 @@ int main() {
             std::cerr << "gguf tensor table parsing mismatch\n";
             return 1;
         }
+        if (gguf.assets.size() != 1u || gguf.assets.front().bytes != 819200u) {
+            std::cerr << "gguf asset mapping mismatch\n";
+            return 1;
+        }
+
+        const auto sharded_gguf = jakal::load_workload_source(gguf_shard_1_path);
+        if (sharded_gguf.assets.size() != 2u) {
+            std::cerr << "gguf shard discovery did not register both shard assets\n";
+            return 1;
+        }
+        const auto sharded_tensor = std::find_if(
+            sharded_gguf.graph.tensors.begin(),
+            sharded_gguf.graph.tensors.end(),
+            [](const jakal::WorkloadTensor& tensor) {
+                return tensor.id == "output.weight";
+            });
+        if (sharded_tensor == sharded_gguf.graph.tensors.end() || sharded_tensor->bytes != 204800u) {
+            std::cerr << "gguf shard aggregation missed downstream shard tensor\n";
+            return 1;
+        }
 
         jakal::RuntimeOptions runtime_options;
         runtime_options.enable_host_probe = true;
@@ -937,14 +1178,61 @@ int main() {
             std::cerr << "runtime execute did not emit imported source telemetry\n";
             return 1;
         }
+        const auto executed_external = runtime.execute_manifest(external_onnx_path);
+        if (!executed_external.executed || executed_external.asset_prefetch.entries.empty() ||
+            executed_external.asset_prefetch.total_prefetch_bytes != 96u) {
+            std::cerr << "runtime execute did not surface onnx external asset prefetch\n";
+            return 1;
+        }
+        if (executed_external.asset_prefetch.entries.front().queue_hint != "host_io" ||
+            executed_external.asset_prefetch.entries.front().target_residency != "host") {
+            std::cerr << "runtime execute did not preserve onnx external queue hint\n";
+            return 1;
+        }
+        const auto executed_shared_external = runtime.execute_manifest(shared_external_onnx_path);
+        if (!executed_shared_external.executed || executed_shared_external.asset_prefetch.entries.size() != 2u ||
+            executed_shared_external.asset_prefetch.total_prefetch_bytes != 216u ||
+            executed_shared_external.asset_prefetch.total_host_io_bytes != 216u) {
+            std::cerr << "runtime execute did not surface shared onnx external blob prefetch\n";
+            return 1;
+        }
+        const auto shared_a = std::find_if(
+            executed_shared_external.asset_prefetch.entries.begin(),
+            executed_shared_external.asset_prefetch.entries.end(),
+            [](const jakal::AssetPrefetchEntry& entry) {
+                return entry.tensor_id == "proj_w_a";
+            });
+        const auto shared_b = std::find_if(
+            executed_shared_external.asset_prefetch.entries.begin(),
+            executed_shared_external.asset_prefetch.entries.end(),
+            [](const jakal::AssetPrefetchEntry& entry) {
+                return entry.tensor_id == "proj_w_b";
+            });
+        if (shared_a == executed_shared_external.asset_prefetch.entries.end() ||
+            shared_b == executed_shared_external.asset_prefetch.entries.end() ||
+            shared_a->file_offset != 0u ||
+            shared_b->file_offset != 96u) {
+            std::cerr << "runtime execute did not preserve shared onnx external offsets\n";
+            return 1;
+        }
         const auto executed_gguf = runtime.execute_manifest(gguf_path);
         if (!executed_gguf.executed || executed_gguf.execution.optimization.operations.empty()) {
             std::cerr << "runtime execute did not accept imported gguf source\n";
             return 1;
         }
+        const auto executed_sharded_gguf = runtime.execute_manifest(gguf_shard_1_path);
+        if (!executed_sharded_gguf.executed || executed_sharded_gguf.asset_prefetch.entries.empty() ||
+            executed_sharded_gguf.asset_prefetch.total_prefetch_bytes != 819200u) {
+            std::cerr << "runtime execute did not surface gguf shard prefetch\n";
+            return 1;
+        }
 
         std::error_code ec;
         std::filesystem::remove(onnx_path, ec);
+        std::filesystem::remove(external_onnx_path, ec);
+        std::filesystem::remove(external_data_path, ec);
+        std::filesystem::remove(shared_external_onnx_path, ec);
+        std::filesystem::remove(shared_external_data_path, ec);
         std::filesystem::remove(resize_onnx_path, ec);
         std::filesystem::remove(shape_onnx_path, ec);
         std::filesystem::remove(graph_ops_onnx_path, ec);
@@ -954,8 +1242,13 @@ int main() {
         std::filesystem::remove(pytorch_path, ec);
         std::filesystem::remove(ggml_path, ec);
         std::filesystem::remove(gguf_path, ec);
+        std::filesystem::remove(gguf_shard_1_path, ec);
+        std::filesystem::remove(gguf_shard_2_path, ec);
         std::filesystem::remove(executed.telemetry_path, ec);
+        std::filesystem::remove(executed_external.telemetry_path, ec);
+        std::filesystem::remove(executed_shared_external.telemetry_path, ec);
         std::filesystem::remove(executed_gguf.telemetry_path, ec);
+        std::filesystem::remove(executed_sharded_gguf.telemetry_path, ec);
 
         std::cout << "workload import adapters ok\n";
         return 0;

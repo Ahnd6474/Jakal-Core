@@ -877,6 +877,18 @@ KernelCoverageReport Runtime::build_kernel_coverage(const OptimizationReport& op
 AssetPrefetchReport Runtime::build_asset_prefetch(
     const WorkloadManifest& manifest,
     const OptimizationReport& optimization) const {
+    const auto queue_hint_for_asset = [&](const WorkloadAsset& asset, const std::string& device_uid) {
+        const auto* target_graph = device_uid.empty() ? nullptr : find_graph_by_uid(devices_, device_uid);
+        const bool target_is_host = target_graph != nullptr && target_graph->probe == "host";
+        if (device_uid.empty() || target_is_host || asset.preferred_residency == "host") {
+            return std::string("host_io");
+        }
+        if (asset.preferred_residency == "device" || asset.preferred_residency == "accelerator") {
+            return std::string("host_to_device");
+        }
+        return std::string("host_to_device");
+    };
+
     AssetPrefetchReport report;
     if (manifest.assets.empty()) {
         return report;
@@ -906,17 +918,23 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
             summary << "missing asset " << asset.id;
         }
         if (asset.tensor_ids.empty()) {
+            const auto queue_hint = queue_hint_for_asset(asset, std::string());
             report.entries.push_back(AssetPrefetchEntry{
                 asset.id,
                 asset.path,
                 std::string(),
                 std::string(),
+                asset.file_offset,
                 asset.bytes,
+                queue_hint,
+                asset.preferred_residency,
                 exists,
                 asset.preload_required,
                 asset.persistent,
-                asset.host_visible});
+                asset.host_visible,
+                !asset.host_visible || queue_hint != "host_io"});
             report.total_prefetch_bytes += asset.bytes;
+            report.total_host_io_bytes += asset.bytes;
             continue;
         }
         const auto per_tensor_bytes = asset.bytes == 0u
@@ -927,33 +945,55 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
         for (const auto& tensor_id : asset.tensor_ids) {
             const auto devices_it = tensor_devices.find(tensor_id);
             if (devices_it == tensor_devices.end() || devices_it->second.empty()) {
+                const auto queue_hint = queue_hint_for_asset(asset, std::string());
                 report.entries.push_back(AssetPrefetchEntry{
                     asset.id,
                     asset.path,
                     tensor_id,
                     std::string(),
+                    asset.file_offset,
                     per_tensor_bytes,
+                    queue_hint,
+                    asset.preferred_residency,
                     exists,
                     asset.preload_required,
                     asset.persistent,
-                    asset.host_visible});
+                    asset.host_visible,
+                    !asset.host_visible || queue_hint != "host_io"});
                 report.total_prefetch_bytes += per_tensor_bytes;
+                report.total_host_io_bytes += per_tensor_bytes;
                 continue;
             }
             for (const auto& device_uid : devices_it->second) {
+                const auto queue_hint = queue_hint_for_asset(asset, device_uid);
                 report.entries.push_back(AssetPrefetchEntry{
                     asset.id,
                     asset.path,
                     tensor_id,
                     device_uid,
+                    asset.file_offset,
                     per_tensor_bytes,
+                    queue_hint,
+                    asset.preferred_residency,
                     exists,
                     asset.preload_required,
                     asset.persistent,
-                    asset.host_visible});
+                    asset.host_visible,
+                    !asset.host_visible || queue_hint != "host_io"});
                 report.total_prefetch_bytes += per_tensor_bytes;
+                if (queue_hint == "host_to_device") {
+                    report.total_host_to_device_bytes += per_tensor_bytes;
+                } else {
+                    report.total_host_io_bytes += per_tensor_bytes;
+                }
             }
         }
+    }
+    if (!report.missing_required_assets) {
+        summary << (summary.tellp() > 0 ? "; " : "")
+                << "prefetch=" << report.total_prefetch_bytes
+                << " host_io=" << report.total_host_io_bytes
+                << " h2d=" << report.total_host_to_device_bytes;
     }
     report.summary = summary.str();
     return report;
@@ -980,7 +1020,7 @@ void Runtime::persist_telemetry(
     }
 
     if (write_header) {
-        output << "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\ttotal_runtime_us\tspeedup_vs_reference\tsummary\n";
+        output << "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tsummary\n";
     }
 
     output << execution_epoch_ << '\t'
@@ -1000,6 +1040,9 @@ void Runtime::persist_telemetry(
            << report.residency_sequence.spill_bytes << '\t'
            << report.residency_sequence.reload_bytes << '\t'
            << report.residency_sequence.forced_spill_count << '\t'
+           << report.asset_prefetch.total_prefetch_bytes << '\t'
+           << report.asset_prefetch.total_host_io_bytes << '\t'
+           << report.asset_prefetch.total_host_to_device_bytes << '\t'
            << (report.executed ? report.execution.total_runtime_us : 0.0) << '\t'
            << (report.executed ? report.execution.speedup_vs_reference : 0.0) << '\t'
            << report.safety.summary << '\n';

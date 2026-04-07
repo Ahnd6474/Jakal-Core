@@ -1218,6 +1218,12 @@ std::int64_t decode_protobuf_int64(const std::uint64_t value) {
     return std::bit_cast<std::int64_t>(value);
 }
 
+std::string read_protobuf_string(const std::vector<std::uint8_t>& bytes, std::size_t& offset);
+void skip_protobuf_field(
+    const std::vector<std::uint8_t>& bytes,
+    std::size_t& offset,
+    const std::uint32_t wire_type);
+
 std::pair<std::string, std::string> parse_onnx_string_map_entry(const std::vector<std::uint8_t>& bytes) {
     std::pair<std::string, std::string> entry;
     std::size_t offset = 0u;
@@ -1633,6 +1639,7 @@ WorkloadManifest load_onnx_workload_source(const std::filesystem::path& path) {
     manifest.workload.matrix_friendly = true;
     manifest.workload.phase = WorkloadPhase::prefill;
 
+    std::vector<WorkloadAsset> external_assets;
     std::unordered_map<std::string, ImportedValueSpec> value_map;
     value_map.reserve(onnx.values.size());
     for (const auto& value : onnx.values) {
@@ -1655,6 +1662,19 @@ WorkloadManifest load_onnx_workload_source(const std::filesystem::path& path) {
         slot.initializer = slot.initializer || value.initializer;
         slot.persistent = slot.persistent || value.initializer;
         slot.host_visible = slot.host_visible || value.host_visible;
+        if (value.initializer && !value.external_data_path.empty() && !value.name.empty()) {
+            WorkloadAsset asset;
+            asset.id = value.name + "-external";
+            asset.path = value.external_data_path;
+            asset.tensor_ids = {value.name};
+            asset.file_offset = value.external_data_offset;
+            asset.bytes = value.bytes;
+            asset.persistent = true;
+            asset.host_visible = true;
+            asset.preload_required = true;
+            asset.preferred_residency = "host";
+            external_assets.push_back(std::move(asset));
+        }
     }
 
     std::vector<ImportedNodeSpec> nodes;
@@ -1749,7 +1769,11 @@ WorkloadManifest load_onnx_workload_source(const std::filesystem::path& path) {
     }
 
     manifest.workload.prefer_unified_memory = saw_initializer;
-    return finalize_imported_manifest(std::move(manifest), source, values, nodes);
+    auto finalized = finalize_imported_manifest(std::move(manifest), source, values, nodes);
+    if (!external_assets.empty()) {
+        finalized.assets = std::move(external_assets);
+    }
+    return finalized;
 }
 
 bool parse_bool_string(const std::string& input, const bool fallback = false) {
@@ -2175,7 +2199,33 @@ WorkloadManifest finalize_imported_manifest(
     return manifest;
 }
 
-GgufFileContents parse_gguf_file(const std::filesystem::path& path) {
+std::vector<std::filesystem::path> discover_gguf_shard_paths(const std::filesystem::path& path) {
+    static const std::regex shard_pattern(R"(^(.*)-(\d{5})-of-(\d{5})\.gguf$)", std::regex::icase);
+
+    std::smatch match;
+    const auto filename = path.filename().string();
+    if (!std::regex_match(filename, match, shard_pattern)) {
+        return {path};
+    }
+
+    const auto shard_prefix = match[1].str();
+    const auto shard_count = static_cast<std::uint32_t>(std::stoul(match[3].str()));
+    std::vector<std::filesystem::path> shard_paths;
+    shard_paths.reserve(shard_count);
+    for (std::uint32_t index = 1u; index <= shard_count; ++index) {
+        std::ostringstream name;
+        name << shard_prefix << '-' << std::setw(5) << std::setfill('0') << index
+             << "-of-" << std::setw(5) << std::setfill('0') << shard_count << ".gguf";
+        const auto candidate = path.parent_path() / name.str();
+        if (!std::filesystem::exists(candidate)) {
+            throw std::runtime_error("missing GGUF shard: " + candidate.string());
+        }
+        shard_paths.push_back(candidate);
+    }
+    return shard_paths;
+}
+
+GgufFileContents parse_single_gguf_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input.is_open()) {
         throw std::runtime_error("unable to open GGUF file: " + path.string());
@@ -2198,6 +2248,7 @@ GgufFileContents parse_gguf_file(const std::filesystem::path& path) {
     GgufFileContents contents;
     contents.metadata.reserve(static_cast<std::size_t>(metadata_count));
     contents.tensors.reserve(static_cast<std::size_t>(tensor_count));
+    contents.shard_paths.push_back(path);
 
     for (std::uint64_t index = 0u; index < metadata_count; ++index) {
         const auto key = read_gguf_string(input);
@@ -2218,6 +2269,7 @@ GgufFileContents parse_gguf_file(const std::filesystem::path& path) {
         }
         tensor.type = read_binary_value<std::uint32_t>(input);
         tensor.offset = read_binary_value<std::uint64_t>(input);
+        tensor.source_path = path;
         contents.tensors.push_back(std::move(tensor));
     }
 
@@ -2239,6 +2291,34 @@ GgufFileContents parse_gguf_file(const std::filesystem::path& path) {
     }
 
     return contents;
+}
+
+GgufFileContents parse_gguf_file(const std::filesystem::path& path) {
+    const auto shard_paths = discover_gguf_shard_paths(path);
+    if (shard_paths.size() == 1u) {
+        return parse_single_gguf_file(path);
+    }
+
+    GgufFileContents combined;
+    combined.shard_paths = shard_paths;
+    for (std::size_t index = 0u; index < shard_paths.size(); ++index) {
+        auto shard = parse_single_gguf_file(shard_paths[index]);
+        if (index == 0u) {
+            combined.metadata = shard.metadata;
+            combined.alignment = shard.alignment;
+        } else {
+            for (const auto& [key, value] : shard.metadata) {
+                combined.metadata.emplace(key, value);
+            }
+            combined.alignment = std::max(combined.alignment, shard.alignment);
+        }
+        combined.total_tensor_bytes += shard.total_tensor_bytes;
+        combined.tensors.insert(
+            combined.tensors.end(),
+            std::make_move_iterator(shard.tensors.begin()),
+            std::make_move_iterator(shard.tensors.end()));
+    }
+    return combined;
 }
 
 std::string choose_weight_tensor_id(
@@ -2334,6 +2414,28 @@ WorkloadManifest load_gguf_workload_source(const std::filesystem::path& path) {
         if (bytes > 0u) {
             ranked_ids.push_back(id);
         }
+    }
+
+    std::unordered_map<std::string, std::size_t> asset_indices;
+    for (const auto& shard_path : gguf.shard_paths) {
+        WorkloadAsset asset;
+        asset.id = shard_path.filename().string();
+        asset.path = shard_path;
+        asset.persistent = true;
+        asset.host_visible = true;
+        asset.preload_required = true;
+        asset.preferred_residency = "device";
+        asset_indices.emplace(shard_path.string(), manifest.assets.size());
+        manifest.assets.push_back(std::move(asset));
+    }
+    for (const auto& tensor : gguf.tensors) {
+        const auto asset_it = asset_indices.find(tensor.source_path.string());
+        if (asset_it == asset_indices.end()) {
+            continue;
+        }
+        auto& asset = manifest.assets[asset_it->second];
+        asset.tensor_ids.push_back(tensor.name);
+        asset.bytes += tensor.bytes;
     }
 
     add_tensor(graph, "decode-token", hidden * sizeof(float), "", {"decode-rmsnorm"}, false, false, true);
@@ -2522,9 +2624,17 @@ WorkloadManifest load_workload_source(const std::filesystem::path& path) {
             if (const auto it = fields.find("tensor_ids"); it != fields.end()) {
                 asset.tensor_ids = split_csv_strings(it->second);
             }
-            if (const auto it = fields.find("bytes"); it != fields.end()) {
-                asset.bytes = static_cast<std::uint64_t>(std::stoull(it->second));
-            } else if (!asset.path.empty()) {
+            const bool explicit_bytes = fields.find("bytes") != fields.end();
+            if (explicit_bytes) {
+                asset.bytes = static_cast<std::uint64_t>(std::stoull(fields.at("bytes")));
+            }
+            if (const auto it = fields.find("offset"); it != fields.end()) {
+                asset.file_offset = static_cast<std::uint64_t>(std::stoull(it->second));
+            }
+            if (const auto it = fields.find("file_offset"); it != fields.end()) {
+                asset.file_offset = static_cast<std::uint64_t>(std::stoull(it->second));
+            }
+            if (!explicit_bytes && !asset.path.empty()) {
                 std::error_code ec;
                 asset.bytes = std::filesystem::is_regular_file(asset.path, ec)
                                   ? static_cast<std::uint64_t>(std::filesystem::file_size(asset.path, ec))

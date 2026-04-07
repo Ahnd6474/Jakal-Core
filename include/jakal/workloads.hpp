@@ -25,6 +25,7 @@ struct WorkloadAsset {
     std::string id;
     std::filesystem::path path;
     std::vector<std::string> tensor_ids;
+    std::uint64_t file_offset = 0;
     std::uint64_t bytes = 0;
     bool persistent = true;
     bool host_visible = false;
