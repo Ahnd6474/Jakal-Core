@@ -316,6 +316,17 @@ std::string lowercase_copy(const std::string& input) {
     return lowered;
 }
 
+bool path_looks_like_gguf(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) {
+        return false;
+    }
+    std::array<char, 4> magic{};
+    input.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+    return input.gcount() == static_cast<std::streamsize>(magic.size()) &&
+           std::string_view(magic.data(), magic.size()) == "GGUF";
+}
+
 std::vector<std::string> split_csv_strings(const std::string& input) {
     std::vector<std::string> values;
     std::stringstream stream(input);
@@ -2553,6 +2564,9 @@ WorkloadManifest load_workload_source(const std::filesystem::path& path) {
     }
     if (extension == ".onnx") {
         return load_onnx_workload_source(path);
+    }
+    if (path_looks_like_gguf(path)) {
+        return load_gguf_workload_source(path);
     }
 
     std::ifstream input(path);

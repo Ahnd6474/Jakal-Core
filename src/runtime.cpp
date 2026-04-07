@@ -1,10 +1,14 @@
 #include "jakal/runtime.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -98,6 +102,386 @@ double head_runtime_us(const WorkloadSpec& workload, const DirectExecutionReport
         [](const double total, const OperationExecutionRecord& operation) {
             return total + std::max(operation.runtime_us, 0.0);
         });
+}
+
+struct LayoutCacheDescriptor {
+    std::string materialization_kind;
+    std::string backend_hint;
+    std::string source_tensor_id;
+    std::uint64_t bytes = 0;
+};
+
+struct PackedLayoutBlobHeader {
+    std::array<char, 8> magic{'J', 'A', 'K', 'P', 'A', 'C', 'K', 'D'};
+    std::uint32_t version = 2u;
+    std::uint32_t materialization_hash = 0u;
+    std::uint32_t backend_cache_hash = 0u;
+    std::uint64_t source_offset = 0u;
+    std::uint64_t source_bytes = 0u;
+    std::uint64_t payload_bytes = 0u;
+    std::int64_t source_mtime_ticks = 0;
+};
+
+std::uint32_t stable_text_hash(const std::string& text) {
+    std::uint32_t hash = 2166136261u;
+    for (const unsigned char ch : text) {
+        hash ^= static_cast<std::uint32_t>(ch);
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+std::string sanitize_cache_component(std::string value) {
+    for (auto& ch : value) {
+        const bool keep =
+            std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '.' || ch == '-' || ch == '_';
+        if (!keep) {
+            ch = '_';
+        }
+    }
+    if (value.empty()) {
+        value = "unnamed";
+    }
+    return value;
+}
+
+std::int64_t file_mtime_ticks(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto write_time = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return 0;
+    }
+    return static_cast<std::int64_t>(write_time.time_since_epoch().count());
+}
+
+std::string file_metadata_fingerprint(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto size = std::filesystem::exists(path, ec) ? std::filesystem::file_size(path, ec) : 0u;
+    return sanitize_cache_component(path.filename().string()) + ":" + std::to_string(size) + ":" +
+           std::to_string(file_mtime_ticks(path));
+}
+
+std::vector<std::filesystem::path> existing_binary_paths(std::initializer_list<std::filesystem::path> candidates) {
+    std::vector<std::filesystem::path> paths;
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec)) {
+            paths.push_back(candidate);
+        }
+    }
+    return paths;
+}
+
+std::string join_fingerprints(const std::vector<std::filesystem::path>& paths) {
+    if (paths.empty()) {
+        return "unresolved";
+    }
+    std::ostringstream stream;
+    bool first = true;
+    for (const auto& path : paths) {
+        if (!first) {
+            stream << ";";
+        }
+        first = false;
+        stream << file_metadata_fingerprint(path);
+    }
+    return stream.str();
+}
+
+std::string backend_binary_cache_tag(const HardwareGraph& graph) {
+    std::ostringstream declared_versions;
+    if (!graph.driver_version.empty()) {
+        declared_versions << "drv=" << sanitize_cache_component(graph.driver_version);
+    }
+    if (!graph.runtime_version.empty()) {
+        if (declared_versions.tellp() > 0) {
+            declared_versions << ";";
+        }
+        declared_versions << "rt=" << sanitize_cache_component(graph.runtime_version);
+    }
+    if (!graph.compiler_version.empty()) {
+        if (declared_versions.tellp() > 0) {
+            declared_versions << ";";
+        }
+        declared_versions << "cc=" << sanitize_cache_component(graph.compiler_version);
+    }
+    const auto version_prefix = declared_versions.str();
+    if (graph.probe == "host") {
+        return "host:" + structural_fingerprint(graph) + ":" + version_prefix;
+    }
+#if defined(_WIN32)
+    if (graph.probe == "level-zero") {
+        const auto paths = existing_binary_paths({
+            "C:\\Windows\\System32\\ze_loader.dll",
+            "C:\\Windows\\System32\\ze_intel_gpu64.dll",
+            "C:\\Windows\\System32\\igdrcl64.dll",
+            "C:\\Program Files (x86)\\Intel\\oneAPI\\2025.1\\bin\\ocloc.exe",
+            "C:\\Program Files (x86)\\Intel\\oneAPI\\latest\\bin\\ocloc.exe"});
+        return "level-zero:" + structural_fingerprint(graph) + ":" + version_prefix + ":" + join_fingerprints(paths);
+    }
+    if (graph.probe == "cuda") {
+        const auto paths = existing_binary_paths({
+            "C:\\Windows\\System32\\nvcuda.dll",
+            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2\\bin\\nvrtc64_130_0.dll",
+            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2\\bin\\nvrtc-builtins64_130.dll"});
+        return "cuda:" + structural_fingerprint(graph) + ":" + version_prefix + ":" + join_fingerprints(paths);
+    }
+    if (graph.probe == "rocm") {
+        const auto paths = existing_binary_paths({
+            "C:\\Windows\\System32\\amdhip64.dll",
+            "C:\\Windows\\System32\\hiprtc.dll",
+            "C:\\Windows\\System32\\hiprtc0507.dll"});
+        return "rocm:" + structural_fingerprint(graph) + ":" + version_prefix + ":" + join_fingerprints(paths);
+    }
+    if (graph.probe == "opencl") {
+        const auto paths = existing_binary_paths({
+            "C:\\Windows\\System32\\OpenCL.dll",
+            "C:\\Windows\\System32\\igdrcl64.dll"});
+        return "opencl:" + structural_fingerprint(graph) + ":" + version_prefix + ":" + join_fingerprints(paths);
+    }
+#else
+    if (graph.probe == "level-zero") {
+        const auto paths = existing_binary_paths({
+            "/usr/lib/libze_loader.so",
+            "/usr/lib/x86_64-linux-gnu/libze_loader.so",
+            "/opt/intel/oneapi/compiler/latest/bin/ocloc"});
+        return "level-zero:" + structural_fingerprint(graph) + ":" + version_prefix + ":" + join_fingerprints(paths);
+    }
+    if (graph.probe == "cuda") {
+        const auto paths = existing_binary_paths({
+            "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+            "/usr/local/cuda/lib64/libnvrtc.so"});
+        return "cuda:" + structural_fingerprint(graph) + ":" + version_prefix + ":" + join_fingerprints(paths);
+    }
+    if (graph.probe == "rocm") {
+        const auto paths = existing_binary_paths({
+            "/opt/rocm/lib/libamdhip64.so",
+            "/opt/rocm/lib/libhiprtc.so"});
+        return "rocm:" + structural_fingerprint(graph) + ":" + version_prefix + ":" + join_fingerprints(paths);
+    }
+    if (graph.probe == "opencl") {
+        const auto paths = existing_binary_paths({
+            "/usr/lib/x86_64-linux-gnu/libOpenCL.so.1"});
+        return "opencl:" + structural_fingerprint(graph) + ":" + version_prefix + ":" + join_fingerprints(paths);
+    }
+#endif
+    return graph.probe + ":" + structural_fingerprint(graph) + ":" + version_prefix;
+}
+
+std::vector<std::uint8_t> read_asset_window(
+    const std::filesystem::path& path,
+    const std::uint64_t file_offset,
+    const std::uint64_t bytes) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) {
+        return {};
+    }
+    input.seekg(0, std::ios::end);
+    const auto file_size = static_cast<std::uint64_t>(std::max<std::streamoff>(input.tellg(), 0));
+    if (file_offset >= file_size) {
+        return {};
+    }
+    const auto available = file_size - file_offset;
+    const auto window_bytes = bytes == 0u ? available : std::min(bytes, available);
+    std::vector<std::uint8_t> buffer(static_cast<std::size_t>(window_bytes), 0u);
+    input.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
+    input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+    const auto read_bytes = static_cast<std::size_t>(std::max<std::streamsize>(input.gcount(), 0));
+    buffer.resize(read_bytes);
+    return buffer;
+}
+
+std::vector<std::uint8_t> build_packed_layout_payload(
+    const std::vector<std::uint8_t>& source,
+    const LayoutCacheDescriptor& descriptor) {
+    if (source.empty() || descriptor.bytes == 0u) {
+        return {};
+    }
+    std::vector<std::uint8_t> payload(static_cast<std::size_t>(descriptor.bytes), 0u);
+    if (descriptor.materialization_kind.find("packed-rhs") != std::string::npos) {
+        constexpr std::size_t kBlock = 16u;
+        const std::size_t source_size = source.size();
+        for (std::size_t dst = 0; dst < payload.size(); ++dst) {
+            const std::size_t block_base = (dst / kBlock) * kBlock;
+            const std::size_t lane = dst % kBlock;
+            const std::size_t src = (lane * kBlock + block_base / kBlock) % source_size;
+            payload[dst] = source[src];
+        }
+        return payload;
+    }
+    if (descriptor.materialization_kind.find("conv-patch9") != std::string::npos) {
+        for (std::size_t dst = 0; dst < payload.size(); ++dst) {
+            payload[dst] = source[(dst / 9u) % source.size()];
+        }
+        return payload;
+    }
+    for (std::size_t dst = 0; dst < payload.size(); ++dst) {
+        payload[dst] = source[dst % source.size()];
+    }
+    return payload;
+}
+
+std::filesystem::path runtime_layout_cache_root(const RuntimeOptions& options) {
+    auto base = options.cache_path.empty() ? Planner::default_cache_path() : options.cache_path;
+    if (base.has_extension()) {
+        const auto parent = base.parent_path();
+        const auto stem = sanitize_cache_component(base.stem().string());
+        return (parent.empty() ? std::filesystem::path(".") : parent) / (stem + "-packed-layouts");
+    }
+    return base / "packed-layouts";
+}
+
+std::filesystem::path packed_layout_blob_path(
+    const std::filesystem::path& root,
+    const AssetPrefetchEntry& entry) {
+    return root /
+           (sanitize_cache_component(entry.source_asset_id.empty() ? entry.asset_id : entry.source_asset_id) + "-" +
+            sanitize_cache_component(entry.tensor_id.empty() ? "global" : entry.tensor_id) + "-" +
+            sanitize_cache_component(entry.materialization_kind) + "-" +
+            sanitize_cache_component(entry.device_uid.empty() ? "host" : entry.device_uid) + "-" +
+            std::to_string(stable_text_hash(entry.backend_cache_tag)) + ".jpkd");
+}
+
+bool packed_layout_blob_matches(
+    const std::filesystem::path& path,
+    const AssetPrefetchEntry& entry,
+    const std::int64_t source_mtime) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) {
+        return false;
+    }
+    PackedLayoutBlobHeader header;
+    input.read(reinterpret_cast<char*>(&header), static_cast<std::streamsize>(sizeof(header)));
+    if (input.gcount() != static_cast<std::streamsize>(sizeof(header))) {
+        return false;
+    }
+    return header.magic == PackedLayoutBlobHeader{}.magic &&
+           header.version == 2u &&
+           header.materialization_hash == stable_text_hash(entry.materialization_kind + "|" + entry.backend_hint) &&
+           header.backend_cache_hash == stable_text_hash(entry.backend_cache_tag) &&
+           header.source_offset == entry.file_offset &&
+           header.source_bytes == entry.bytes &&
+           header.payload_bytes == entry.bytes &&
+           header.source_mtime_ticks == source_mtime;
+}
+
+bool write_packed_layout_blob(
+    const std::filesystem::path& path,
+    const AssetPrefetchEntry& entry,
+    const std::int64_t source_mtime,
+    const std::vector<std::uint8_t>& payload) {
+    PackedLayoutBlobHeader header;
+    header.materialization_hash = stable_text_hash(entry.materialization_kind + "|" + entry.backend_hint);
+    header.backend_cache_hash = stable_text_hash(entry.backend_cache_tag);
+    header.source_offset = entry.file_offset;
+    header.source_bytes = entry.bytes;
+    header.payload_bytes = static_cast<std::uint64_t>(payload.size());
+    header.source_mtime_ticks = source_mtime;
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) {
+        return false;
+    }
+    output.write(reinterpret_cast<const char*>(&header), static_cast<std::streamsize>(sizeof(header)));
+    output.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    return output.good();
+}
+
+bool should_persist_packed_layout_blob(const AssetPrefetchEntry& entry) {
+    if (!entry.derived_cache) {
+        return false;
+    }
+    return entry.materialization_kind.find("packed-rhs") != std::string::npos ||
+           entry.materialization_kind.find("conv-patch9") != std::string::npos;
+}
+
+void materialize_packed_layout_blobs(
+    const RuntimeOptions& options,
+    AssetPrefetchReport& report) {
+    const auto root = runtime_layout_cache_root(options);
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+
+    for (auto& entry : report.entries) {
+        if (!should_persist_packed_layout_blob(entry) || entry.path.empty()) {
+            continue;
+        }
+        const auto source_path = entry.path;
+        const auto source_mtime = file_mtime_ticks(source_path);
+        const auto cache_path = packed_layout_blob_path(root, entry);
+        if (packed_layout_blob_matches(cache_path, entry, source_mtime)) {
+            entry.path = cache_path;
+            entry.exists_on_disk = true;
+            continue;
+        }
+
+        const auto source = read_asset_window(source_path, entry.file_offset, 0u);
+        const auto payload = build_packed_layout_payload(
+            source,
+            LayoutCacheDescriptor{
+                entry.materialization_kind,
+                entry.backend_hint,
+                entry.tensor_id,
+                entry.bytes});
+        if (payload.size() != entry.bytes || payload.empty()) {
+            continue;
+        }
+        if (write_packed_layout_blob(cache_path, entry, source_mtime, payload)) {
+            entry.path = cache_path;
+            entry.exists_on_disk = true;
+        }
+    }
+}
+
+std::optional<LayoutCacheDescriptor> describe_layout_cache(
+    const OperationSpec& operation,
+    const WorkloadGraph& workload_graph,
+    const bool gpu_target) {
+    const auto find_tensor_bytes = [&](const std::string& tensor_id) -> std::uint64_t {
+        const auto it = std::find_if(
+            workload_graph.tensors.begin(),
+            workload_graph.tensors.end(),
+            [&](const WorkloadTensor& tensor) { return tensor.id == tensor_id; });
+        return it == workload_graph.tensors.end() ? 0u : it->bytes;
+    };
+
+    switch (operation.op_class) {
+    case OperationClass::matmul:
+        if ((gpu_target && !(operation.gpu_pack_weights || operation.gpu_pretranspose_rhs)) ||
+            (!gpu_target && !(operation.cpu_pack_weights || operation.cpu_pretranspose_rhs)) ||
+            operation.input_tensor_ids.size() < 2u) {
+            return std::nullopt;
+        }
+        return LayoutCacheDescriptor{
+            gpu_target ? "gpu-packed-rhs" : "cpu-packed-rhs",
+            gpu_target ? "gpu" : "cpu",
+            operation.input_tensor_ids[1],
+            find_tensor_bytes(operation.input_tensor_ids[1])};
+    case OperationClass::convolution_2d:
+        if ((gpu_target && operation.gpu_input_layout.find("conv-patch9") == std::string::npos) ||
+            (!gpu_target && operation.cpu_input_layout.find("conv-patch9") == std::string::npos) ||
+            operation.input_tensor_ids.empty() || operation.extents.size() < 2u) {
+            return std::nullopt;
+        }
+        return LayoutCacheDescriptor{
+            gpu_target ? "gpu-conv-patch9" : "cpu-conv-patch9",
+            gpu_target ? "gpu" : "cpu",
+            operation.input_tensor_ids.front(),
+            operation.output_bytes * 9u};
+    case OperationClass::resample_2d:
+        if ((gpu_target && operation.gpu_input_layout.find("resample-packed6") == std::string::npos) ||
+            (!gpu_target && operation.cpu_input_layout.find("resample-packed6") == std::string::npos) ||
+            operation.input_tensor_ids.empty() || operation.extents.size() < 4u) {
+            return std::nullopt;
+        }
+        return LayoutCacheDescriptor{
+            gpu_target ? "gpu-resample-packed6" : "cpu-resample-packed6",
+            gpu_target ? "gpu" : "cpu",
+            operation.input_tensor_ids.front(),
+            operation.output_bytes * 6u};
+    default:
+        return std::nullopt;
+    }
 }
 
 double successful_operation_ratio(const DirectExecutionReport& report) {
@@ -283,6 +667,10 @@ double planner_risk_score(
 
 }  // namespace
 
+std::string runtime_backend_cache_tag_for_graph(const HardwareGraph& graph) {
+    return backend_binary_cache_tag(graph);
+}
+
 std::string runtime_backend_name_for_graph(const HardwareGraph& graph) {
     return backend_name_for_graph(graph);
 }
@@ -344,7 +732,6 @@ void Runtime::refresh_hardware() {
         }
         devices_.push_back(std::move(graph));
     }
-
     std::sort(devices_.begin(), devices_.end(), [](const HardwareGraph& left, const HardwareGraph& right) {
         const auto left_summary = summarize_graph(left);
         const auto right_summary = summarize_graph(right);
@@ -661,6 +1048,7 @@ ManagedExecutionReport Runtime::execute_manifest(const std::filesystem::path& ma
     report = manifest.has_graph ? execute_managed(manifest.workload, manifest.graph) : execute_managed(manifest.workload);
     if (manifest.has_graph) {
         report.asset_prefetch = build_asset_prefetch(manifest, report.execution.optimization);
+        materialize_packed_layout_blobs(options_, report.asset_prefetch);
         if (report.asset_prefetch.missing_required_assets && report.executed) {
             report.executed = false;
             report.safety.summary += report.safety.summary.empty() ? "" : "; ";
@@ -1040,6 +1428,19 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
         return report;
     }
 
+    const auto append_prefetch_entry = [&](AssetPrefetchEntry entry) {
+        report.total_prefetch_bytes += entry.bytes;
+        if (entry.derived_cache) {
+            report.total_layout_cache_bytes += entry.bytes;
+        }
+        if (entry.queue_hint == "host_to_device") {
+            report.total_host_to_device_bytes += entry.bytes;
+        } else {
+            report.total_host_io_bytes += entry.bytes;
+        }
+        report.entries.push_back(std::move(entry));
+    };
+
     std::unordered_map<std::string, std::vector<std::string>> tensor_devices;
     for (const auto& optimized : optimization.operations) {
         for (const auto& entry : optimized.graph.residency_plan) {
@@ -1050,6 +1451,13 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
             if (std::find(devices.begin(), devices.end(), entry.device_uid) == devices.end()) {
                 devices.push_back(entry.device_uid);
             }
+        }
+    }
+
+    std::unordered_map<std::string, std::vector<const WorkloadAsset*>> assets_by_tensor;
+    for (const auto& asset : manifest.assets) {
+        for (const auto& tensor_id : asset.tensor_ids) {
+            assets_by_tensor[tensor_id].push_back(&asset);
         }
     }
 
@@ -1065,7 +1473,8 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
         }
         if (asset.tensor_ids.empty()) {
             const auto queue_hint = queue_hint_for_asset(asset, std::string());
-            report.entries.push_back(AssetPrefetchEntry{
+            append_prefetch_entry(AssetPrefetchEntry{
+                asset.id,
                 asset.id,
                 asset.path,
                 std::string(),
@@ -1074,13 +1483,15 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
                 asset.bytes,
                 queue_hint,
                 asset.preferred_residency,
+                "raw",
+                "any",
+                "raw",
                 exists,
                 asset.preload_required,
                 asset.persistent,
                 asset.host_visible,
-                !asset.host_visible || queue_hint != "host_io"});
-            report.total_prefetch_bytes += asset.bytes;
-            report.total_host_io_bytes += asset.bytes;
+                !asset.host_visible || queue_hint != "host_io",
+                false});
             continue;
         }
         const auto per_tensor_bytes = asset.bytes == 0u
@@ -1092,7 +1503,8 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
             const auto devices_it = tensor_devices.find(tensor_id);
             if (devices_it == tensor_devices.end() || devices_it->second.empty()) {
                 const auto queue_hint = queue_hint_for_asset(asset, std::string());
-                report.entries.push_back(AssetPrefetchEntry{
+                append_prefetch_entry(AssetPrefetchEntry{
+                    asset.id,
                     asset.id,
                     asset.path,
                     tensor_id,
@@ -1101,18 +1513,21 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
                     per_tensor_bytes,
                     queue_hint,
                     asset.preferred_residency,
+                    "raw",
+                    "any",
+                    "raw",
                     exists,
                     asset.preload_required,
                     asset.persistent,
                     asset.host_visible,
-                    !asset.host_visible || queue_hint != "host_io"});
-                report.total_prefetch_bytes += per_tensor_bytes;
-                report.total_host_io_bytes += per_tensor_bytes;
+                    !asset.host_visible || queue_hint != "host_io",
+                    false});
                 continue;
             }
             for (const auto& device_uid : devices_it->second) {
                 const auto queue_hint = queue_hint_for_asset(asset, device_uid);
-                report.entries.push_back(AssetPrefetchEntry{
+                append_prefetch_entry(AssetPrefetchEntry{
+                    asset.id,
                     asset.id,
                     asset.path,
                     tensor_id,
@@ -1121,16 +1536,86 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
                     per_tensor_bytes,
                     queue_hint,
                     asset.preferred_residency,
+                    "raw",
+                    "any",
+                    "raw",
                     exists,
                     asset.preload_required,
                     asset.persistent,
                     asset.host_visible,
-                    !asset.host_visible || queue_hint != "host_io"});
-                report.total_prefetch_bytes += per_tensor_bytes;
-                if (queue_hint == "host_to_device") {
-                    report.total_host_to_device_bytes += per_tensor_bytes;
+                    !asset.host_visible || queue_hint != "host_io",
+                    false});
+            }
+        }
+    }
+
+    std::unordered_set<std::string> seen_layout_caches;
+    for (const auto& optimized : optimization.operations) {
+        for (const bool gpu_target : {false, true}) {
+            const auto descriptor = describe_layout_cache(optimized.operation, optimization.workload_graph, gpu_target);
+            if (!descriptor.has_value()) {
+                continue;
+            }
+            const auto assets_it = assets_by_tensor.find(descriptor->source_tensor_id);
+            if (assets_it == assets_by_tensor.end()) {
+                continue;
+            }
+            for (const auto* source_asset : assets_it->second) {
+                if (source_asset == nullptr || !source_asset->persistent) {
+                    continue;
+                }
+                std::vector<std::string> target_devices;
+                if (gpu_target) {
+                    const auto tensor_devices_it = tensor_devices.find(descriptor->source_tensor_id);
+                    if (tensor_devices_it != tensor_devices.end()) {
+                        for (const auto& device_uid : tensor_devices_it->second) {
+                            const auto* target_graph = find_graph_by_uid(devices_, device_uid);
+                            if (target_graph != nullptr && target_graph->probe != "host") {
+                                target_devices.push_back(device_uid);
+                            }
+                        }
+                    }
                 } else {
-                    report.total_host_io_bytes += per_tensor_bytes;
+                    const auto host_graph_it = std::find_if(devices_.begin(), devices_.end(), [](const HardwareGraph& graph) {
+                        return graph.probe == "host";
+                    });
+                    target_devices.push_back(host_graph_it == devices_.end() ? std::string() : host_graph_it->uid);
+                }
+                if (target_devices.empty()) {
+                    continue;
+                }
+
+                for (const auto& device_uid : target_devices) {
+                    const std::string cache_id =
+                        source_asset->id + "#" + optimized.operation.name + "#" + descriptor->materialization_kind +
+                        "#" + (device_uid.empty() ? std::string("host") : device_uid);
+                    if (!seen_layout_caches.insert(cache_id).second) {
+                        continue;
+                    }
+                    const auto* target_graph = device_uid.empty() ? nullptr : find_graph_by_uid(devices_, device_uid);
+                    const std::string backend_hint =
+                        gpu_target ? (target_graph == nullptr ? std::string("gpu") : target_graph->probe) : "host";
+                    const std::string backend_cache_tag =
+                        gpu_target && target_graph != nullptr ? runtime_backend_cache_tag_for_graph(*target_graph) : "host";
+                    append_prefetch_entry(AssetPrefetchEntry{
+                        cache_id,
+                        source_asset->id,
+                        source_asset->path,
+                        descriptor->source_tensor_id,
+                        device_uid,
+                        source_asset->file_offset,
+                        descriptor->bytes,
+                        gpu_target ? std::string("host_to_device") : std::string("host_io"),
+                        gpu_target ? std::string("device") : std::string("host"),
+                        descriptor->materialization_kind,
+                        backend_hint,
+                        backend_cache_tag,
+                        source_asset->path.empty() ? false : std::filesystem::exists(source_asset->path),
+                        source_asset->preload_required,
+                        true,
+                        !gpu_target,
+                        gpu_target,
+                        true});
                 }
             }
         }
@@ -1139,7 +1624,8 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
         summary << (summary.tellp() > 0 ? "; " : "")
                 << "prefetch=" << report.total_prefetch_bytes
                 << " host_io=" << report.total_host_io_bytes
-                << " h2d=" << report.total_host_to_device_bytes;
+                << " h2d=" << report.total_host_to_device_bytes
+                << " layout_cache=" << report.total_layout_cache_bytes;
     }
     report.summary = summary.str();
     return report;

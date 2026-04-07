@@ -1,0 +1,306 @@
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Manifest profile
+  source=D:\GitHub\Jakal-Core\qwen2.5-0.5b.ollama.gguf
+  format=gguf imported=yes has_graph=yes
+  workload=Qwen2.5 0.5B Instruct dataset=gguf-qwen2 phase=decode shape=ctx-32768 kind=inference
+  assets=1 ops=8 tensors=301
+  devices [level-zero:level-zero-device-0] [host:12th Gen Intel(R) Core(TM) i5-1240P]
+pass=1 executed=yes source=heuristic_auto strategy=auto_balanced confidence=0.300 risk=0.100 total_us=326399.900 reference_us=273210.100 speedup=0.837x backends=intel:level-zero-direct=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=auto_balanced final=auto_balanced rollback=no planner_auto=no mem_block=no
+  memory peak_pressure=0.099 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=2 executed=yes source=exploration strategy=role_split confidence=0.250 risk=0.450 total_us=317803.400 reference_us=243013.300 speedup=0.765x backends=host-direct=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=role_split final=role_split rollback=no planner_auto=no mem_block=no
+  memory peak_pressure=0.088 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=3 executed=yes source=exploration strategy=tpu_like confidence=0.250 risk=0.450 total_us=334105.000 reference_us=265591.400 speedup=0.795x backends=host-direct=2 intel:level-zero-direct+gpu-lowered=4 intel:level-zero-direct=1
+  safety requested=auto_balanced selected=tpu_like final=tpu_like rollback=no planner_auto=no mem_block=no
+  memory peak_pressure=0.097 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=4 executed=yes source=exploration strategy=reduce_on_gpu confidence=0.321 risk=0.450 total_us=342662.600 reference_us=262923.300 speedup=0.767x backends=host-direct=2 intel:level-zero-direct+gpu-lowered=4 intel:level-zero-direct=1
+  safety requested=auto_balanced selected=reduce_on_gpu final=reduce_on_gpu rollback=no planner_auto=no mem_block=no
+  memory peak_pressure=0.093 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=5 executed=yes source=exploration strategy=projection_sharded confidence=0.321 risk=0.450 total_us=230000.500 reference_us=194236.900 speedup=0.845x backends=host-direct=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=projection_sharded final=projection_sharded rollback=yes planner_auto=no mem_block=no
+  memory peak_pressure=0.091 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=6 executed=yes source=exploration strategy=blind_sharded confidence=0.321 risk=0.450 total_us=188762.000 reference_us=188449.900 speedup=0.998x backends=mixed-direct[intel:level-zero]=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=blind_sharded final=blind_sharded rollback=no planner_auto=no mem_block=no
+  memory peak_pressure=0.085 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=7 executed=yes source=exact_learning strategy=projection_sharded confidence=0.662 risk=0.050 total_us=221698.900 reference_us=178626.900 speedup=0.806x backends=host-direct=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=projection_sharded final=projection_sharded rollback=yes planner_auto=no mem_block=no
+  memory peak_pressure=0.091 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=8 executed=yes source=exact_learning strategy=projection_sharded confidence=0.775 risk=0.050 total_us=221141.600 reference_us=178822.500 speedup=0.809x backends=host-direct=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=projection_sharded fBuild succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+Build succeeded for : tgl.
+Build succeeded for : rkl.
+Build succeeded for : adl-s.
+Build succeeded for : adl-p.
+Build succeeded for : adl-n.
+Build succeeded for : dg1.
+inal=projection_sharded rollback=no planner_auto=no mem_block=no
+  memory peak_pressure=0.091 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=9 executed=yes source=exact_learning strategy=projection_sharded confidence=0.887 risk=0.050 total_us=246305.500 reference_us=199410.700 speedup=0.810x backends=host-direct=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=projection_sharded final=projection_sharded rollback=no planner_auto=no mem_block=no
+  memory peak_pressure=0.091 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=10 executed=yes source=exact_learning strategy=projection_sharded confidence=0.980 risk=0.050 total_us=286718.400 reference_us=248343.800 speedup=0.866x backends=host-direct=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=projection_sharded final=projection_sharded rollback=yes planner_auto=no mem_block=no
+  memory peak_pressure=0.091 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=11 executed=yes source=exact_learning strategy=projection_sharded confidence=0.980 risk=0.050 total_us=275944.700 reference_us=236800.100 speedup=0.858x backends=host-direct=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=projection_sharded final=projection_sharded rollback=no planner_auto=no mem_block=no
+  memory peak_pressure=0.091 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv
+pass=12 executed=yes source=exact_learning strategy=projection_sharded confidence=0.844 risk=0.050 total_us=269886.100 reference_us=254017.600 speedup=0.941x backends=host-direct=3 intel:level-zero-direct+gpu-lowered=4
+  safety requested=auto_balanced selected=projection_sharded final=projection_sharded rollback=yes planner_auto=no mem_block=no
+  memory peak_pressure=0.091 spill=0 reload=0 layout_cache=310736384 telemetry=C:\Users\ahnd6\AppData\Local\Temp\jakal-manifest-795003340813700.telemetry.tsv

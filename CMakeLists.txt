@@ -80,6 +80,9 @@ if(JAKAL_CORE_BUILD_EXAMPLES)
 
     add_executable(jakal_partition_roles examples/partition_roles.cpp)
     target_link_libraries(jakal_partition_roles PRIVATE jakal::core)
+
+    add_executable(jakal_profile_manifest examples/profile_manifest.cpp)
+    target_link_libraries(jakal_profile_manifest PRIVATE jakal::core)
 endif()
 
 if(JAKAL_CORE_BUILD_TESTS)

@@ -26,6 +26,10 @@ struct DeviceAssignment {
 struct OperationData {
     std::vector<float> input0;
     std::vector<float> input1;
+    std::vector<float> cpu_rhs_materialized;
+    std::vector<float> gpu_rhs_materialized;
+    std::string cpu_rhs_layout = "native";
+    std::string gpu_rhs_layout = "native";
 };
 
 struct BackendRunResult {
@@ -58,6 +62,7 @@ public:
 
     virtual BackendRunResult run_matmul(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         std::span<const float> lhs,
         std::span<const float> rhs,
         std::uint32_t rows,
@@ -67,6 +72,7 @@ public:
 
     virtual BackendRunResult run_conv3x3(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         std::span<const float> input,
         std::uint32_t height,
         std::uint32_t width,
@@ -74,6 +80,7 @@ public:
 
     virtual BackendRunResult run_resample(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         std::span<const float> input,
         std::uint32_t src_h,
         std::uint32_t src_w,

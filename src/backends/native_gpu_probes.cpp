@@ -65,10 +65,34 @@ std::string sanitize_id_fragment(const std::string& text) {
     return result;
 }
 
+std::string format_compact_version(const int version) {
+    if (version <= 0) {
+        return {};
+    }
+    const int major = version / 1000;
+    const int minor = (version % 1000) / 10;
+    return std::to_string(major) + "." + std::to_string(minor);
+}
+
+std::string format_packed_api_version(const std::uint32_t version) {
+    if (version == 0u) {
+        return {};
+    }
+    const auto major = static_cast<std::uint32_t>((version >> 16u) & 0xffffu);
+    const auto minor = static_cast<std::uint32_t>(version & 0xffffu);
+    if (major == 0u && minor == 0u) {
+        return {};
+    }
+    return std::to_string(major) + "." + std::to_string(minor);
+}
+
 HardwareGraph make_native_gpu_graph(
     const std::string& uid_prefix,
     const std::string& probe_name,
     const std::string& presentation_name,
+    const std::string& driver_version,
+    const std::string& runtime_version,
+    const std::string& compiler_version,
     const std::uint32_t ordinal,
     const std::uint32_t execution_objects,
     const std::uint32_t lanes_per_object,
@@ -84,6 +108,9 @@ HardwareGraph make_native_gpu_graph(
     graph.uid = uid_prefix + ":" + std::to_string(ordinal);
     graph.probe = probe_name;
     graph.presentation_name = presentation_name;
+    graph.driver_version = driver_version;
+    graph.runtime_version = runtime_version;
+    graph.compiler_version = compiler_version;
     graph.ordinal = ordinal;
 
     const std::string root_id = graph.uid + "/root";
@@ -183,9 +210,11 @@ public:
     using ze_result_t = std::int32_t;
     using ze_driver_handle_t = void*;
     using ze_device_handle_t = void*;
+    using ze_api_version_t = std::uint32_t;
     using ze_init_fn = ze_result_t (*)(std::uint32_t);
     using ze_driver_get_fn = ze_result_t (*)(std::uint32_t*, ze_driver_handle_t*);
     using ze_device_get_fn = ze_result_t (*)(ze_driver_handle_t, std::uint32_t*, ze_device_handle_t*);
+    using ze_driver_get_api_version_fn = ze_result_t (*)(ze_driver_handle_t, ze_api_version_t*);
 
     LevelZeroApi() {
 #if defined(_WIN32)
@@ -202,6 +231,8 @@ public:
         ze_init_ = reinterpret_cast<ze_init_fn>(load_symbol(library_, "zeInit"));
         ze_driver_get_ = reinterpret_cast<ze_driver_get_fn>(load_symbol(library_, "zeDriverGet"));
         ze_device_get_ = reinterpret_cast<ze_device_get_fn>(load_symbol(library_, "zeDeviceGet"));
+        ze_driver_get_api_version_ =
+            reinterpret_cast<ze_driver_get_api_version_fn>(load_symbol(library_, "zeDriverGetApiVersion"));
         loaded_ = ze_init_ != nullptr && ze_driver_get_ != nullptr && ze_device_get_ != nullptr;
     }
 
@@ -227,6 +258,10 @@ public:
 
         std::uint32_t ordinal = 0;
         for (const auto driver : drivers) {
+            ze_api_version_t api_version = 0u;
+            if (ze_driver_get_api_version_ != nullptr) {
+                (void)ze_driver_get_api_version_(driver, &api_version);
+            }
             std::uint32_t device_count = 0;
             if (ze_device_get_(driver, &device_count, nullptr) != 0 || device_count == 0) {
                 continue;
@@ -242,6 +277,9 @@ public:
                     "level-zero:" + sanitize_id_fragment(name),
                     "level-zero",
                     name,
+                    format_packed_api_version(api_version),
+                    format_packed_api_version(api_version),
+                    "ocloc",
                     ordinal++,
                     64u,
                     16u,
@@ -264,6 +302,7 @@ private:
     ze_init_fn ze_init_ = nullptr;
     ze_driver_get_fn ze_driver_get_ = nullptr;
     ze_device_get_fn ze_device_get_ = nullptr;
+    ze_driver_get_api_version_fn ze_driver_get_api_version_ = nullptr;
 };
 
 class CudaApi {
@@ -276,6 +315,7 @@ public:
     using cu_device_get_name_fn = CUresult (*)(char*, int, CUdevice);
     using cu_device_total_mem_fn = CUresult (*)(std::size_t*, CUdevice);
     using cu_device_get_attribute_fn = CUresult (*)(int*, int, CUdevice);
+    using cu_driver_get_version_fn = CUresult (*)(int*);
 
     CudaApi() {
 #if defined(_WIN32)
@@ -296,6 +336,8 @@ public:
         cu_device_total_mem_ = reinterpret_cast<cu_device_total_mem_fn>(load_symbol(library_, "cuDeviceTotalMem_v2"));
         cu_device_get_attribute_ =
             reinterpret_cast<cu_device_get_attribute_fn>(load_symbol(library_, "cuDeviceGetAttribute"));
+        cu_driver_get_version_ =
+            reinterpret_cast<cu_driver_get_version_fn>(load_symbol(library_, "cuDriverGetVersion"));
         loaded_ = cu_init_ != nullptr && cu_device_get_count_ != nullptr && cu_device_get_ != nullptr &&
                   cu_device_get_name_ != nullptr && cu_device_total_mem_ != nullptr && cu_device_get_attribute_ != nullptr;
     }
@@ -320,6 +362,10 @@ public:
         constexpr int kWarpSize = 10;
         constexpr int kL2CacheSize = 38;
         constexpr int kManagedMemory = 83;
+        int driver_version = 0;
+        if (cu_driver_get_version_ != nullptr) {
+            (void)cu_driver_get_version_(&driver_version);
+        }
         for (int ordinal = 0; ordinal < device_count; ++ordinal) {
             CUdevice device = 0;
             if (cu_device_get_(&device, ordinal) != 0) {
@@ -344,6 +390,9 @@ public:
                 "cuda:" + sanitize_id_fragment(device_name),
                 "cuda",
                 device_name,
+                format_compact_version(driver_version),
+                format_compact_version(driver_version),
+                "nvrtc",
                 static_cast<std::uint32_t>(ordinal),
                 std::max(multiprocessors, 1),
                 std::max(warp_size, 1),
@@ -368,6 +417,7 @@ private:
     cu_device_get_name_fn cu_device_get_name_ = nullptr;
     cu_device_total_mem_fn cu_device_total_mem_ = nullptr;
     cu_device_get_attribute_fn cu_device_get_attribute_ = nullptr;
+    cu_driver_get_version_fn cu_driver_get_version_ = nullptr;
 };
 
 class RocmApi {
@@ -380,6 +430,8 @@ public:
     using hip_device_get_name_fn = hipError_t (*)(char*, int, hipDevice_t);
     using hip_device_total_mem_fn = hipError_t (*)(std::size_t*, hipDevice_t);
     using hip_device_get_attribute_fn = hipError_t (*)(int*, int, hipDevice_t);
+    using hip_driver_get_version_fn = hipError_t (*)(int*);
+    using hip_runtime_get_version_fn = hipError_t (*)(int*);
 
     RocmApi() {
 #if defined(_WIN32)
@@ -402,6 +454,10 @@ public:
             reinterpret_cast<hip_device_total_mem_fn>(load_symbol(library_, "hipDeviceTotalMem"));
         hip_device_get_attribute_ =
             reinterpret_cast<hip_device_get_attribute_fn>(load_symbol(library_, "hipDeviceGetAttribute"));
+        hip_driver_get_version_ =
+            reinterpret_cast<hip_driver_get_version_fn>(load_symbol(library_, "hipDriverGetVersion"));
+        hip_runtime_get_version_ =
+            reinterpret_cast<hip_runtime_get_version_fn>(load_symbol(library_, "hipRuntimeGetVersion"));
         loaded_ = hip_init_ != nullptr && hip_get_device_count_ != nullptr && hip_device_get_ != nullptr &&
                   hip_device_get_name_ != nullptr && hip_device_total_mem_ != nullptr && hip_device_get_attribute_ != nullptr;
     }
@@ -426,6 +482,14 @@ public:
         constexpr int kWarpSize = 10;
         constexpr int kL2CacheSize = 38;
         constexpr int kManagedMemory = 83;
+        int driver_version = 0;
+        int runtime_version = 0;
+        if (hip_driver_get_version_ != nullptr) {
+            (void)hip_driver_get_version_(&driver_version);
+        }
+        if (hip_runtime_get_version_ != nullptr) {
+            (void)hip_runtime_get_version_(&runtime_version);
+        }
         for (int ordinal = 0; ordinal < device_count; ++ordinal) {
             hipDevice_t device = 0;
             if (hip_device_get_(&device, ordinal) != 0) {
@@ -450,6 +514,9 @@ public:
                 "rocm:" + sanitize_id_fragment(device_name),
                 "rocm",
                 device_name,
+                format_compact_version(driver_version),
+                format_compact_version(runtime_version),
+                "hiprtc",
                 static_cast<std::uint32_t>(ordinal),
                 std::max(multiprocessors, 1),
                 std::max(warp_size, 1),
@@ -474,6 +541,8 @@ private:
     hip_device_get_name_fn hip_device_get_name_ = nullptr;
     hip_device_total_mem_fn hip_device_total_mem_ = nullptr;
     hip_device_get_attribute_fn hip_device_get_attribute_ = nullptr;
+    hip_driver_get_version_fn hip_driver_get_version_ = nullptr;
+    hip_runtime_get_version_fn hip_runtime_get_version_ = nullptr;
 };
 
 class LevelZeroProbe final : public IDeviceProbe {

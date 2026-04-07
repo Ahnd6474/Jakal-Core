@@ -174,6 +174,20 @@ int run_command(const std::string& command) {
     return std::system(command.c_str());
 }
 
+bool gpu_rhs_uses_transposed_layout(const OperationSpec& operation) {
+    return operation.gpu_pack_weights || operation.gpu_pretranspose_rhs;
+}
+
+bool gpu_conv_uses_patch9_layout(const OperationSpec& operation) {
+    return operation.op_class == OperationClass::convolution_2d &&
+           operation.gpu_input_layout.find("conv-patch9") != std::string::npos;
+}
+
+bool gpu_resample_uses_packed6_layout(const OperationSpec& operation) {
+    return operation.op_class == OperationClass::resample_2d &&
+           operation.gpu_input_layout.find("resample-packed6") != std::string::npos;
+}
+
 constexpr const char* kCudaLikeProgramSource = R"GPU(
 extern "C" __device__ __forceinline__ float q(float value, int low_precision) {
   if (!low_precision) return value;
@@ -218,6 +232,21 @@ extern "C" __global__ void matmul_tiled(const float* lhs,const float* rhs,float*
   }
   if (row < rows && col < columns) out[row * columns + col] = q(acc, low_precision);
 }
+extern "C" __global__ void matmul_tiled_rhs_t(const float* lhs,const float* rhs,float* out,unsigned int rows,unsigned int columns,unsigned int depth,int low_precision) {
+  __shared__ float lhs_tile[16][16];
+  __shared__ float rhs_tile[16][16];
+  const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;
+  float acc = 0.0f;
+  for (unsigned int base = 0; base < depth; base += 16) {
+    lhs_tile[threadIdx.y][threadIdx.x] = (row < rows && (base + threadIdx.x) < depth) ? lhs[row * depth + base + threadIdx.x] : 0.0f;
+    rhs_tile[threadIdx.y][threadIdx.x] = (col < columns && (base + threadIdx.y) < depth) ? rhs[col * depth + base + threadIdx.y] : 0.0f;
+    __syncthreads();
+    for (unsigned int inner = 0; inner < 16; ++inner) acc = q(acc + lhs_tile[threadIdx.y][inner] * rhs_tile[inner][threadIdx.x], low_precision);
+    __syncthreads();
+  }
+  if (row < rows && col < columns) out[row * columns + col] = q(acc, low_precision);
+}
 extern "C" __global__ void conv3x3_valid(const float* input,float* output,unsigned int height,unsigned int width,int low_precision) {
   const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -227,6 +256,18 @@ extern "C" __global__ void conv3x3_valid(const float* input,float* output,unsign
   const float kernel[9] = {0.0625f,0.125f,0.0625f,0.125f,0.25f,0.125f,0.0625f,0.125f,0.0625f};
   float acc = 0.0f;
   for (unsigned int ky = 0; ky < 3; ++ky) for (unsigned int kx = 0; kx < 3; ++kx) acc = q(acc + q(input[(y + ky) * width + (x + kx)], low_precision) * kernel[ky * 3u + kx], low_precision);
+  output[y * out_width + x] = acc;
+}
+extern "C" __global__ void conv3x3_valid_patch9(const float* input,float* output,unsigned int height,unsigned int width,int low_precision) {
+  const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const unsigned int out_width = width - 2u;
+  const unsigned int out_height = height - 2u;
+  if (x >= out_width || y >= out_height) return;
+  const float kernel[9] = {0.0625f,0.125f,0.0625f,0.125f,0.25f,0.125f,0.0625f,0.125f,0.0625f};
+  const unsigned int base = (y * out_width + x) * 9u;
+  float acc = 0.0f;
+  for (unsigned int index = 0; index < 9u; ++index) acc = q(acc + q(input[base + index], low_precision) * kernel[index], low_precision);
   output[y * out_width + x] = acc;
 }
 extern "C" __global__ void bilinear_resample(const float* input,float* output,unsigned int src_h,unsigned int src_w,unsigned int dst_h,unsigned int dst_w,unsigned int dst_y_offset,unsigned int shard_rows,int low_precision) {
@@ -252,14 +293,34 @@ extern "C" __global__ void bilinear_resample(const float* input,float* output,un
   const float bottom = q(v10 + ((v11 - v10) * wx), low_precision);
   output[y * dst_w + x] = q(top + ((bottom - top) * wy), low_precision);
 }
+extern "C" __global__ void bilinear_resample_packed6(const float* input,float* output,unsigned int src_h,unsigned int src_w,unsigned int dst_h,unsigned int dst_w,unsigned int dst_y_offset,unsigned int shard_rows,int low_precision) {
+  (void)src_h; (void)src_w; (void)dst_h; (void)dst_y_offset;
+  const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= dst_w || y >= shard_rows) return;
+  const unsigned int base = (y * dst_w + x) * 6u;
+  const float v00 = q(input[base + 0u], low_precision);
+  const float v01 = q(input[base + 1u], low_precision);
+  const float v10 = q(input[base + 2u], low_precision);
+  const float v11 = q(input[base + 3u], low_precision);
+  const float wx = input[base + 4u];
+  const float wy = input[base + 5u];
+  const float top = q(v00 + ((v01 - v00) * wx), low_precision);
+  const float bottom = q(v10 + ((v11 - v10) * wx), low_precision);
+  output[y * dst_w + x] = q(top + ((bottom - top) * wy), low_precision);
+}
 )GPU";
 
 constexpr const char* kOpenClProgramSource = R"CLC(
+#ifndef JAKAL_ALWAYS_LOW_PRECISION
+#define JAKAL_ALWAYS_LOW_PRECISION 0
+#endif
 inline float q(float value, int low_precision) {
-  if (!low_precision) return value;
+  (void)low_precision;
+  if (!JAKAL_ALWAYS_LOW_PRECISION) return value;
   float scaled = value * 1024.0f;
-  float rounded = scaled >= 0.0f ? floor(scaled + 0.5f) : -floor((-scaled) + 0.5f);
-  return rounded / 1024.0f;
+  int rounded = (int)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+  return ((float)rounded) / 1024.0f;
 }
 __kernel void elementwise_map(__global const float* lhs,__global const float* rhs,__global float* out,uint count,int low_precision) {
   uint gid = get_global_id(0); if (gid >= count) return;
@@ -285,6 +346,18 @@ __kernel void matmul_tiled(__global const float* lhs,__global const float* rhs,_
   }
   if (row < rows && col < columns) out[row * columns + col] = q(acc, low_precision);
 }
+__kernel void matmul_tiled_rhs_t(__global const float* lhs,__global const float* rhs,__global float* out,uint rows,uint columns,uint depth,int low_precision,__local float* lhs_tile,__local float* rhs_tile) {
+  uint col = get_global_id(0); uint row = get_global_id(1); uint lcol = get_local_id(0); uint lrow = get_local_id(1); uint tile = get_local_size(0); float acc = 0.0f;
+  for (uint base = 0; base < depth; base += tile) {
+    uint lhs_index = row * depth + base + lcol; uint rhs_index = col * depth + base + lrow;
+    lhs_tile[lrow * tile + lcol] = (row < rows && (base + lcol) < depth) ? lhs[lhs_index] : 0.0f;
+    rhs_tile[lrow * tile + lcol] = (col < columns && (base + lrow) < depth) ? rhs[rhs_index] : 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint inner = 0; inner < tile; ++inner) acc = q(acc + lhs_tile[lrow * tile + inner] * rhs_tile[inner * tile + lcol], low_precision);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (row < rows && col < columns) out[row * columns + col] = q(acc, low_precision);
+}
 __kernel void conv3x3_valid(__global const float* input,__global float* output,uint height,uint width,int low_precision) {
   uint x = get_global_id(0); uint y = get_global_id(1); uint out_width = width - 2u; uint out_height = height - 2u; if (x >= out_width || y >= out_height) return;
   float acc = 0.0f;
@@ -298,6 +371,18 @@ __kernel void conv3x3_valid(__global const float* input,__global float* output,u
   }
   output[y * out_width + x] = acc;
 }
+__kernel void conv3x3_valid_patch9(__global const float* input,__global float* output,uint height,uint width,int low_precision) {
+  uint x = get_global_id(0); uint y = get_global_id(1); uint out_width = width - 2u; uint out_height = height - 2u; if (x >= out_width || y >= out_height) return;
+  float acc = 0.0f; uint base = (y * out_width + x) * 9u;
+  for (uint index = 0; index < 9u; ++index) {
+    float weight = 0.125f;
+    uint ky = index / 3u; uint kx = index % 3u;
+    if ((ky == 1u) && (kx == 1u)) weight = 0.25f;
+    else if ((ky != 1u) && (kx != 1u)) weight = 0.0625f;
+    acc = q(acc + q(input[base + index], low_precision) * weight, low_precision);
+  }
+  output[y * out_width + x] = acc;
+}
 __kernel void bilinear_resample(__global const float* input,__global float* output,uint src_h,uint src_w,uint dst_h,uint dst_w,uint dst_y_offset,uint shard_rows,int low_precision) {
   uint x = get_global_id(0); uint y = get_global_id(1); if (x >= dst_w || y >= shard_rows) return;
   float global_y = (float)(y + dst_y_offset); float src_y = ((global_y + 0.5f) * (float)src_h / (float)dst_h) - 0.5f; src_y = clamp(src_y, 0.0f, (float)(src_h - 1u));
@@ -307,6 +392,109 @@ __kernel void bilinear_resample(__global const float* input,__global float* outp
   float v00 = q(input[y0 * src_w + x0], low_precision); float v01 = q(input[y0 * src_w + x1], low_precision); float v10 = q(input[y1 * src_w + x0], low_precision); float v11 = q(input[y1 * src_w + x1], low_precision);
   float top = q(v00 + ((v01 - v00) * wx), low_precision); float bottom = q(v10 + ((v11 - v10) * wx), low_precision);
   output[y * dst_w + x] = q(top + ((bottom - top) * wy), low_precision);
+}
+__kernel void bilinear_resample_packed6(__global const float* input,__global float* output,uint src_h,uint src_w,uint dst_h,uint dst_w,uint dst_y_offset,uint shard_rows,int low_precision) {
+  (void)src_h; (void)src_w; (void)dst_h; (void)dst_y_offset;
+  uint x = get_global_id(0); uint y = get_global_id(1); if (x >= dst_w || y >= shard_rows) return;
+  uint base = (y * dst_w + x) * 6u;
+  float v00 = q(input[base + 0u], low_precision); float v01 = q(input[base + 1u], low_precision); float v10 = q(input[base + 2u], low_precision); float v11 = q(input[base + 3u], low_precision);
+  float wx = input[base + 4u]; float wy = input[base + 5u];
+  float top = q(v00 + ((v01 - v00) * wx), low_precision); float bottom = q(v10 + ((v11 - v10) * wx), low_precision);
+  output[y * dst_w + x] = q(top + ((bottom - top) * wy), low_precision);
+}
+)CLC";
+
+constexpr const char* kOpenClFp16ProgramSource = R"CLC(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+inline float q(float value) {
+  return convert_float(convert_half_rte(value));
+}
+__kernel void elementwise_map(__global const float* lhs,__global const float* rhs,__global float* out,uint count,int low_precision) {
+  (void)low_precision;
+  uint gid = get_global_id(0); if (gid >= count) return;
+  float left = q(lhs[gid] * 1.125f); float right = q(rhs[gid] * 0.25f);
+  out[gid] = q(left + right - 0.03125f);
+}
+__kernel void reduce_sum(__global const float* input,__global float* partials,uint count,int low_precision,__local float* scratch) {
+  (void)low_precision;
+  uint lid = get_local_id(0); uint gid = get_global_id(0); uint global_size = get_global_size(0); float value = 0.0f;
+  for (uint index = gid; index < count; index += global_size) value = q(value + q(input[index]));
+  scratch[lid] = value; barrier(CLK_LOCAL_MEM_FENCE);
+  for (uint stride = get_local_size(0) / 2; stride > 0; stride >>= 1) { if (lid < stride) scratch[lid] = q(scratch[lid] + scratch[lid + stride]); barrier(CLK_LOCAL_MEM_FENCE); }
+  if (lid == 0) partials[get_group_id(0)] = scratch[0];
+}
+__kernel void matmul_tiled(__global const float* lhs,__global const float* rhs,__global float* out,uint rows,uint columns,uint depth,int low_precision,__local float* lhs_tile,__local float* rhs_tile) {
+  (void)low_precision;
+  uint col = get_global_id(0); uint row = get_global_id(1); uint lcol = get_local_id(0); uint lrow = get_local_id(1); uint tile = get_local_size(0); float acc = 0.0f;
+  for (uint base = 0; base < depth; base += tile) {
+    uint lhs_index = row * depth + base + lcol; uint rhs_index = (base + lrow) * columns + col;
+    lhs_tile[lrow * tile + lcol] = (row < rows && (base + lcol) < depth) ? q(lhs[lhs_index]) : 0.0f;
+    rhs_tile[lrow * tile + lcol] = (col < columns && (base + lrow) < depth) ? q(rhs[rhs_index]) : 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint inner = 0; inner < tile; ++inner) acc = q(acc + q(lhs_tile[lrow * tile + inner] * rhs_tile[inner * tile + lcol]));
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (row < rows && col < columns) out[row * columns + col] = q(acc);
+}
+__kernel void matmul_tiled_rhs_t(__global const float* lhs,__global const float* rhs,__global float* out,uint rows,uint columns,uint depth,int low_precision,__local float* lhs_tile,__local float* rhs_tile) {
+  (void)low_precision;
+  uint col = get_global_id(0); uint row = get_global_id(1); uint lcol = get_local_id(0); uint lrow = get_local_id(1); uint tile = get_local_size(0); float acc = 0.0f;
+  for (uint base = 0; base < depth; base += tile) {
+    uint lhs_index = row * depth + base + lcol; uint rhs_index = col * depth + base + lrow;
+    lhs_tile[lrow * tile + lcol] = (row < rows && (base + lcol) < depth) ? q(lhs[lhs_index]) : 0.0f;
+    rhs_tile[lrow * tile + lcol] = (col < columns && (base + lrow) < depth) ? q(rhs[rhs_index]) : 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint inner = 0; inner < tile; ++inner) acc = q(acc + q(lhs_tile[lrow * tile + inner] * rhs_tile[inner * tile + lcol]));
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (row < rows && col < columns) out[row * columns + col] = q(acc);
+}
+__kernel void conv3x3_valid(__global const float* input,__global float* output,uint height,uint width,int low_precision) {
+  (void)low_precision;
+  uint x = get_global_id(0); uint y = get_global_id(1); uint out_width = width - 2u; uint out_height = height - 2u; if (x >= out_width || y >= out_height) return;
+  float acc = 0.0f;
+  for (uint ky = 0; ky < 3; ++ky) {
+    for (uint kx = 0; kx < 3; ++kx) {
+      float weight = 0.125f;
+      if ((ky == 1u) && (kx == 1u)) weight = 0.25f;
+      else if ((ky != 1u) && (kx != 1u)) weight = 0.0625f;
+      acc = q(acc + q(q(input[(y + ky) * width + (x + kx)]) * q(weight)));
+    }
+  }
+  output[y * out_width + x] = q(acc);
+}
+__kernel void conv3x3_valid_patch9(__global const float* input,__global float* output,uint height,uint width,int low_precision) {
+  (void)low_precision;
+  uint x = get_global_id(0); uint y = get_global_id(1); uint out_width = width - 2u; uint out_height = height - 2u; if (x >= out_width || y >= out_height) return;
+  float acc = 0.0f; uint base = (y * out_width + x) * 9u;
+  for (uint index = 0; index < 9u; ++index) {
+    float weight = 0.125f;
+    uint ky = index / 3u; uint kx = index % 3u;
+    if ((ky == 1u) && (kx == 1u)) weight = 0.25f;
+    else if ((ky != 1u) && (kx != 1u)) weight = 0.0625f;
+    acc = q(acc + q(q(input[base + index]) * q(weight)));
+  }
+  output[y * out_width + x] = q(acc);
+}
+__kernel void bilinear_resample(__global const float* input,__global float* output,uint src_h,uint src_w,uint dst_h,uint dst_w,uint dst_y_offset,uint shard_rows,int low_precision) {
+  (void)low_precision;
+  uint x = get_global_id(0); uint y = get_global_id(1); if (x >= dst_w || y >= shard_rows) return;
+  float global_y = (float)(y + dst_y_offset); float src_y = ((global_y + 0.5f) * (float)src_h / (float)dst_h) - 0.5f; src_y = clamp(src_y, 0.0f, (float)(src_h - 1u));
+  uint y0 = (uint)src_y; uint y1 = min(y0 + 1u, src_h - 1u); float wy = q(src_y - (float)y0);
+  float src_x = (((float)x + 0.5f) * (float)src_w / (float)dst_w) - 0.5f; src_x = clamp(src_x, 0.0f, (float)(src_w - 1u));
+  uint x0 = (uint)src_x; uint x1 = min(x0 + 1u, src_w - 1u); float wx = q(src_x - (float)x0);
+  float v00 = q(input[y0 * src_w + x0]); float v01 = q(input[y0 * src_w + x1]); float v10 = q(input[y1 * src_w + x0]); float v11 = q(input[y1 * src_w + x1]);
+  float top = q(v00 + q((v01 - v00) * wx)); float bottom = q(v10 + q((v11 - v10) * wx));
+  output[y * dst_w + x] = q(top + q((bottom - top) * wy));
+}
+__kernel void bilinear_resample_packed6(__global const float* input,__global float* output,uint src_h,uint src_w,uint dst_h,uint dst_w,uint dst_y_offset,uint shard_rows,int low_precision) {
+  (void)low_precision; (void)src_h; (void)src_w; (void)dst_h; (void)dst_y_offset;
+  uint x = get_global_id(0); uint y = get_global_id(1); if (x >= dst_w || y >= shard_rows) return;
+  uint base = (y * dst_w + x) * 6u;
+  float v00 = q(input[base + 0u]); float v01 = q(input[base + 1u]); float v10 = q(input[base + 2u]); float v11 = q(input[base + 3u]);
+  float wx = input[base + 4u]; float wy = input[base + 5u];
+  float top = q(v00 + q((v01 - v00) * wx)); float bottom = q(v10 + q((v11 - v10) * wx));
+  output[y * dst_w + x] = q(top + q((bottom - top) * wy));
 }
 )CLC";
 
@@ -334,24 +522,24 @@ public:
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
-    BackendRunResult run_matmul(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
-        auto result = run_matmul_native(graph, lhs, rhs, rows, columns, depth, low_precision);
+    BackendRunResult run_matmul(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
+        auto result = run_matmul_native(graph, operation, lhs, rhs, rows, columns, depth, low_precision);
         if (result.success) return result;
-        auto fallback = host_->run_matmul(graph, lhs, rhs, rows, columns, depth, low_precision);
+        auto fallback = host_->run_matmul(graph, operation, lhs, rhs, rows, columns, depth, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
-    BackendRunResult run_conv3x3(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
-        auto result = run_conv3x3_native(graph, input, height, width, low_precision);
+    BackendRunResult run_conv3x3(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
+        auto result = run_conv3x3_native(graph, operation, input, height, width, low_precision);
         if (result.success) return result;
-        auto fallback = host_->run_conv3x3(graph, input, height, width, low_precision);
+        auto fallback = host_->run_conv3x3(graph, operation, input, height, width, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
-    BackendRunResult run_resample(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
-        auto result = run_resample_native(graph, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
+    BackendRunResult run_resample(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
+        auto result = run_resample_native(graph, operation, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
         if (result.success) return result;
-        auto fallback = host_->run_resample(graph, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
+        auto fallback = host_->run_resample(graph, operation, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
@@ -361,9 +549,9 @@ protected:
 
     virtual BackendRunResult run_elementwise_native(const HardwareGraph&, std::span<const float>, std::span<const float>, bool) const = 0;
     virtual BackendRunResult run_reduction_native(const HardwareGraph&, std::span<const float>, bool) const = 0;
-    virtual BackendRunResult run_matmul_native(const HardwareGraph&, std::span<const float>, std::span<const float>, std::uint32_t, std::uint32_t, std::uint32_t, bool) const = 0;
-    virtual BackendRunResult run_conv3x3_native(const HardwareGraph&, std::span<const float>, std::uint32_t, std::uint32_t, bool) const = 0;
-    virtual BackendRunResult run_resample_native(const HardwareGraph&, std::span<const float>, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool) const = 0;
+    virtual BackendRunResult run_matmul_native(const HardwareGraph&, const OperationSpec&, std::span<const float>, std::span<const float>, std::uint32_t, std::uint32_t, std::uint32_t, bool) const = 0;
+    virtual BackendRunResult run_conv3x3_native(const HardwareGraph&, const OperationSpec&, std::span<const float>, std::uint32_t, std::uint32_t, bool) const = 0;
+    virtual BackendRunResult run_resample_native(const HardwareGraph&, const OperationSpec&, std::span<const float>, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool) const = 0;
 
     JakalBackendKind backend_;
     std::string probe_name_;
@@ -378,9 +566,9 @@ public:
 private:
     BackendRunResult run_elementwise_native(const HardwareGraph&, std::span<const float>, std::span<const float>, bool) const override { return failure("native-unimplemented"); }
     BackendRunResult run_reduction_native(const HardwareGraph&, std::span<const float>, bool) const override { return failure("native-unimplemented"); }
-    BackendRunResult run_matmul_native(const HardwareGraph&, std::span<const float>, std::span<const float>, std::uint32_t, std::uint32_t, std::uint32_t, bool) const override { return failure("native-unimplemented"); }
-    BackendRunResult run_conv3x3_native(const HardwareGraph&, std::span<const float>, std::uint32_t, std::uint32_t, bool) const override { return failure("native-unimplemented"); }
-    BackendRunResult run_resample_native(const HardwareGraph&, std::span<const float>, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool) const override { return failure("native-unimplemented"); }
+    BackendRunResult run_matmul_native(const HardwareGraph&, const OperationSpec&, std::span<const float>, std::span<const float>, std::uint32_t, std::uint32_t, std::uint32_t, bool) const override { return failure("native-unimplemented"); }
+    BackendRunResult run_conv3x3_native(const HardwareGraph&, const OperationSpec&, std::span<const float>, std::uint32_t, std::uint32_t, bool) const override { return failure("native-unimplemented"); }
+    BackendRunResult run_resample_native(const HardwareGraph&, const OperationSpec&, std::span<const float>, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool) const override { return failure("native-unimplemented"); }
 };
 
 class CudaNativeBackend final : public NativeKernelBackendBase {
@@ -667,7 +855,7 @@ private:
         return result;
     }
 
-    BackendRunResult run_matmul_native(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
+    BackendRunResult run_matmul_native(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
         auto context = acquire_context(graph);
         if (context == nullptr) return failure("cuda-context");
         BackendRunResult result;
@@ -675,7 +863,7 @@ private:
         result.runtime_us = measure_us([&]() {
             std::scoped_lock execution_lock(context->execution_mutex);
             if (!activate(*context)) { result.error = "cuda-activate"; return; }
-            auto kernel = get_kernel(*context, "matmul_tiled");
+            auto kernel = get_kernel(*context, gpu_rhs_uses_transposed_layout(operation) ? "matmul_tiled_rhs_t" : "matmul_tiled");
             if (kernel == nullptr) { result.error = "cuda-kernel"; return; }
             cu_device_ptr_t d_lhs = 0, d_rhs = 0, d_out = 0;
             if (!alloc_and_copy_input(d_lhs, lhs) || !alloc_and_copy_input(d_rhs, rhs) || api().cu_mem_alloc(&d_out, result.output.size() * sizeof(float)) != 0) {
@@ -696,14 +884,28 @@ private:
         return result;
     }
 
-    BackendRunResult run_conv3x3_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
+    BackendRunResult run_conv3x3_native(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
         unsigned int h = height, w = width; int low = low_precision ? 1 : 0;
-        return launch_unary_2d(graph, "conv3x3_valid", input, static_cast<std::size_t>(height - 2u) * (width - 2u), width - 2u, height - 2u, {nullptr, nullptr, &h, &w, &low});
+        return launch_unary_2d(
+            graph,
+            gpu_conv_uses_patch9_layout(operation) ? "conv3x3_valid_patch9" : "conv3x3_valid",
+            input,
+            static_cast<std::size_t>(height - 2u) * (width - 2u),
+            width - 2u,
+            height - 2u,
+            {nullptr, nullptr, &h, &w, &low});
     }
 
-    BackendRunResult run_resample_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
+    BackendRunResult run_resample_native(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
         unsigned int src_height = src_h, src_width = src_w, dst_height = dst_h, dst_width = dst_w, offset = row_offset, rows = row_count; int low = low_precision ? 1 : 0;
-        return launch_unary_2d(graph, "bilinear_resample", input, static_cast<std::size_t>(row_count) * dst_w, dst_w, row_count, {nullptr, nullptr, &src_height, &src_width, &dst_height, &dst_width, &offset, &rows, &low});
+        return launch_unary_2d(
+            graph,
+            gpu_resample_uses_packed6_layout(operation) ? "bilinear_resample_packed6" : "bilinear_resample",
+            input,
+            static_cast<std::size_t>(row_count) * dst_w,
+            dst_w,
+            row_count,
+            {nullptr, nullptr, &src_height, &src_width, &dst_height, &dst_width, &offset, &rows, &low});
     }
 
     mutable std::mutex mutex_;
@@ -895,40 +1097,44 @@ private:
         if (ptr != nullptr) (void)api().ze_mem_free(context.context, ptr);
     }
 
-    BinaryBlob compile_binary() const {
+    BinaryBlob compile_binary(const bool low_precision_variant) const {
+        const auto variant_index = low_precision_variant ? 1u : 0u;
         std::scoped_lock lock(binary_mutex_);
-        if (!cached_binary_.bytes.empty()) return cached_binary_;
+        if (!cached_binaries_[variant_index].bytes.empty()) return cached_binaries_[variant_index];
         if (const auto ocloc = locate_ocloc(); ocloc.has_value()) {
             const auto temp_dir = std::filesystem::temp_directory_path() / "jakal-level-zero-ocloc";
             std::error_code ignore_error;
             std::filesystem::create_directories(temp_dir, ignore_error);
-            const auto source_path = temp_dir / "jakal_level_zero_native.cl";
-            const std::string output_name = "jakal_level_zero_native";
-            const auto output_spv = temp_dir / "jakal_level_zero_native.spv";
-            const auto output_bin = temp_dir / "jakal_level_zero_native.bin";
-            if (write_text_file(source_path, kOpenClProgramSource)) {
+            const std::string variant_name = low_precision_variant ? "jakal_level_zero_native_lowp" : "jakal_level_zero_native_strict";
+            const auto source_path = temp_dir / (variant_name + ".cl");
+            const auto output_spv = temp_dir / (variant_name + ".spv");
+            const auto output_bin = temp_dir / (variant_name + ".bin");
+            const std::string source_text = low_precision_variant
+                                                ? std::string(kOpenClFp16ProgramSource)
+                                                : std::string("#define JAKAL_ALWAYS_LOW_PRECISION 0\n") + kOpenClProgramSource;
+            if (write_text_file(source_path, source_text)) {
                 std::string command =
 #if defined(_WIN32)
                     "powershell -NoProfile -Command \"& '" + ocloc->string() + "' compile -file '" + source_path.string() +
-                    "' -device xe-lp -output_no_suffix -output '" + output_name +
+                    "' -device xe-lp -output_no_suffix -output '" + variant_name +
                     "' -out_dir '" + temp_dir.string() + "'\"";
 #else
                     "\"" + ocloc->string() + "\" compile -file \"" + source_path.string() +
-                    "\" -device xe-lp -output_no_suffix -output \"" + output_name +
+                    "\" -device xe-lp -output_no_suffix -output \"" + variant_name +
                     "\" -out_dir \"" + temp_dir.string() + "\"";
 #endif
                 if (run_command(command) == 0) {
                     const auto spirv = read_binary_file(output_spv);
                     if (!spirv.empty()) {
-                        cached_binary_.bytes = spirv;
-                        cached_binary_.format = ZE_MODULE_FORMAT_IL_SPIRV;
-                        return cached_binary_;
+                        cached_binaries_[variant_index].bytes = spirv;
+                        cached_binaries_[variant_index].format = ZE_MODULE_FORMAT_IL_SPIRV;
+                        return cached_binaries_[variant_index];
                     }
                     const auto bytes = read_binary_file(output_bin);
                     if (!bytes.empty()) {
-                        cached_binary_.bytes = bytes;
-                        cached_binary_.format = ZE_MODULE_FORMAT_NATIVE;
-                        return cached_binary_;
+                        cached_binaries_[variant_index].bytes = bytes;
+                        cached_binaries_[variant_index].format = ZE_MODULE_FORMAT_NATIVE;
+                        return cached_binaries_[variant_index];
                     }
                 }
             }
@@ -957,30 +1163,31 @@ private:
         if (opencl_api().build_program(program, 1, &device, "", nullptr, nullptr) != CL_SUCCESS) { opencl_api().release_program(program); opencl_api().release_context(context); return {}; }
         std::size_t il_size = 0;
         if (opencl_api().get_program_info(program, CL_PROGRAM_IL, 0, nullptr, &il_size) == CL_SUCCESS && il_size > 0) {
-            cached_binary_.bytes.resize(il_size);
-            if (opencl_api().get_program_info(program, CL_PROGRAM_IL, il_size, cached_binary_.bytes.data(), nullptr) == CL_SUCCESS) cached_binary_.format = ZE_MODULE_FORMAT_IL_SPIRV;
-            else cached_binary_.bytes.clear();
+            cached_binaries_[variant_index].bytes.resize(il_size);
+            if (opencl_api().get_program_info(program, CL_PROGRAM_IL, il_size, cached_binaries_[variant_index].bytes.data(), nullptr) == CL_SUCCESS) cached_binaries_[variant_index].format = ZE_MODULE_FORMAT_IL_SPIRV;
+            else cached_binaries_[variant_index].bytes.clear();
         }
-        if (cached_binary_.bytes.empty()) {
+        if (cached_binaries_[variant_index].bytes.empty()) {
             std::size_t binary_size = 0;
             if (opencl_api().get_program_info(program, CL_PROGRAM_BINARY_SIZES, sizeof(std::size_t), &binary_size, nullptr) == CL_SUCCESS && binary_size > 0) {
-                cached_binary_.bytes.resize(binary_size);
-                unsigned char* binary_ptr = cached_binary_.bytes.data();
-                if (opencl_api().get_program_info(program, CL_PROGRAM_BINARIES, sizeof(unsigned char*), &binary_ptr, nullptr) == CL_SUCCESS) cached_binary_.format = ZE_MODULE_FORMAT_NATIVE;
-                else cached_binary_.bytes.clear();
+                cached_binaries_[variant_index].bytes.resize(binary_size);
+                unsigned char* binary_ptr = cached_binaries_[variant_index].bytes.data();
+                if (opencl_api().get_program_info(program, CL_PROGRAM_BINARIES, sizeof(unsigned char*), &binary_ptr, nullptr) == CL_SUCCESS) cached_binaries_[variant_index].format = ZE_MODULE_FORMAT_NATIVE;
+                else cached_binaries_[variant_index].bytes.clear();
             }
         }
         opencl_api().release_program(program);
         opencl_api().release_context(context);
-        return cached_binary_;
+        return cached_binaries_[variant_index];
     }
 
-    std::shared_ptr<Context> acquire_context(const HardwareGraph& graph) const {
+    std::shared_ptr<Context> acquire_context(const HardwareGraph& graph, const bool low_precision_variant) const {
         std::scoped_lock lock(mutex_);
         last_error_.clear();
         if (!api().ready) { last_error_ = "level-zero-loader"; return {}; }
         if (api().ze_init(0u) != 0) { last_error_ = "level-zero-init"; return {}; }
-        if (const auto existing = contexts_.find(graph.uid); existing != contexts_.end()) return existing->second;
+        const auto context_key = graph.uid + (low_precision_variant ? ":lowp" : ":strict");
+        if (const auto existing = contexts_.find(context_key); existing != contexts_.end()) return existing->second;
         std::uint32_t driver_count = 0;
         if (api().ze_driver_get(&driver_count, nullptr) != 0 || driver_count == 0) { last_error_ = "level-zero-driver-enum"; return {}; }
         std::vector<ze_driver_handle_t> drivers(driver_count, nullptr);
@@ -993,7 +1200,7 @@ private:
             if (api().ze_device_get(driver, &device_count, devices.data()) != 0) continue;
             for (const auto device : devices) {
                 if (ordinal++ != graph.ordinal) continue;
-                auto blob = compile_binary();
+                auto blob = compile_binary(low_precision_variant);
                 if (blob.bytes.empty()) { last_error_ = "level-zero-binary"; return {}; }
                 auto context = std::make_shared<Context>();
                 context->device = device;
@@ -1004,7 +1211,7 @@ private:
                 if (api().ze_context_create(driver, &context_desc, &context->context) != 0) { last_error_ = "level-zero-context-create"; return {}; }
                 if (api().ze_command_queue_create(context->context, device, &queue_desc, &context->queue) != 0) { last_error_ = "level-zero-queue-create"; return {}; }
                 if (api().ze_module_create(context->context, device, &module_desc, &context->module, &build_log) != 0) { last_error_ = "level-zero-module-create"; return {}; }
-                contexts_.emplace(graph.uid, context);
+                contexts_.emplace(context_key, context);
                 return context;
             }
         }
@@ -1040,7 +1247,7 @@ private:
     }
 
     BackendRunResult run_elementwise_native(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const bool low_precision) const override {
-        auto context = acquire_context(graph);
+        auto context = acquire_context(graph, low_precision);
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(lhs.size(), 0.0f);
@@ -1049,7 +1256,7 @@ private:
             void* lhs_mem = nullptr; void* rhs_mem = nullptr; void* out_mem = nullptr;
             if (!alloc_shared(*context, lhs.size_bytes(), &lhs_mem) || !alloc_shared(*context, rhs.size_bytes(), &rhs_mem) || !alloc_shared(*context, result.output.size() * sizeof(float), &out_mem)) { free_shared(*context, lhs_mem); free_shared(*context, rhs_mem); free_shared(*context, out_mem); result.error = "level-zero-memory"; return; }
             std::memcpy(lhs_mem, lhs.data(), lhs.size_bytes()); std::memcpy(rhs_mem, rhs.data(), rhs.size_bytes());
-            unsigned int count = static_cast<unsigned int>(lhs.size()); int low = low_precision ? 1 : 0;
+            unsigned int count = static_cast<unsigned int>(lhs.size()); int low = 0;
             if (!launch(*context, "elementwise_map", {256u,1u,1u}, {count == 0 ? 1u : (count + 255u) / 256u, 1u, 1u}, {{sizeof(void*), &lhs_mem}, {sizeof(void*), &rhs_mem}, {sizeof(void*), &out_mem}, {sizeof(unsigned int), &count}, {sizeof(int), &low}})) result.error = "level-zero-launch";
             else { std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float)); result.success = true; result.used_host = false; result.used_opencl = false; }
             free_shared(*context, lhs_mem); free_shared(*context, rhs_mem); free_shared(*context, out_mem);
@@ -1058,7 +1265,7 @@ private:
     }
 
     BackendRunResult run_reduction_native(const HardwareGraph& graph, const std::span<const float> input, const bool low_precision) const override {
-        auto context = acquire_context(graph);
+        auto context = acquire_context(graph, low_precision);
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.runtime_us = measure_us([&]() {
@@ -1070,7 +1277,7 @@ private:
             void* in_mem = nullptr; void* partial_mem = nullptr;
             if (!alloc_shared(*context, input.size_bytes(), &in_mem) || !alloc_shared(*context, partials.size() * sizeof(float), &partial_mem)) { free_shared(*context, in_mem); free_shared(*context, partial_mem); result.error = "level-zero-memory"; return; }
             std::memcpy(in_mem, input.data(), input.size_bytes());
-            unsigned int count = static_cast<unsigned int>(input.size()); int low = low_precision ? 1 : 0;
+            unsigned int count = static_cast<unsigned int>(input.size()); int low = 0;
             if (!launch(*context, "reduce_sum", {local,1u,1u}, {groups,1u,1u}, {{sizeof(void*), &in_mem}, {sizeof(void*), &partial_mem}, {sizeof(unsigned int), &count}, {sizeof(int), &low}}, {{4u, local * sizeof(float)}})) result.error = "level-zero-launch";
             else { std::memcpy(partials.data(), partial_mem, partials.size() * sizeof(float)); for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false; }
             free_shared(*context, in_mem); free_shared(*context, partial_mem);
@@ -1078,8 +1285,8 @@ private:
         return result;
     }
 
-    BackendRunResult run_matmul_native(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
-        auto context = acquire_context(graph);
+    BackendRunResult run_matmul_native(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
+        auto context = acquire_context(graph, low_precision);
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(rows) * columns, 0.0f);
@@ -1088,16 +1295,17 @@ private:
             void* lhs_mem = nullptr; void* rhs_mem = nullptr; void* out_mem = nullptr;
             if (!alloc_shared(*context, lhs.size_bytes(), &lhs_mem) || !alloc_shared(*context, rhs.size_bytes(), &rhs_mem) || !alloc_shared(*context, result.output.size() * sizeof(float), &out_mem)) { free_shared(*context, lhs_mem); free_shared(*context, rhs_mem); free_shared(*context, out_mem); result.error = "level-zero-memory"; return; }
             std::memcpy(lhs_mem, lhs.data(), lhs.size_bytes()); std::memcpy(rhs_mem, rhs.data(), rhs.size_bytes());
-            unsigned int row_count = rows, column_count = columns, depth_count = depth; int low = low_precision ? 1 : 0;
-            if (!launch(*context, "matmul_tiled", {kNativeTileSize,kNativeTileSize,1u}, {columns == 0 ? 1u : (columns + kNativeTileSize - 1u) / kNativeTileSize, rows == 0 ? 1u : (rows + kNativeTileSize - 1u) / kNativeTileSize, 1u}, {{sizeof(void*), &lhs_mem}, {sizeof(void*), &rhs_mem}, {sizeof(void*), &out_mem}, {sizeof(unsigned int), &row_count}, {sizeof(unsigned int), &column_count}, {sizeof(unsigned int), &depth_count}, {sizeof(int), &low}}, {{7u, kNativeTileSize * kNativeTileSize * sizeof(float)}, {8u, kNativeTileSize * kNativeTileSize * sizeof(float)}})) result.error = "level-zero-launch";
+            unsigned int row_count = rows, column_count = columns, depth_count = depth; int low = 0;
+            const char* kernel_name = gpu_rhs_uses_transposed_layout(operation) ? "matmul_tiled_rhs_t" : "matmul_tiled";
+            if (!launch(*context, kernel_name, {kNativeTileSize,kNativeTileSize,1u}, {columns == 0 ? 1u : (columns + kNativeTileSize - 1u) / kNativeTileSize, rows == 0 ? 1u : (rows + kNativeTileSize - 1u) / kNativeTileSize, 1u}, {{sizeof(void*), &lhs_mem}, {sizeof(void*), &rhs_mem}, {sizeof(void*), &out_mem}, {sizeof(unsigned int), &row_count}, {sizeof(unsigned int), &column_count}, {sizeof(unsigned int), &depth_count}, {sizeof(int), &low}}, {{7u, kNativeTileSize * kNativeTileSize * sizeof(float)}, {8u, kNativeTileSize * kNativeTileSize * sizeof(float)}})) result.error = "level-zero-launch";
             else { std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float)); result.success = true; result.used_host = false; result.used_opencl = false; }
             free_shared(*context, lhs_mem); free_shared(*context, rhs_mem); free_shared(*context, out_mem);
         });
         return result;
     }
 
-    BackendRunResult run_conv3x3_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
-        auto context = acquire_context(graph);
+    BackendRunResult run_conv3x3_native(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
+        auto context = acquire_context(graph, low_precision);
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(height - 2u) * (width - 2u), 0.0f);
@@ -1115,12 +1323,12 @@ private:
             std::memcpy(in_mem, input.data(), input.size_bytes());
             unsigned int input_height = height;
             unsigned int input_width = width;
-            int low = low_precision ? 1 : 0;
+            int low = 0;
             const std::uint32_t out_width = width - 2u;
             const std::uint32_t out_height = height - 2u;
             if (!launch(
                     *context,
-                    "conv3x3_valid",
+                    gpu_conv_uses_patch9_layout(operation) ? "conv3x3_valid_patch9" : "conv3x3_valid",
                     {kNativeTileSize, kNativeTileSize, 1u},
                     {
                         out_width == 0u ? 1u : (out_width + kNativeTileSize - 1u) / kNativeTileSize,
@@ -1147,8 +1355,8 @@ private:
         return result;
     }
 
-    BackendRunResult run_resample_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
-        auto context = acquire_context(graph);
+    BackendRunResult run_resample_native(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
+        auto context = acquire_context(graph, low_precision);
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(row_count) * dst_w, 0.0f);
@@ -1170,10 +1378,10 @@ private:
             unsigned int dst_width = dst_w;
             unsigned int dst_row_offset = row_offset;
             unsigned int dst_row_count = row_count;
-            int low = low_precision ? 1 : 0;
+            int low = 0;
             if (!launch(
                     *context,
-                    "bilinear_resample",
+                    gpu_resample_uses_packed6_layout(operation) ? "bilinear_resample_packed6" : "bilinear_resample",
                     {kNativeTileSize, kNativeTileSize, 1u},
                     {
                         dst_w == 0u ? 1u : (dst_w + kNativeTileSize - 1u) / kNativeTileSize,
@@ -1207,7 +1415,7 @@ private:
     mutable std::mutex mutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<Context>> contexts_;
     mutable std::mutex binary_mutex_;
-    mutable BinaryBlob cached_binary_;
+    mutable std::array<BinaryBlob, 2> cached_binaries_;
     mutable std::string last_error_;
 };
 
@@ -1429,19 +1637,33 @@ private:
         return result;
     }
 
-    BackendRunResult run_matmul_native(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
+    BackendRunResult run_matmul_native(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
         unsigned int row_count = rows, column_count = columns, depth_count = depth; int low = low_precision ? 1 : 0;
-        return launch_binary_2d(graph, "matmul_tiled", lhs, rhs, static_cast<std::size_t>(rows) * columns, columns, rows, {nullptr, nullptr, nullptr, &row_count, &column_count, &depth_count, &low});
+        return launch_binary_2d(graph, gpu_rhs_uses_transposed_layout(operation) ? "matmul_tiled_rhs_t" : "matmul_tiled", lhs, rhs, static_cast<std::size_t>(rows) * columns, columns, rows, {nullptr, nullptr, nullptr, &row_count, &column_count, &depth_count, &low});
     }
 
-    BackendRunResult run_conv3x3_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
+    BackendRunResult run_conv3x3_native(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
         unsigned int h = height, w = width; int low = low_precision ? 1 : 0;
-        return launch_unary_2d(graph, "conv3x3_valid", input, static_cast<std::size_t>(height - 2u) * (width - 2u), width - 2u, height - 2u, {nullptr, nullptr, &h, &w, &low});
+        return launch_unary_2d(
+            graph,
+            gpu_conv_uses_patch9_layout(operation) ? "conv3x3_valid_patch9" : "conv3x3_valid",
+            input,
+            static_cast<std::size_t>(height - 2u) * (width - 2u),
+            width - 2u,
+            height - 2u,
+            {nullptr, nullptr, &h, &w, &low});
     }
 
-    BackendRunResult run_resample_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
+    BackendRunResult run_resample_native(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
         unsigned int src_height = src_h, src_width = src_w, dst_height = dst_h, dst_width = dst_w, offset = row_offset, rows = row_count; int low = low_precision ? 1 : 0;
-        return launch_unary_2d(graph, "bilinear_resample", input, static_cast<std::size_t>(row_count) * dst_w, dst_w, row_count, {nullptr, nullptr, &src_height, &src_width, &dst_height, &dst_width, &offset, &rows, &low});
+        return launch_unary_2d(
+            graph,
+            gpu_resample_uses_packed6_layout(operation) ? "bilinear_resample_packed6" : "bilinear_resample",
+            input,
+            static_cast<std::size_t>(row_count) * dst_w,
+            dst_w,
+            row_count,
+            {nullptr, nullptr, &src_height, &src_width, &dst_height, &dst_width, &offset, &rows, &low});
     }
 
     mutable std::mutex mutex_;

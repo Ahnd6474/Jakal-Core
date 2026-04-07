@@ -75,10 +75,13 @@ constexpr cl_device_info CL_DEVICE_GLOBAL_MEM_CACHE_SIZE = 0x101E;
 constexpr cl_device_info CL_DEVICE_GLOBAL_MEM_SIZE = 0x101F;
 constexpr cl_device_info CL_DEVICE_LOCAL_MEM_SIZE = 0x1023;
 constexpr cl_device_info CL_DEVICE_NAME = 0x102B;
+constexpr cl_device_info CL_DRIVER_VERSION = 0x102D;
+constexpr cl_device_info CL_DEVICE_VERSION = 0x102F;
 constexpr cl_device_info CL_DEVICE_HOST_UNIFIED_MEMORY = 0x1035;
 constexpr cl_device_info CL_DEVICE_DOUBLE_FP_CONFIG = 0x1032;
 constexpr cl_device_info CL_DEVICE_HALF_FP_CONFIG = 0x1033;
 constexpr cl_device_info CL_DEVICE_NATIVE_VECTOR_WIDTH_FLOAT = 0x103A;
+constexpr cl_device_info CL_DEVICE_OPENCL_C_VERSION = 0x103D;
 
 using cl_get_platform_ids_fn = cl_int (*)(cl_uint, cl_platform_id*, cl_uint*);
 using cl_get_platform_info_fn = cl_int (*)(cl_platform_id, cl_platform_info, size_t, void*, size_t*);
@@ -249,6 +252,12 @@ public:
 
             for (const auto device_id : platform_devices) {
                 const std::string device_name = get_string_info(api_.get_device_info(), device_id, CL_DEVICE_NAME);
+                const std::string driver_version =
+                    get_string_info(api_.get_device_info(), device_id, CL_DRIVER_VERSION);
+                const std::string runtime_version =
+                    get_string_info(api_.get_device_info(), device_id, CL_DEVICE_VERSION);
+                const std::string compiler_version =
+                    get_string_info(api_.get_device_info(), device_id, CL_DEVICE_OPENCL_C_VERSION);
                 const bool unified_memory = get_scalar_info<cl_bool>(
                     api_.get_device_info(),
                     device_id,
@@ -307,6 +316,9 @@ public:
                 graph.uid = "opencl:" + platform_fragment + ":" + std::to_string(ordinal);
                 graph.probe = "opencl";
                 graph.presentation_name = device_name.empty() ? "opencl-device" : device_name;
+                graph.driver_version = driver_version;
+                graph.runtime_version = runtime_version;
+                graph.compiler_version = compiler_version;
                 graph.ordinal = ordinal;
 
                 const std::string root_id = graph.uid + "/root";

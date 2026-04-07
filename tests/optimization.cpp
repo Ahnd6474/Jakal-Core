@@ -1,5 +1,6 @@
 #include "jakal/device.hpp"
 #include "jakal/executor.hpp"
+#include "jakal/executors/scheduler.hpp"
 #include "jakal/jakal_toolkit.hpp"
 #include "jakal/operation_variant_registry.hpp"
 #include "jakal/runtime.hpp"
@@ -178,6 +179,37 @@ jakal::HardwareGraph make_manual_host_graph() {
     return graph;
 }
 
+void attach_cache_and_scratch(
+    jakal::HardwareGraph& graph,
+    const std::uint64_t cache_bytes,
+    const std::uint64_t scratch_bytes) {
+    graph.nodes.push_back({"l2-cache", "l2-cache", "root", jakal::HardwareObjectDomain::storage, jakal::HardwareObjectRole::cache});
+    graph.nodes.back().storage.capacity_bytes = cache_bytes;
+    graph.nodes.push_back({"scratch", "scratch", "root", jakal::HardwareObjectDomain::storage, jakal::HardwareObjectRole::scratchpad});
+    graph.nodes.back().storage.capacity_bytes = scratch_bytes;
+    graph.edges.push_back({"root", "l2-cache", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "scratch", jakal::GraphEdgeSemantics::contains, true});
+    jakal::materialize_graph_costs(graph);
+}
+
+const jakal::OperationOptimizationResult* find_operation_by_name(
+    const jakal::OptimizationReport& report,
+    const std::string& name) {
+    const auto it = std::find_if(report.operations.begin(), report.operations.end(), [&](const auto& result) {
+        return result.operation.name == name;
+    });
+    return it == report.operations.end() ? nullptr : &*it;
+}
+
+const jakal::OperationOptimizationResult* find_first_operation_by_class(
+    const jakal::OptimizationReport& report,
+    const jakal::OperationClass op_class) {
+    const auto it = std::find_if(report.operations.begin(), report.operations.end(), [&](const auto& result) {
+        return result.operation.op_class == op_class;
+    });
+    return it == report.operations.end() ? nullptr : &*it;
+}
+
 bool verify_partition_strategies() {
     const auto plan_cache = unique_temp_file("partition-plan-test");
     const auto exec_cache = unique_temp_file("partition-exec-test");
@@ -202,26 +234,21 @@ bool verify_partition_strategies() {
             true,
             strategy};
     };
-    const auto find_operation = [](const jakal::OptimizationReport& report, const std::string& name)
-        -> const jakal::OperationOptimizationResult* {
-        const auto it = std::find_if(report.operations.begin(), report.operations.end(), [&](const auto& result) {
-            return result.operation.name == name;
-        });
-        return it == report.operations.end() ? nullptr : &*it;
-    };
-
     const auto role_split = optimizer.optimize(
         make_workload(jakal::PartitionStrategy::role_split),
         planner.build_plan(make_workload(jakal::PartitionStrategy::role_split), graphs),
         graphs);
-    const auto* role_qkv = find_operation(role_split, "decode-qkv");
-    const auto* role_kv = find_operation(role_split, "kv-append");
+    const auto* role_qkv = find_operation_by_name(role_split, "decode-qkv");
+    const auto* role_kv = find_operation_by_name(role_split, "kv-append");
     if (role_qkv == nullptr || role_kv == nullptr) {
+        std::cerr << "partition: missing role_split ops\n";
         return false;
     }
     if (role_qkv->config.primary_device_uid != "gpu:test:0" ||
         role_qkv->config.participating_devices.size() != 1u ||
         role_kv->config.primary_device_uid != "host:test:0") {
+        std::cerr << "partition: role_split placement mismatch qkv=" << role_qkv->config.primary_device_uid
+                  << " kv=" << role_kv->config.primary_device_uid << '\n';
         return false;
     }
 
@@ -229,13 +256,18 @@ bool verify_partition_strategies() {
         make_workload(jakal::PartitionStrategy::projection_sharded),
         planner.build_plan(make_workload(jakal::PartitionStrategy::projection_sharded), graphs),
         graphs);
-    const auto* sharded_qkv = find_operation(projection_sharded, "decode-qkv");
+    const auto* sharded_qkv = find_operation_by_name(projection_sharded, "decode-qkv");
     if (sharded_qkv == nullptr) {
+        std::cerr << "partition: missing sharded qkv\n";
         return false;
     }
     if (sharded_qkv->config.strategy != jakal::ExecutionStrategy::sharded ||
         sharded_qkv->config.participating_devices.size() != 2u ||
         sharded_qkv->config.logical_partitions != 4u) {
+        std::cerr << "partition: sharded config mismatch strategy="
+                  << jakal::to_string(sharded_qkv->config.strategy)
+                  << " devices=" << sharded_qkv->config.participating_devices.size()
+                  << " parts=" << sharded_qkv->config.logical_partitions << '\n';
         return false;
     }
 
@@ -243,17 +275,21 @@ bool verify_partition_strategies() {
     if (tpu_like_plan.allocations.size() != 2u ||
         tpu_like_plan.allocations.front().device.uid != "host:test:0" ||
         tpu_like_plan.allocations.back().device.uid != "gpu:test:0") {
+        std::cerr << "partition: tpu_like allocation order mismatch\n";
         return false;
     }
     if (tpu_like_plan.allocations.front().ratio >= tpu_like_plan.allocations.back().ratio) {
+        std::cerr << "partition: tpu_like ratios not gpu-biased host=" << tpu_like_plan.allocations.front().ratio
+                  << " gpu=" << tpu_like_plan.allocations.back().ratio << '\n';
         return false;
     }
 
     const auto tpu_like = optimizer.optimize(make_workload(jakal::PartitionStrategy::tpu_like), tpu_like_plan, graphs);
-    const auto* tpu_qkv = find_operation(tpu_like, "decode-qkv");
-    const auto* tpu_reduce = find_operation(tpu_like, "decode-score-reduce");
-    const auto* tpu_kv = find_operation(tpu_like, "kv-append");
+    const auto* tpu_qkv = find_operation_by_name(tpu_like, "decode-qkv");
+    const auto* tpu_reduce = find_operation_by_name(tpu_like, "decode-score-reduce");
+    const auto* tpu_kv = find_operation_by_name(tpu_like, "kv-append");
     if (tpu_qkv == nullptr || tpu_reduce == nullptr || tpu_kv == nullptr) {
+        std::cerr << "partition: missing tpu_like ops\n";
         return false;
     }
     if (tpu_qkv->config.primary_device_uid != "gpu:test:0" ||
@@ -261,14 +297,23 @@ bool verify_partition_strategies() {
         tpu_qkv->config.logical_partitions != 4u ||
         tpu_qkv->config.queue_depth < 3u ||
         tpu_qkv->config.stages < 3u) {
+        std::cerr << "partition: tpu qkv mismatch primary=" << tpu_qkv->config.primary_device_uid
+                  << " strategy=" << jakal::to_string(tpu_qkv->config.strategy)
+                  << " parts=" << tpu_qkv->config.logical_partitions
+                  << " queue=" << tpu_qkv->config.queue_depth
+                  << " stages=" << tpu_qkv->config.stages << '\n';
         return false;
     }
     if (tpu_reduce->config.primary_device_uid != "gpu:test:0" ||
         tpu_reduce->config.strategy != jakal::ExecutionStrategy::overlapped) {
+        std::cerr << "partition: tpu reduce mismatch primary=" << tpu_reduce->config.primary_device_uid
+                  << " strategy=" << jakal::to_string(tpu_reduce->config.strategy) << '\n';
         return false;
     }
     if (tpu_kv->config.primary_device_uid != "host:test:0" ||
         tpu_kv->config.participating_devices.size() != 1u) {
+        std::cerr << "partition: tpu kv mismatch primary=" << tpu_kv->config.primary_device_uid
+                  << " devices=" << tpu_kv->config.participating_devices.size() << '\n';
         return false;
     }
 
@@ -277,6 +322,307 @@ bool verify_partition_strategies() {
     std::filesystem::remove(exec_cache, ec);
     std::filesystem::remove(exec_cache.string() + ".perf", ec);
     return true;
+}
+
+bool verify_cache_aware_tiling_for_inference() {
+    const auto weak_cache = unique_temp_file("tiling-weak-exec");
+    const auto strong_cache = unique_temp_file("tiling-strong-exec");
+
+    auto weak_gpu = make_manual_gpu_graph("gpu:weak:0", "Weak GPU", false, false, false);
+    weak_gpu.nodes[2].compute.execution_width = 32;
+    weak_gpu.nodes[2].compute.clock_mhz = 900;
+    weak_gpu.nodes[2].compute.matrix_engines = 0;
+    attach_cache_and_scratch(weak_gpu, 128ull * 1024ull, 16ull * 1024ull);
+
+    auto strong_gpu = make_manual_gpu_graph("gpu:strong:0", "Strong GPU", true, true, true);
+    strong_gpu.nodes[2].compute.execution_width = 256;
+    strong_gpu.nodes[2].compute.clock_mhz = 2200;
+    strong_gpu.nodes[2].compute.matrix_engines = 64;
+    strong_gpu.nodes[4].transfer.read_bandwidth_gbps = 256.0;
+    strong_gpu.nodes[4].transfer.write_bandwidth_gbps = 256.0;
+    attach_cache_and_scratch(strong_gpu, 2ull * 1024ull * 1024ull, 256ull * 1024ull);
+
+    const jakal::WorkloadSpec workload{
+        "llm-decode-token-lite",
+        jakal::WorkloadKind::inference,
+        "llm-decode-token-lite",
+        640ull * 1024ull * 1024ull,
+        12ull * 1024ull * 1024ull,
+        3.8e10,
+        1,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "decode-small"};
+
+    const auto make_plan = [](const jakal::HardwareGraph& graph) {
+        jakal::ExecutionPlan plan;
+        plan.signature = "manual-" + graph.uid;
+        plan.allocations.push_back({graph, 1.0, 1.0});
+        return plan;
+    };
+
+    jakal::ExecutionOptimizer weak_optimizer(weak_cache);
+    jakal::ExecutionOptimizer strong_optimizer(strong_cache);
+    const auto weak_report = weak_optimizer.optimize(workload, make_plan(weak_gpu), {weak_gpu});
+    const auto strong_report = strong_optimizer.optimize(workload, make_plan(strong_gpu), {strong_gpu});
+
+    const auto* weak_matmul = find_first_operation_by_class(weak_report, jakal::OperationClass::matmul);
+    const auto* strong_matmul = find_first_operation_by_class(strong_report, jakal::OperationClass::matmul);
+    if (weak_matmul == nullptr || strong_matmul == nullptr) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(weak_cache, ec);
+    std::filesystem::remove(strong_cache, ec);
+    std::filesystem::remove(weak_cache.string() + ".perf", ec);
+    std::filesystem::remove(strong_cache.string() + ".perf", ec);
+
+    return strong_matmul->config.tile_x > weak_matmul->config.tile_x &&
+           strong_matmul->config.tile_y > weak_matmul->config.tile_y &&
+           strong_matmul->config.tile_k >= weak_matmul->config.tile_k;
+}
+
+bool verify_topology_aware_scheduler_for_inference() {
+    auto edge_gpu = make_manual_gpu_graph("gpu:edge:0", "Edge GPU", false, false, false);
+    edge_gpu.nodes[2].compute.execution_width = 64;
+    edge_gpu.nodes[2].compute.clock_mhz = 1200;
+    edge_gpu.nodes[2].compute.matrix_engines = 4;
+    edge_gpu.nodes[4].transfer.read_bandwidth_gbps = 64.0;
+    edge_gpu.nodes[4].transfer.write_bandwidth_gbps = 64.0;
+    attach_cache_and_scratch(edge_gpu, 256ull * 1024ull, 32ull * 1024ull);
+
+    auto datacenter_gpu = make_manual_gpu_graph("gpu:dc:0", "Datacenter GPU", true, true, true);
+    datacenter_gpu.nodes[2].compute.execution_width = 256;
+    datacenter_gpu.nodes[2].compute.clock_mhz = 2400;
+    datacenter_gpu.nodes[2].compute.matrix_engines = 64;
+    datacenter_gpu.nodes[4].transfer.read_bandwidth_gbps = 320.0;
+    datacenter_gpu.nodes[4].transfer.write_bandwidth_gbps = 320.0;
+    attach_cache_and_scratch(datacenter_gpu, 4ull * 1024ull * 1024ull, 512ull * 1024ull);
+
+    jakal::OperationSpec operation;
+    operation.name = "decode-qkv";
+    operation.op_class = jakal::OperationClass::matmul;
+    operation.extents = {1024, 1024, 1024};
+    operation.input_bytes = 32ull * 1024ull * 1024ull;
+    operation.output_bytes = 16ull * 1024ull * 1024ull;
+    operation.temporary_bytes = 4ull * 1024ull * 1024ull;
+    operation.estimated_flops = 4.0e11;
+    operation.parallelizable = true;
+    operation.matrix_friendly = true;
+
+    jakal::OperationOptimizationResult optimized;
+    optimized.operation = operation;
+    optimized.config.primary_device_uid = datacenter_gpu.uid;
+    optimized.config.participating_devices = {edge_gpu.uid, datacenter_gpu.uid};
+    optimized.config.logical_partitions = 4;
+    optimized.config.overlap_transfers = true;
+    optimized.config.use_low_precision = true;
+
+    jakal::OptimizationReport report;
+    report.placement.allocations.push_back({edge_gpu, 0.5, 1.0});
+    report.placement.allocations.push_back({datacenter_gpu, 0.5, 1.0});
+
+    const std::vector<jakal::HardwareGraph> graphs{edge_gpu, datacenter_gpu};
+    jakal::executors::DefaultIntraDeviceScheduler scheduler;
+    const auto assignments = scheduler.make_assignments(report, optimized, graphs, 1024u);
+    if (assignments.size() != 8u) {
+        return false;
+    }
+
+    std::size_t edge_count = 0;
+    std::size_t datacenter_count = 0;
+    for (const auto& assignment : assignments) {
+        if (assignment.graph == nullptr) {
+            return false;
+        }
+        if (assignment.graph->uid == edge_gpu.uid) {
+            edge_count += assignment.shard.count;
+        } else if (assignment.graph->uid == datacenter_gpu.uid) {
+            datacenter_count += assignment.shard.count;
+        }
+    }
+
+    return datacenter_count > edge_count;
+}
+
+bool verify_operation_lowering_for_cpu_and_gpu_inference() {
+    const auto exec_cache = unique_temp_file("lowering-exec");
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+
+    auto host = make_manual_host_graph();
+    host.nodes[2].compute.native_vector_bits = 512;
+    host.nodes[2].compute.execution_width = 32;
+    attach_cache_and_scratch(host, 2ull * 1024ull * 1024ull, 64ull * 1024ull);
+
+    auto gpu = make_manual_gpu_graph("gpu:infer:0", "Inference GPU", true, true, true);
+    gpu.nodes[2].compute.execution_width = 256;
+    gpu.nodes[2].compute.matrix_engines = 64;
+    gpu.nodes[2].compute.clock_mhz = 2200;
+    attach_cache_and_scratch(gpu, 4ull * 1024ull * 1024ull, 256ull * 1024ull);
+
+    jakal::ExecutionPlan plan;
+    plan.signature = "manual-lowering";
+    plan.allocations.push_back({host, 0.2, 1.0});
+    plan.allocations.push_back({gpu, 0.8, 4.0});
+
+    const jakal::WorkloadSpec workload{
+        "ai-vision-inference-lite",
+        jakal::WorkloadKind::inference,
+        "ai-vision-inference-224",
+        512ull * 1024ull * 1024ull,
+        64ull * 1024ull * 1024ull,
+        4.0e12,
+        8,
+        true,
+        false,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::prefill,
+        "vision-mid"};
+
+    const auto report = optimizer.optimize(workload, plan, {host, gpu});
+    const auto* mlp_up = find_operation_by_name(report, "mlp-up");
+    const auto* patch_proj = find_operation_by_name(report, "patch-proj");
+    const auto* mlp_activation = find_operation_by_name(report, "mlp-activation");
+    if (mlp_up == nullptr || patch_proj == nullptr) {
+        std::cerr << "lowering: missing mlp-up or patch-proj\n";
+        return false;
+    }
+    if (mlp_activation != nullptr) {
+        std::cerr << "lowering: ops";
+        for (const auto& operation : report.workload_graph.operations) {
+            std::cerr << ' ' << operation.name;
+        }
+        std::cerr << '\n';
+        const auto tensor_it = std::find_if(
+            report.workload_graph.tensors.begin(),
+            report.workload_graph.tensors.end(),
+            [](const jakal::WorkloadTensor& tensor) { return tensor.id == "mlp-up-out"; });
+        if (tensor_it != report.workload_graph.tensors.end()) {
+            std::cerr << "lowering: mlp-up-out producer=" << tensor_it->producer_operation
+                      << " consumers=" << tensor_it->consumer_operations.size();
+            for (const auto& consumer : tensor_it->consumer_operations) {
+                std::cerr << " " << consumer;
+            }
+            std::cerr << '\n';
+        }
+        std::cerr << "lowering: mlp-activation still present\n";
+        return false;
+    }
+    if (std::find(mlp_up->operation.fused_operation_names.begin(),
+                  mlp_up->operation.fused_operation_names.end(),
+                  "mlp-activation") == mlp_up->operation.fused_operation_names.end()) {
+        std::cerr << "lowering: mlp-up fused ops missing mlp-activation\n";
+        return false;
+    }
+    if (!patch_proj->operation.cpu_pack_weights ||
+        !patch_proj->operation.gpu_pack_weights ||
+        !patch_proj->operation.cpu_pretranspose_rhs ||
+        !patch_proj->operation.gpu_pretranspose_rhs ||
+        !patch_proj->operation.cpu_vectorized ||
+        !patch_proj->operation.gpu_tensorized ||
+        patch_proj->operation.cpu_weight_layout == "native" ||
+        patch_proj->operation.gpu_weight_layout == "native" ||
+        patch_proj->operation.cpu_output_layout == "native" ||
+        patch_proj->operation.gpu_output_layout == "native" ||
+        patch_proj->operation.cpu_micro_kernel_unroll < 2u ||
+        patch_proj->operation.gpu_micro_kernel_unroll < 2u) {
+        std::cerr << "lowering: patch-proj hints cpu_pack=" << patch_proj->operation.cpu_pack_weights
+                  << " gpu_pack=" << patch_proj->operation.gpu_pack_weights
+                  << " cpu_preT=" << patch_proj->operation.cpu_pretranspose_rhs
+                  << " gpu_preT=" << patch_proj->operation.gpu_pretranspose_rhs
+                  << " cpu_vec=" << patch_proj->operation.cpu_vectorized
+                  << " gpu_tensor=" << patch_proj->operation.gpu_tensorized
+                  << " cpu_w=" << patch_proj->operation.cpu_weight_layout
+                  << " gpu_w=" << patch_proj->operation.gpu_weight_layout
+                  << " cpu_out=" << patch_proj->operation.cpu_output_layout
+                  << " gpu_out=" << patch_proj->operation.gpu_output_layout
+                  << " cpu_u=" << patch_proj->operation.cpu_micro_kernel_unroll
+                  << " gpu_u=" << patch_proj->operation.gpu_micro_kernel_unroll << '\n';
+        return false;
+    }
+    if (patch_proj->config.variant_id.find("gpu-lowered") == std::string::npos) {
+        std::cerr << "lowering: patch-proj variant missing gpu-lowered tag: "
+                  << patch_proj->config.variant_id << '\n';
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    if (report.workload_graph.operations.size() >= 8u) {
+        std::cerr << "lowering: expected fewer than 8 ops, got " << report.workload_graph.operations.size() << '\n';
+        return false;
+    }
+    return true;
+}
+
+bool verify_operation_lowering_for_non_dl_graphs() {
+    const auto exec_cache = unique_temp_file("lowering-gaming-exec");
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+
+    auto host = make_manual_host_graph();
+    host.nodes[2].compute.native_vector_bits = 256;
+    attach_cache_and_scratch(host, 1024ull * 1024ull, 64ull * 1024ull);
+
+    auto gpu = make_manual_gpu_graph("gpu:gaming:0", "Gaming GPU", true, false, false);
+    gpu.nodes[2].compute.execution_width = 192;
+    gpu.nodes[2].compute.matrix_engines = 16;
+    attach_cache_and_scratch(gpu, 2ull * 1024ull * 1024ull, 128ull * 1024ull);
+
+    jakal::ExecutionPlan plan;
+    plan.signature = "manual-gaming-lowering";
+    plan.allocations.push_back({host, 0.35, 1.0});
+    plan.allocations.push_back({gpu, 0.65, 2.0});
+
+    const jakal::WorkloadSpec workload{
+        "gaming-upscale-1080p",
+        jakal::WorkloadKind::gaming,
+        "gaming-fsr-like-720p-to-1080p",
+        512ull * 1024ull * 1024ull,
+        96ull * 1024ull * 1024ull,
+        2.0e12,
+        1,
+        true,
+        false,
+        false};
+
+    const auto report = optimizer.optimize(workload, plan, {host, gpu});
+    const auto* upscale = find_operation_by_name(report, "upscale-resolve");
+    const auto* post = find_operation_by_name(report, "post-tonemap");
+    const auto* history = find_operation_by_name(report, "history-reconstruction");
+    if (upscale == nullptr || history == nullptr) {
+        return false;
+    }
+    if (post != nullptr) {
+        return false;
+    }
+    if (std::find(upscale->operation.fused_operation_names.begin(),
+                  upscale->operation.fused_operation_names.end(),
+                  "post-tonemap") == upscale->operation.fused_operation_names.end()) {
+        return false;
+    }
+    if (!history->operation.cpu_vectorized ||
+        !history->operation.gpu_tensorized ||
+        history->operation.cpu_input_layout == "native" ||
+        history->operation.gpu_input_layout == "native") {
+        return false;
+    }
+    if (upscale->config.variant_id.find("gpu-lowered") == std::string::npos &&
+        upscale->config.variant_id.find("cpu-lowered") == std::string::npos) {
+        std::cerr << "gaming lowering: upscale-resolve variant missing lowered tag: "
+                  << upscale->config.variant_id << '\n';
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    return report.workload_graph.operations.size() < 7u;
 }
 
 bool verify_gpu_direct_variants() {
@@ -292,6 +638,7 @@ bool verify_gpu_direct_variants() {
         bool unified_memory;
     } cases[] = {
         {"level-zero", "Intel Arc A770", jakal::JakalVendorFamily::intel, jakal::JakalBackendKind::level_zero, jakal::OperationClass::matmul, {64, 64, 64}, true, false, true},
+        {"level-zero-conv", "Intel Arc A770", jakal::JakalVendorFamily::intel, jakal::JakalBackendKind::level_zero, jakal::OperationClass::convolution_2d, {64, 64}, true, false, true},
         {"cuda", "NVIDIA RTX 4090", jakal::JakalVendorFamily::nvidia, jakal::JakalBackendKind::cuda, jakal::OperationClass::matmul, {64, 64, 64}, true, true, false},
         {"vulkan", "AMD Radeon RX 7900", jakal::JakalVendorFamily::amd, jakal::JakalBackendKind::vulkan_compute, jakal::OperationClass::resample_2d, {128, 128, 256, 256}, true, false, false},
     };
@@ -304,6 +651,25 @@ bool verify_gpu_direct_variants() {
             test_case.fp16,
             test_case.int8,
             test_case.unified_memory);
+        switch (test_case.backend) {
+        case jakal::JakalBackendKind::level_zero:
+            graph.probe = "level-zero";
+            break;
+        case jakal::JakalBackendKind::cuda:
+            graph.probe = "cuda";
+            break;
+        case jakal::JakalBackendKind::rocm:
+            graph.probe = "rocm";
+            break;
+        case jakal::JakalBackendKind::vulkan_compute:
+            graph.probe = "vulkan";
+            break;
+        case jakal::JakalBackendKind::opencl:
+            graph.probe = "opencl";
+            break;
+        default:
+            break;
+        }
 
         jakal::OperationSpec operation;
         operation.name = "op-" + test_case.name;
@@ -318,6 +684,22 @@ bool verify_gpu_direct_variants() {
         operation.reduction_like = test_case.op_class == jakal::OperationClass::reduction;
         operation.streaming_friendly = test_case.op_class == jakal::OperationClass::resample_2d;
         operation.matrix_friendly = test_case.op_class == jakal::OperationClass::matmul;
+        if (test_case.op_class == jakal::OperationClass::matmul) {
+            operation.gpu_pack_weights = true;
+            operation.gpu_pretranspose_rhs = true;
+            operation.gpu_tensorized = true;
+            operation.gpu_weight_layout = "gpu-tensorcore-tiled";
+            operation.gpu_output_layout = "gpu-tile-accumulator";
+            operation.gpu_micro_kernel_unroll = 4;
+        } else if (test_case.op_class == jakal::OperationClass::convolution_2d) {
+            operation.gpu_input_layout = "gpu-conv-patch9";
+            operation.gpu_output_layout = "gpu-conv-accumulator";
+            operation.gpu_tensorized = true;
+        } else if (test_case.op_class == jakal::OperationClass::resample_2d) {
+            operation.gpu_input_layout = "gpu-resample-packed6";
+            operation.gpu_output_layout = "gpu-resample-linear";
+            operation.gpu_tensorized = true;
+        }
 
         jakal::ExecutionConfig config;
         config.signature = "cfg-" + test_case.name;
@@ -380,6 +762,14 @@ bool verify_gpu_direct_variants() {
         if (record.backend_name.find(jakal::to_string(test_case.backend)) == std::string::npos) {
             std::cerr << "Backend name mismatch for " << test_case.name
                       << ": expected substring " << jakal::to_string(test_case.backend)
+                      << ", got " << record.backend_name << ".\n";
+            return false;
+        }
+        if ((test_case.op_class == jakal::OperationClass::matmul ||
+             test_case.op_class == jakal::OperationClass::convolution_2d ||
+             test_case.op_class == jakal::OperationClass::resample_2d) &&
+            record.backend_name.find("gpu-lowered") == std::string::npos) {
+            std::cerr << "Expected lowered GPU backend tag for " << test_case.name
                       << ", got " << record.backend_name << ".\n";
             return false;
         }
@@ -663,6 +1053,26 @@ int main() {
         return 1;
     }
     std::cerr << "stage: partition\n";
+    if (!verify_cache_aware_tiling_for_inference()) {
+        std::cerr << "Inference cache-aware tiling check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: tiling\n";
+    if (!verify_topology_aware_scheduler_for_inference()) {
+        std::cerr << "Inference topology-aware scheduler check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: scheduler\n";
+    if (!verify_operation_lowering_for_cpu_and_gpu_inference()) {
+        std::cerr << "Inference operation lowering check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: lowering\n";
+    if (!verify_operation_lowering_for_non_dl_graphs()) {
+        std::cerr << "Non-DL operation lowering check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: lowering-non-dl\n";
 
     const auto presets = jakal::canonical_workload_presets();
     const auto preset_it = std::find_if(presets.begin(), presets.end(), [](const jakal::CanonicalWorkloadPreset& preset) {

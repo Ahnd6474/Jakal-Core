@@ -173,14 +173,8 @@ HostPrecisionMode select_host_precision(const HardwareGraph& graph, const bool l
     if (graph.probe != "host") {
         return HostPrecisionMode::emulated_lowp;
     }
-
-    const auto summary = summarize_graph(graph);
-    if (summary.supports_bf16) {
-        return HostPrecisionMode::bf16;
-    }
-    if (summary.supports_fp16) {
-        return HostPrecisionMode::fp16;
-    }
+    // Product-correctness first: native host fp16/bf16 easily overflows these
+    // surrogate workloads and breaks semantic verification.
     return HostPrecisionMode::emulated_lowp;
 }
 
@@ -196,6 +190,35 @@ float quantize_host_value(const float value, const HostPrecisionMode mode) {
         return quantize_value(value, true);
     }
     return value;
+}
+
+bool cpu_rhs_uses_transposed_layout(const OperationSpec& operation) {
+    return operation.cpu_pack_weights || operation.cpu_pretranspose_rhs;
+}
+
+bool cpu_conv_uses_patch9_layout(const OperationSpec& operation, const std::span<const float> input) {
+    if (operation.op_class != OperationClass::convolution_2d ||
+        operation.cpu_input_layout.find("conv-patch9") == std::string::npos ||
+        operation.extents.size() < 2u) {
+        return false;
+    }
+    const auto height = static_cast<std::size_t>(operation.extents[0]);
+    const auto width = static_cast<std::size_t>(operation.extents[1]);
+    if (height < 3u || width < 3u) {
+        return false;
+    }
+    return input.size() == (height - 2u) * (width - 2u) * 9u;
+}
+
+bool cpu_resample_uses_packed6_layout(const OperationSpec& operation, const std::span<const float> input) {
+    if (operation.op_class != OperationClass::resample_2d ||
+        operation.cpu_input_layout.find("resample-packed6") == std::string::npos ||
+        operation.extents.size() < 4u) {
+        return false;
+    }
+    const auto dst_h = static_cast<std::size_t>(operation.extents[2]);
+    const auto dst_w = static_cast<std::size_t>(operation.extents[3]);
+    return input.size() == dst_h * dst_w * 6u;
 }
 
 class HostKernelBackend final : public IKernelBackend {
@@ -286,6 +309,7 @@ public:
 
     BackendRunResult run_matmul(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> lhs,
         const std::span<const float> rhs,
         const std::uint32_t rows,
@@ -296,7 +320,7 @@ public:
         result.output.resize(static_cast<std::size_t>(rows) * columns, 0.0f);
         const auto precision = select_host_precision(graph, low_precision);
         result.runtime_us = measure_us([&]() {
-            if (try_run_host_native_low_precision_matmul(
+            if (!cpu_rhs_uses_transposed_layout(operation) && try_run_host_native_low_precision_matmul(
                     graph,
                     lhs,
                     rhs,
@@ -325,7 +349,10 @@ public:
                             float acc = 0.0f;
                             for (std::uint32_t inner = 0; inner < depth; ++inner) {
                                 const float left = quantize_host_value(lhs[row * depth + inner], precision);
-                                const float right = quantize_host_value(rhs[inner * columns + col], precision);
+                                const std::size_t rhs_index = cpu_rhs_uses_transposed_layout(operation)
+                                                                  ? (static_cast<std::size_t>(col) * depth + inner)
+                                                                  : (static_cast<std::size_t>(inner) * columns + col);
+                                const float right = quantize_host_value(rhs[rhs_index], precision);
                                 acc = quantize_host_value(acc + (left * right), precision);
                             }
                             result.output[row * columns + col] = acc;
@@ -344,6 +371,7 @@ public:
 
     BackendRunResult run_conv3x3(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> input,
         const std::uint32_t height,
         const std::uint32_t width,
@@ -359,13 +387,19 @@ public:
         result.output.resize(static_cast<std::size_t>(out_height) * out_width, 0.0f);
         const auto precision = select_host_precision(graph, low_precision);
         result.runtime_us = measure_us([&]() {
+            const bool packed_input = cpu_conv_uses_patch9_layout(operation, input);
             for (std::uint32_t y = 1; y + 1 < height; ++y) {
                 for (std::uint32_t x = 1; x + 1 < width; ++x) {
                     float acc = 0.0f;
                     for (std::uint32_t ky = 0; ky < 3; ++ky) {
                         for (std::uint32_t kx = 0; kx < 3; ++kx) {
+                            const std::size_t patch_index =
+                                ((static_cast<std::size_t>(y - 1u) * out_width) + (x - 1u)) * 9u +
+                                ky * 3u + kx;
+                            const std::size_t dense_index =
+                                (static_cast<std::size_t>(y + ky - 1u) * width) + (x + kx - 1u);
                             const float value = quantize_host_value(
-                                input[(y + ky - 1u) * width + (x + kx - 1u)],
+                                input[packed_input ? patch_index : dense_index],
                                 precision);
                             acc = quantize_host_value(acc + (value * kernel[ky * 3u + kx]), precision);
                         }
@@ -381,6 +415,7 @@ public:
 
     BackendRunResult run_resample(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> input,
         const std::uint32_t src_h,
         const std::uint32_t src_w,
@@ -393,26 +428,42 @@ public:
         result.output.resize(static_cast<std::size_t>(row_count) * dst_w, 0.0f);
         const auto precision = select_host_precision(graph, low_precision);
         result.runtime_us = measure_us([&]() {
+            const bool packed_input = cpu_resample_uses_packed6_layout(operation, input);
             for (std::uint32_t local_y = 0; local_y < row_count; ++local_y) {
                 const std::uint32_t y = row_offset + local_y;
-                const float src_y =
-                    (static_cast<float>(y) + 0.5f) * static_cast<float>(src_h) / static_cast<float>(dst_h) - 0.5f;
-                const float clamped_y = std::clamp(src_y, 0.0f, static_cast<float>(src_h - 1u));
-                const auto y0 = static_cast<std::uint32_t>(clamped_y);
-                const auto y1 = std::min(y0 + 1u, src_h - 1u);
-                const float wy = clamped_y - static_cast<float>(y0);
-
                 for (std::uint32_t x = 0; x < dst_w; ++x) {
-                    const float src_x =
-                        (static_cast<float>(x) + 0.5f) * static_cast<float>(src_w) / static_cast<float>(dst_w) - 0.5f;
-                    const float clamped_x = std::clamp(src_x, 0.0f, static_cast<float>(src_w - 1u));
-                    const auto x0 = static_cast<std::uint32_t>(clamped_x);
-                    const auto x1 = std::min(x0 + 1u, src_w - 1u);
-                    const float wx = clamped_x - static_cast<float>(x0);
-                    const float v00 = quantize_host_value(input[y0 * src_w + x0], precision);
-                    const float v01 = quantize_host_value(input[y0 * src_w + x1], precision);
-                    const float v10 = quantize_host_value(input[y1 * src_w + x0], precision);
-                    const float v11 = quantize_host_value(input[y1 * src_w + x1], precision);
+                    float v00 = 0.0f;
+                    float v01 = 0.0f;
+                    float v10 = 0.0f;
+                    float v11 = 0.0f;
+                    float wx = 0.0f;
+                    float wy = 0.0f;
+                    if (packed_input) {
+                        const std::size_t base = (static_cast<std::size_t>(y) * dst_w + x) * 6u;
+                        v00 = quantize_host_value(input[base + 0u], precision);
+                        v01 = quantize_host_value(input[base + 1u], precision);
+                        v10 = quantize_host_value(input[base + 2u], precision);
+                        v11 = quantize_host_value(input[base + 3u], precision);
+                        wx = input[base + 4u];
+                        wy = input[base + 5u];
+                    } else {
+                        const float src_y =
+                            (static_cast<float>(y) + 0.5f) * static_cast<float>(src_h) / static_cast<float>(dst_h) - 0.5f;
+                        const float clamped_y = std::clamp(src_y, 0.0f, static_cast<float>(src_h - 1u));
+                        const auto y0 = static_cast<std::uint32_t>(clamped_y);
+                        const auto y1 = std::min(y0 + 1u, src_h - 1u);
+                        wy = clamped_y - static_cast<float>(y0);
+                        const float src_x =
+                            (static_cast<float>(x) + 0.5f) * static_cast<float>(src_w) / static_cast<float>(dst_w) - 0.5f;
+                        const float clamped_x = std::clamp(src_x, 0.0f, static_cast<float>(src_w - 1u));
+                        const auto x0 = static_cast<std::uint32_t>(clamped_x);
+                        const auto x1 = std::min(x0 + 1u, src_w - 1u);
+                        wx = clamped_x - static_cast<float>(x0);
+                        v00 = quantize_host_value(input[y0 * src_w + x0], precision);
+                        v01 = quantize_host_value(input[y0 * src_w + x1], precision);
+                        v10 = quantize_host_value(input[y1 * src_w + x0], precision);
+                        v11 = quantize_host_value(input[y1 * src_w + x1], precision);
+                    }
                     const float top = quantize_host_value(v00 + ((v01 - v00) * wx), precision);
                     const float bottom = quantize_host_value(v10 + ((v11 - v10) * wx), precision);
                     result.output[local_y * dst_w + x] = quantize_host_value(top + ((bottom - top) * wy), precision);
@@ -681,6 +732,7 @@ public:
 
     BackendRunResult run_matmul(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> lhs,
         const std::span<const float> rhs,
         const std::uint32_t rows,
@@ -690,11 +742,12 @@ public:
         return finalize(
             graph,
             OperationClass::matmul,
-            host_.run_matmul(graph, lhs, rhs, rows, columns, depth, low_precision));
+            host_.run_matmul(graph, operation, lhs, rhs, rows, columns, depth, low_precision));
     }
 
     BackendRunResult run_conv3x3(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> input,
         const std::uint32_t height,
         const std::uint32_t width,
@@ -702,11 +755,12 @@ public:
         return finalize(
             graph,
             OperationClass::convolution_2d,
-            host_.run_conv3x3(graph, input, height, width, low_precision));
+            host_.run_conv3x3(graph, operation, input, height, width, low_precision));
     }
 
     BackendRunResult run_resample(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> input,
         const std::uint32_t src_h,
         const std::uint32_t src_w,
@@ -718,7 +772,17 @@ public:
         return finalize(
             graph,
             OperationClass::resample_2d,
-            host_.run_resample(graph, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision));
+            host_.run_resample(
+                graph,
+                operation,
+                input,
+                src_h,
+                src_w,
+                dst_h,
+                dst_w,
+                row_offset,
+                row_count,
+                low_precision));
     }
 
 private:

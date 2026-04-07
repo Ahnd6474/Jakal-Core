@@ -109,6 +109,9 @@ struct HardwareGraph {
     std::string uid;
     std::string probe;
     std::string presentation_name;
+    std::string driver_version;
+    std::string runtime_version;
+    std::string compiler_version;
     std::uint32_t ordinal = 0;
     std::vector<HardwareObjectNode> nodes;
     std::vector<HardwareGraphEdge> edges;

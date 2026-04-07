@@ -100,6 +100,21 @@ struct OperationSpec {
     std::vector<std::string> output_tensor_ids;
     std::vector<std::string> temporary_tensor_ids;
     std::vector<std::string> dependency_operation_names;
+    std::vector<std::string> fused_operation_names;
+    bool cpu_vectorized = false;
+    bool gpu_tensorized = false;
+    std::string cpu_input_layout = "native";
+    std::string cpu_weight_layout = "native";
+    std::string cpu_output_layout = "native";
+    std::string gpu_input_layout = "native";
+    std::string gpu_weight_layout = "native";
+    std::string gpu_output_layout = "native";
+    bool cpu_pack_weights = false;
+    bool gpu_pack_weights = false;
+    bool cpu_pretranspose_rhs = false;
+    bool gpu_pretranspose_rhs = false;
+    std::uint32_t cpu_micro_kernel_unroll = 1;
+    std::uint32_t gpu_micro_kernel_unroll = 1;
 };
 
 struct WorkloadTensor {

@@ -99,6 +99,39 @@ bool backend_result_is_usable(const executors::BackendRunResult& result) {
     });
 }
 
+std::string summarize_vector(const std::vector<float>& values) {
+    if (values.empty()) {
+        return "size=0";
+    }
+    std::size_t nan_count = 0;
+    std::size_t inf_count = 0;
+    double max_abs = 0.0;
+    for (const float value : values) {
+        if (std::isnan(value)) {
+            ++nan_count;
+            continue;
+        }
+        if (!std::isfinite(value)) {
+            ++inf_count;
+            continue;
+        }
+        max_abs = std::max(max_abs, std::abs(static_cast<double>(value)));
+    }
+    std::ostringstream stream;
+    stream << "size=" << values.size()
+           << " nan=" << nan_count
+           << " inf=" << inf_count
+           << " maxabs=" << max_abs
+           << " first=" << values.front();
+    if (values.size() > 1u) {
+        stream << "," << values[1];
+    }
+    if (values.size() > 2u) {
+        stream << "," << values[2];
+    }
+    return stream.str();
+}
+
 std::string sanitize_id_fragment(const std::string& text) {
     std::string result = text;
     for (char& ch : result) {
@@ -168,6 +201,35 @@ bool variant_compatible_with_graph(
     }
 }
 
+bool gpu_conv_uses_patch9_layout(const OperationSpec& operation);
+bool gpu_resample_uses_packed6_layout(const OperationSpec& operation);
+
+bool cpu_materialized_lowering_active(const OperationSpec& operation) {
+    switch (operation.op_class) {
+    case OperationClass::matmul:
+        return operation.cpu_pack_weights || operation.cpu_pretranspose_rhs;
+    case OperationClass::convolution_2d:
+        return operation.cpu_input_layout.find("conv-patch9") != std::string::npos;
+    case OperationClass::resample_2d:
+        return operation.cpu_input_layout.find("resample-packed6") != std::string::npos;
+    default:
+        return false;
+    }
+}
+
+bool gpu_materialized_lowering_active(const OperationSpec& operation) {
+    switch (operation.op_class) {
+    case OperationClass::matmul:
+        return operation.gpu_pack_weights || operation.gpu_pretranspose_rhs;
+    case OperationClass::convolution_2d:
+        return operation.gpu_input_layout.find("conv-patch9") != std::string::npos;
+    case OperationClass::resample_2d:
+        return operation.gpu_input_layout.find("resample-packed6") != std::string::npos;
+    default:
+        return false;
+    }
+}
+
 const JakalToolkitVariant* find_preferred_gpu_variant(
     const DeviceAssignment& assignment,
     const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index,
@@ -189,6 +251,14 @@ const JakalToolkitVariant* find_preferred_gpu_variant(
             double score = variant.toolkit_score;
             if (traits.matrix_friendly && variant.binding.capabilities.subgroup_matrix) {
                 score += 0.05;
+            }
+            if (operation.gpu_tensorized && traits.op_class == OperationClass::matmul &&
+                variant.binding.capabilities.subgroup_matrix) {
+                score += 0.08;
+            }
+            if (gpu_materialized_lowering_active(operation) &&
+                variant.binding.backend != JakalBackendKind::opencl) {
+                score += 0.03;
             }
             if (traits.streaming_friendly && variant.binding.capabilities.unified_memory) {
                 score += 0.03;
@@ -239,15 +309,24 @@ std::string actual_backend_name(
         preferred_gpu->executable;
 
     if (uses_host && uses_gpu) {
-        return "mixed-direct[" + gpu_request() + "]";
+        std::string suffix;
+        if (gpu_materialized_lowering_active(operation)) {
+            suffix += "+gpu-lowered";
+        }
+        if (cpu_materialized_lowering_active(operation)) {
+            suffix += "+cpu-lowered";
+        }
+        return "mixed-direct[" + gpu_request() + "]" + suffix;
     }
     if (uses_gpu) {
         if (executable_gpu_request) {
-            return gpu_request() + "-direct";
+            return gpu_request() + "-direct" +
+                   (gpu_materialized_lowering_active(operation) ? "+gpu-lowered" : "");
         }
         return "gpu-direct";
     }
-    return "host-direct";
+    return std::string("host-direct") +
+           (cpu_materialized_lowering_active(operation) ? "+cpu-lowered" : "");
 }
 
 #if defined(_WIN32)
@@ -582,6 +661,38 @@ __kernel void matmul_tiled(
   }
 }
 
+__kernel void matmul_tiled_rhs_t(
+    __global const float* lhs,
+    __global const float* rhs,
+    __global float* out,
+    uint rows,
+    uint columns,
+    uint depth,
+    int low_precision,
+    __local float* lhs_tile,
+    __local float* rhs_tile) {
+  uint col = get_global_id(0);
+  uint row = get_global_id(1);
+  uint lcol = get_local_id(0);
+  uint lrow = get_local_id(1);
+  uint tile = get_local_size(0);
+  float acc = 0.0f;
+  for (uint base = 0; base < depth; base += tile) {
+    uint lhs_index = row * depth + base + lcol;
+    uint rhs_index = col * depth + base + lrow;
+    lhs_tile[lrow * tile + lcol] = (row < rows && (base + lcol) < depth) ? lhs[lhs_index] : 0.0f;
+    rhs_tile[lrow * tile + lcol] = (col < columns && (base + lrow) < depth) ? rhs[rhs_index] : 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint inner = 0; inner < tile; ++inner) {
+      acc = q(acc + lhs_tile[lrow * tile + inner] * rhs_tile[inner * tile + lcol], low_precision);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (row < rows && col < columns) {
+    out[row * columns + col] = q(acc, low_precision);
+  }
+}
+
 __kernel void conv3x3_valid(
     __global const float* input,
     __global float* output,
@@ -600,6 +711,30 @@ __kernel void conv3x3_valid(
       float value = q(input[(y + ky) * width + (x + kx)], low_precision);
       acc = q(acc + value * kernel[ky * 3 + kx], low_precision);
     }
+  }
+  output[y * out_width + x] = acc;
+}
+
+__kernel void conv3x3_valid_patch9(
+    __global const float* input,
+    __global float* output,
+    uint height,
+    uint width,
+    int low_precision) {
+  uint x = get_global_id(0);
+  uint y = get_global_id(1);
+  uint out_width = width - 2;
+  uint out_height = height - 2;
+  if (x >= out_width || y >= out_height) return;
+  float acc = 0.0f;
+  uint base = (y * out_width + x) * 9u;
+  for (uint index = 0; index < 9u; ++index) {
+    float weight = 0.125f;
+    uint ky = index / 3u;
+    uint kx = index % 3u;
+    if ((ky == 1u) && (kx == 1u)) weight = 0.25f;
+    else if ((ky != 1u) && (kx != 1u)) weight = 0.0625f;
+    acc = q(acc + q(input[base + index], low_precision) * weight, low_precision);
   }
   output[y * out_width + x] = acc;
 }
@@ -632,6 +767,35 @@ __kernel void bilinear_resample(
   float v01 = q(input[y0 * src_w + x1], low_precision);
   float v10 = q(input[y1 * src_w + x0], low_precision);
   float v11 = q(input[y1 * src_w + x1], low_precision);
+  float top = q(v00 + ((v01 - v00) * wx), low_precision);
+  float bottom = q(v10 + ((v11 - v10) * wx), low_precision);
+  output[y * dst_w + x] = q(top + ((bottom - top) * wy), low_precision);
+}
+
+__kernel void bilinear_resample_packed6(
+    __global const float* input,
+    __global float* output,
+    uint src_h,
+    uint src_w,
+    uint dst_h,
+    uint dst_w,
+    uint dst_y_offset,
+    uint shard_rows,
+    int low_precision) {
+  (void)src_h;
+  (void)src_w;
+  (void)dst_h;
+  (void)dst_y_offset;
+  uint x = get_global_id(0);
+  uint y = get_global_id(1);
+  if (x >= dst_w || y >= shard_rows) return;
+  uint base = (y * dst_w + x) * 6u;
+  float v00 = q(input[base + 0u], low_precision);
+  float v01 = q(input[base + 1u], low_precision);
+  float v10 = q(input[base + 2u], low_precision);
+  float v11 = q(input[base + 3u], low_precision);
+  float wx = input[base + 4u];
+  float wy = input[base + 5u];
   float top = q(v00 + ((v01 - v00) * wx), low_precision);
   float bottom = q(v10 + ((v11 - v10) * wx), low_precision);
   output[y * dst_w + x] = q(top + ((bottom - top) * wy), low_precision);
@@ -1040,6 +1204,7 @@ public:
 
     BackendRunResult run_matmul(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> lhs,
         const std::span<const float> rhs,
         const std::uint32_t rows,
@@ -1059,7 +1224,11 @@ public:
         result.output.resize(static_cast<std::size_t>(rows) * columns, 0.0f);
         result.runtime_us = measure_us([&]() {
             std::scoped_lock execution_lock(context->execution_mutex);
-            cl_kernel kernel = ensure_kernel(context, program, low_precision, "matmul_tiled");
+            cl_kernel kernel = ensure_kernel(
+                context,
+                program,
+                low_precision,
+                (operation.gpu_pack_weights || operation.gpu_pretranspose_rhs) ? "matmul_tiled_rhs_t" : "matmul_tiled");
             if (kernel == nullptr) {
                 return;
             }
@@ -1107,6 +1276,7 @@ public:
 
     BackendRunResult run_conv3x3(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> input,
         const std::uint32_t height,
         const std::uint32_t width,
@@ -1126,7 +1296,11 @@ public:
         result.output.resize(static_cast<std::size_t>(out_height) * out_width, 0.0f);
         result.runtime_us = measure_us([&]() {
             std::scoped_lock execution_lock(context->execution_mutex);
-            cl_kernel kernel = ensure_kernel(context, program, low_precision, "conv3x3_valid");
+            cl_kernel kernel = ensure_kernel(
+                context,
+                program,
+                low_precision,
+                gpu_conv_uses_patch9_layout(operation) ? "conv3x3_valid_patch9" : "conv3x3_valid");
             if (kernel == nullptr) {
                 return;
             }
@@ -1166,6 +1340,7 @@ public:
 
     BackendRunResult run_resample(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> input,
         const std::uint32_t src_h,
         const std::uint32_t src_w,
@@ -1187,7 +1362,11 @@ public:
         result.output.resize(static_cast<std::size_t>(row_count) * dst_w, 0.0f);
         result.runtime_us = measure_us([&]() {
             std::scoped_lock execution_lock(context->execution_mutex);
-            cl_kernel kernel = ensure_kernel(context, program, low_precision, "bilinear_resample");
+            cl_kernel kernel = ensure_kernel(
+                context,
+                program,
+                low_precision,
+                gpu_resample_uses_packed6_layout(operation) ? "bilinear_resample_packed6" : "bilinear_resample");
             if (kernel == nullptr) {
                 return;
             }
@@ -1235,6 +1414,97 @@ public:
     }
 };
 
+std::vector<float> materialize_rhs_transposed(
+    const std::vector<float>& rhs,
+    const std::uint32_t depth,
+    const std::uint32_t columns) {
+    std::vector<float> transposed(static_cast<std::size_t>(depth) * columns, 0.0f);
+    for (std::uint32_t inner = 0; inner < depth; ++inner) {
+        for (std::uint32_t col = 0; col < columns; ++col) {
+            transposed[static_cast<std::size_t>(col) * depth + inner] =
+                rhs[static_cast<std::size_t>(inner) * columns + col];
+        }
+    }
+    return transposed;
+}
+
+bool cpu_conv_uses_patch9_layout(const OperationSpec& operation) {
+    return operation.op_class == OperationClass::convolution_2d &&
+           operation.cpu_input_layout.find("conv-patch9") != std::string::npos;
+}
+
+bool gpu_conv_uses_patch9_layout(const OperationSpec& operation) {
+    return operation.op_class == OperationClass::convolution_2d &&
+           operation.gpu_input_layout.find("conv-patch9") != std::string::npos;
+}
+
+bool cpu_resample_uses_packed6_layout(const OperationSpec& operation) {
+    return operation.op_class == OperationClass::resample_2d &&
+           operation.cpu_input_layout.find("resample-packed6") != std::string::npos;
+}
+
+bool gpu_resample_uses_packed6_layout(const OperationSpec& operation) {
+    return operation.op_class == OperationClass::resample_2d &&
+           operation.gpu_input_layout.find("resample-packed6") != std::string::npos;
+}
+
+std::vector<float> materialize_conv_patch9(
+    const std::span<const float> input,
+    const std::uint32_t height,
+    const std::uint32_t width) {
+    const auto out_height = height - 2u;
+    const auto out_width = width - 2u;
+    std::vector<float> packed(static_cast<std::size_t>(out_height) * out_width * 9u, 0.0f);
+    for (std::uint32_t y = 0; y < out_height; ++y) {
+        for (std::uint32_t x = 0; x < out_width; ++x) {
+            const auto base = (static_cast<std::size_t>(y) * out_width + x) * 9u;
+            for (std::uint32_t ky = 0; ky < 3u; ++ky) {
+                for (std::uint32_t kx = 0; kx < 3u; ++kx) {
+                    packed[base + ky * 3u + kx] =
+                        input[(static_cast<std::size_t>(y + ky) * width) + (x + kx)];
+                }
+            }
+        }
+    }
+    return packed;
+}
+
+std::vector<float> materialize_resample_packed6(
+    const std::span<const float> input,
+    const std::uint32_t src_h,
+    const std::uint32_t src_w,
+    const std::uint32_t dst_h,
+    const std::uint32_t dst_w,
+    const std::uint32_t row_offset,
+    const std::uint32_t row_count) {
+    std::vector<float> packed(static_cast<std::size_t>(row_count) * dst_w * 6u, 0.0f);
+    for (std::uint32_t local_y = 0; local_y < row_count; ++local_y) {
+        const auto y = row_offset + local_y;
+        const float src_y =
+            (static_cast<float>(y) + 0.5f) * static_cast<float>(src_h) / static_cast<float>(dst_h) - 0.5f;
+        const float clamped_y = std::clamp(src_y, 0.0f, static_cast<float>(src_h - 1u));
+        const auto y0 = static_cast<std::uint32_t>(clamped_y);
+        const auto y1 = std::min(y0 + 1u, src_h - 1u);
+        const float wy = clamped_y - static_cast<float>(y0);
+        for (std::uint32_t x = 0; x < dst_w; ++x) {
+            const float src_x =
+                (static_cast<float>(x) + 0.5f) * static_cast<float>(src_w) / static_cast<float>(dst_w) - 0.5f;
+            const float clamped_x = std::clamp(src_x, 0.0f, static_cast<float>(src_w - 1u));
+            const auto x0 = static_cast<std::uint32_t>(clamped_x);
+            const auto x1 = std::min(x0 + 1u, src_w - 1u);
+            const float wx = clamped_x - static_cast<float>(x0);
+            const auto base = (static_cast<std::size_t>(local_y) * dst_w + x) * 6u;
+            packed[base + 0u] = input[y0 * src_w + x0];
+            packed[base + 1u] = input[y0 * src_w + x1];
+            packed[base + 2u] = input[y1 * src_w + x0];
+            packed[base + 3u] = input[y1 * src_w + x1];
+            packed[base + 4u] = wx;
+            packed[base + 5u] = wy;
+        }
+    }
+    return packed;
+}
+
 OperationData make_operation_data(const OperationSpec& operation) {
     OperationData data;
     switch (operation.op_class) {
@@ -1251,6 +1521,20 @@ OperationData make_operation_data(const OperationSpec& operation) {
         const auto depth = static_cast<std::size_t>(operation.extents.at(2));
         data.input0 = make_pattern(rows * depth, 4.0f);
         data.input1 = make_pattern(depth * cols, 5.0f);
+        if (operation.cpu_pack_weights || operation.cpu_pretranspose_rhs) {
+            data.cpu_rhs_materialized = materialize_rhs_transposed(
+                data.input1,
+                static_cast<std::uint32_t>(depth),
+                static_cast<std::uint32_t>(cols));
+            data.cpu_rhs_layout = "packed-transposed";
+        }
+        if (operation.gpu_pack_weights || operation.gpu_pretranspose_rhs) {
+            data.gpu_rhs_materialized = materialize_rhs_transposed(
+                data.input1,
+                static_cast<std::uint32_t>(depth),
+                static_cast<std::uint32_t>(cols));
+            data.gpu_rhs_layout = "packed-transposed";
+        }
         break;
     }
     case OperationClass::convolution_2d: {
@@ -1380,44 +1664,54 @@ BackendRunResult dispatch_backend(
         const std::span<const float> lhs_slice(
             data.input0.data() + static_cast<std::ptrdiff_t>(row_begin * depth),
             static_cast<std::size_t>(rows) * depth);
-        const std::span<const float> rhs_slice(data.input1);
+        const bool use_gpu_rhs = graph.probe != "host" && !data.gpu_rhs_materialized.empty();
+        const bool use_cpu_rhs = graph.probe == "host" && !data.cpu_rhs_materialized.empty();
+        const std::span<const float> rhs_slice(
+            use_gpu_rhs ? data.gpu_rhs_materialized : (use_cpu_rhs ? data.cpu_rhs_materialized : data.input1));
         if (const auto gpu = dispatch_gpu([&](const auto& backend) {
-                return backend.run_matmul(graph, lhs_slice, rhs_slice, rows, columns, depth, low_precision);
+                return backend.run_matmul(graph, operation.operation, lhs_slice, rhs_slice, rows, columns, depth, low_precision);
             })) {
             if (!should_fallback_from_gpu(*gpu)) {
                 return *gpu;
             }
         }
         if (graph.probe == "opencl" && opencl.available()) {
-            auto result = opencl.run_matmul(graph, lhs_slice, rhs_slice, rows, columns, depth, low_precision);
+            auto result = opencl.run_matmul(graph, operation.operation, lhs_slice, rhs_slice, rows, columns, depth, low_precision);
             if (result.success) {
                 return result;
             }
         }
-        return host.run_matmul(graph, lhs_slice, rhs_slice, rows, columns, depth, low_precision);
+        return host.run_matmul(graph, operation.operation, lhs_slice, rhs_slice, rows, columns, depth, low_precision);
     }
     case OperationClass::convolution_2d: {
         const auto width = static_cast<std::uint32_t>(operation.operation.extents.at(1));
         const auto input_row_begin = static_cast<std::uint32_t>(assignment.shard.start);
         const auto rows = static_cast<std::uint32_t>(assignment.shard.count);
         const auto input_height = rows + 2u;
-        const std::span<const float> input_slice(
+        const std::span<const float> dense_input_slice(
             data.input0.data() + static_cast<std::ptrdiff_t>(input_row_begin * width),
             static_cast<std::size_t>(input_height) * width);
+        const bool use_gpu_layout = graph.probe != "host" && gpu_conv_uses_patch9_layout(operation.operation);
+        const bool use_cpu_layout = graph.probe == "host" && cpu_conv_uses_patch9_layout(operation.operation);
+        const auto packed_input = (use_gpu_layout || use_cpu_layout)
+                                      ? materialize_conv_patch9(dense_input_slice, input_height, width)
+                                      : std::vector<float>{};
+        const std::span<const float> input_slice(
+            packed_input.empty() ? dense_input_slice : std::span<const float>(packed_input));
         if (const auto gpu = dispatch_gpu([&](const auto& backend) {
-                return backend.run_conv3x3(graph, input_slice, input_height, width, low_precision);
+                return backend.run_conv3x3(graph, operation.operation, input_slice, input_height, width, low_precision);
             })) {
             if (!should_fallback_from_gpu(*gpu)) {
                 return *gpu;
             }
         }
         if (graph.probe == "opencl" && opencl.available()) {
-            auto result = opencl.run_conv3x3(graph, input_slice, input_height, width, low_precision);
+            auto result = opencl.run_conv3x3(graph, operation.operation, input_slice, input_height, width, low_precision);
             if (result.success) {
                 return result;
             }
         }
-        return host.run_conv3x3(graph, input_slice, input_height, width, low_precision);
+        return host.run_conv3x3(graph, operation.operation, input_slice, input_height, width, low_precision);
     }
     case OperationClass::resample_2d:
     default: {
@@ -1427,10 +1721,18 @@ BackendRunResult dispatch_backend(
         const auto dst_w = static_cast<std::uint32_t>(operation.operation.extents.at(3));
         const auto row_offset = static_cast<std::uint32_t>(assignment.shard.start);
         const auto row_count = static_cast<std::uint32_t>(assignment.shard.count);
-        const std::span<const float> input(data.input0);
+        const std::span<const float> dense_input(data.input0);
+        const bool use_gpu_layout = graph.probe != "host" && gpu_resample_uses_packed6_layout(operation.operation);
+        const bool use_cpu_layout = graph.probe == "host" && cpu_resample_uses_packed6_layout(operation.operation);
+        const auto packed_input = (use_gpu_layout || use_cpu_layout)
+                                      ? materialize_resample_packed6(dense_input, src_h, src_w, dst_h, dst_w, row_offset, row_count)
+                                      : std::vector<float>{};
+        const std::span<const float> input(
+            packed_input.empty() ? dense_input : std::span<const float>(packed_input));
         if (const auto gpu = dispatch_gpu([&](const auto& backend) {
                 return backend.run_resample(
                     graph,
+                    operation.operation,
                     input,
                     src_h,
                     src_w,
@@ -1445,12 +1747,32 @@ BackendRunResult dispatch_backend(
             }
         }
         if (graph.probe == "opencl" && opencl.available()) {
-            auto result = opencl.run_resample(graph, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
+            auto result = opencl.run_resample(
+                graph,
+                operation.operation,
+                input,
+                src_h,
+                src_w,
+                dst_h,
+                dst_w,
+                row_offset,
+                row_count,
+                low_precision);
             if (result.success) {
                 return result;
             }
         }
-        return host.run_resample(graph, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
+        return host.run_resample(
+            graph,
+            operation.operation,
+            input,
+            src_h,
+            src_w,
+            dst_h,
+            dst_w,
+            row_offset,
+            row_count,
+            low_precision);
     }
     }
 }
@@ -1516,6 +1838,9 @@ DirectExecutionReport DirectExecutor::execute(
 
             const bool reference_low_precision = false;
             const bool verification_low_precision = optimized.config.use_low_precision;
+            HardwareGraph verification_host_graph = reference_host_graph;
+            verification_host_graph.uid += ":verification";
+            verification_host_graph.probe = "host-emulated";
             std::vector<float> verification_vector;
             double verification_scalar = 0.0;
 
@@ -1531,7 +1856,7 @@ DirectExecutionReport DirectExecutor::execute(
                     verification_vector = reference.output;
                 } else {
                     const auto verification = host_backend->run_elementwise(
-                        reference_host_graph,
+                        verification_host_graph,
                         operation_data.input0,
                         operation_data.input1,
                         verification_low_precision);
@@ -1547,7 +1872,7 @@ DirectExecutionReport DirectExecutor::execute(
                     verification_scalar = reference.scalar_output;
                 } else {
                     const auto verification =
-                        host_backend->run_reduction(reference_host_graph, operation_data.input0, verification_low_precision);
+                        host_backend->run_reduction(verification_host_graph, operation_data.input0, verification_low_precision);
                     verification_scalar = verification.scalar_output;
                 }
                 break;
@@ -1555,6 +1880,7 @@ DirectExecutionReport DirectExecutor::execute(
             case OperationClass::matmul: {
                 const auto reference = host_backend->run_matmul(
                     reference_host_graph,
+                    optimized.operation,
                     operation_data.input0,
                     operation_data.input1,
                     static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
@@ -1566,9 +1892,10 @@ DirectExecutionReport DirectExecutor::execute(
                     verification_vector = reference.output;
                 } else {
                     const auto verification = host_backend->run_matmul(
-                        reference_host_graph,
+                        verification_host_graph,
+                        optimized.operation,
                         operation_data.input0,
-                        operation_data.input1,
+                        operation_data.cpu_rhs_materialized.empty() ? operation_data.input1 : operation_data.cpu_rhs_materialized,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
@@ -1580,6 +1907,7 @@ DirectExecutionReport DirectExecutor::execute(
             case OperationClass::convolution_2d: {
                 const auto reference = host_backend->run_conv3x3(
                     reference_host_graph,
+                    optimized.operation,
                     operation_data.input0,
                     static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                     static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
@@ -1589,7 +1917,8 @@ DirectExecutionReport DirectExecutor::execute(
                     verification_vector = reference.output;
                 } else {
                     const auto verification = host_backend->run_conv3x3(
-                        reference_host_graph,
+                        verification_host_graph,
+                        optimized.operation,
                         operation_data.input0,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
@@ -1602,6 +1931,7 @@ DirectExecutionReport DirectExecutor::execute(
             default: {
                 const auto reference = host_backend->run_resample(
                     reference_host_graph,
+                    optimized.operation,
                     operation_data.input0,
                     static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                     static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
@@ -1615,7 +1945,8 @@ DirectExecutionReport DirectExecutor::execute(
                     verification_vector = reference.output;
                 } else {
                     const auto verification = host_backend->run_resample(
-                        reference_host_graph,
+                        verification_host_graph,
+                        optimized.operation,
                         operation_data.input0,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
@@ -1801,7 +2132,10 @@ DirectExecutionReport DirectExecutor::execute(
                 " tol=" + std::to_string(optimized.operation.max_relative_error) +
                 " lowp=" + (optimized.config.use_low_precision ? std::string("1") : std::string("0")) +
                 " verified=" + (completed.verified ? std::string("1") : std::string("0")) +
-                " error=" + completed.backend_error);
+                " error=" + completed.backend_error +
+                (optimized.operation.op_class == OperationClass::reduction
+                     ? " scalar=" + std::to_string(merged_scalar)
+                     : " output=" + summarize_vector(merged_output)));
         } catch (const std::exception& error) {
             trace_execution_line("exec:exception op=" + optimized.operation.name + " what=" + error.what());
             std::ostringstream message;

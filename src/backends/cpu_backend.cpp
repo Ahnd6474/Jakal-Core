@@ -180,6 +180,9 @@ public:
         graph.uid = "host:0";
         graph.probe = "host";
         graph.presentation_name = seed.brand;
+        graph.driver_version = "host";
+        graph.runtime_version = "host";
+        graph.compiler_version = "host";
         graph.ordinal = 0;
 
         const std::string root_id = graph.uid + "/root";

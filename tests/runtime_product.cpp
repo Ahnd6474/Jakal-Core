@@ -1,6 +1,7 @@
 #include "jakal/runtime.hpp"
 #include "jakal/workloads.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -97,6 +98,126 @@ void write_manifest(
     output << "outputs=score-out\n";
 }
 
+void write_spatial_manifest(
+    const std::filesystem::path& path,
+    const std::filesystem::path& asset_path) {
+    std::ofstream output(path, std::ios::trunc);
+    output << "[workload]\n";
+    output << "name=manifest-spatial\n";
+    output << "kind=gaming\n";
+    output << "dataset_tag=manifest-spatial-lite\n";
+    output << "phase=decode\n";
+    output << "working_set_bytes=16777216\n";
+    output << "host_exchange_bytes=2097152\n";
+    output << "estimated_flops=48000000\n";
+    output << "batch_size=1\n";
+    output << "latency_sensitive=true\n";
+    output << "prefer_unified_memory=true\n\n";
+
+    output << "[asset]\n";
+    output << "id=frame-history\n";
+    output << "path=" << asset_path.string() << "\n";
+    output << "tensor_ids=frame\n";
+    output << "preload_required=true\n";
+    output << "persistent=true\n";
+    output << "host_visible=true\n\n";
+
+    output << "[tensor]\n";
+    output << "id=frame\n";
+    output << "bytes=4096\n";
+    output << "persistent=true\n";
+    output << "host_visible=true\n";
+    output << "consumers=spatial-conv,spatial-upsample\n\n";
+
+    output << "[tensor]\n";
+    output << "id=conv-out\n";
+    output << "bytes=3600\n";
+    output << "producer=spatial-conv\n\n";
+
+    output << "[tensor]\n";
+    output << "id=upscale-out\n";
+    output << "bytes=9216\n";
+    output << "producer=spatial-upsample\n\n";
+
+    output << "[operation]\n";
+    output << "name=spatial-conv\n";
+    output << "class=convolution_2d\n";
+    output << "extents=32,32\n";
+    output << "input_bytes=4096\n";
+    output << "output_bytes=3600\n";
+    output << "estimated_flops=129600\n";
+    output << "parallelizable=true\n";
+    output << "inputs=frame\n";
+    output << "outputs=conv-out\n\n";
+
+    output << "[operation]\n";
+    output << "name=spatial-upsample\n";
+    output << "class=resample_2d\n";
+    output << "extents=32,32,48,48\n";
+    output << "input_bytes=4096\n";
+    output << "output_bytes=9216\n";
+    output << "estimated_flops=36864\n";
+    output << "parallelizable=true\n";
+    output << "streaming_friendly=true\n";
+    output << "inputs=frame\n";
+    output << "outputs=upscale-out\n";
+}
+
+void write_matmul_manifest(
+    const std::filesystem::path& path,
+    const std::filesystem::path& asset_path) {
+    std::ofstream output(path, std::ios::trunc);
+    output << "[workload]\n";
+    output << "name=manifest-matmul\n";
+    output << "kind=inference\n";
+    output << "dataset_tag=manifest-matmul-lite\n";
+    output << "phase=prefill\n";
+    output << "working_set_bytes=16777216\n";
+    output << "host_exchange_bytes=1048576\n";
+    output << "estimated_flops=65536\n";
+    output << "batch_size=1\n";
+    output << "latency_sensitive=true\n";
+    output << "matrix_friendly=true\n\n";
+
+    output << "[asset]\n";
+    output << "id=matmul-weights\n";
+    output << "path=" << asset_path.string() << "\n";
+    output << "tensor_ids=weights\n";
+    output << "preload_required=true\n";
+    output << "persistent=true\n";
+    output << "host_visible=true\n\n";
+
+    output << "[tensor]\n";
+    output << "id=input\n";
+    output << "bytes=4096\n";
+    output << "host_visible=true\n";
+    output << "consumers=patch-proj\n\n";
+
+    output << "[tensor]\n";
+    output << "id=weights\n";
+    output << "bytes=4096\n";
+    output << "persistent=true\n";
+    output << "host_visible=true\n";
+    output << "consumers=patch-proj\n\n";
+
+    output << "[tensor]\n";
+    output << "id=proj-out\n";
+    output << "bytes=4096\n";
+    output << "producer=patch-proj\n\n";
+
+    output << "[operation]\n";
+    output << "name=patch-proj\n";
+    output << "class=matmul\n";
+    output << "extents=32,32,32\n";
+    output << "input_bytes=8192\n";
+    output << "output_bytes=4096\n";
+    output << "estimated_flops=65536\n";
+    output << "parallelizable=true\n";
+    output << "matrix_friendly=true\n";
+    output << "inputs=input,weights\n";
+    output << "outputs=proj-out\n";
+}
+
 }  // namespace
 
 int main() {
@@ -105,8 +226,11 @@ int main() {
         const auto runtime_manifest_path = unique_temp_file("runtime-product-runtime", ".workload");
         const auto blocked_manifest_path = unique_temp_file("runtime-product-blocked", ".workload");
         const auto missing_asset_manifest_path = unique_temp_file("runtime-product-missing-asset", ".workload");
+        const auto spatial_manifest_path = unique_temp_file("runtime-product-spatial", ".workload");
+        const auto matmul_manifest_path = unique_temp_file("runtime-product-matmul", ".workload");
         const auto weight_asset_path = unique_temp_file("runtime-product-weights", ".bin");
         const auto missing_weight_asset_path = unique_temp_file("runtime-product-weights-missing", ".bin");
+        const auto cache_path = unique_temp_file("runtime-product-cache", ".tsv");
 
         {
             std::ofstream weights(weight_asset_path, std::ios::binary | std::ios::trunc);
@@ -118,6 +242,8 @@ int main() {
         write_manifest(runtime_manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, false);
         write_manifest(blocked_manifest_path, 1ull << 50u, 4ull * 1024ull * 1024ull * 1024ull, true);
         write_manifest(missing_asset_manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, true, missing_weight_asset_path);
+        write_spatial_manifest(spatial_manifest_path, weight_asset_path);
+        write_matmul_manifest(matmul_manifest_path, weight_asset_path);
 
         const auto manifest = jakal::load_workload_manifest(manifest_path);
         if (!manifest.has_graph || manifest.graph.operations.size() != 2u || manifest.graph.tensors.size() != 4u) {
@@ -135,7 +261,26 @@ int main() {
         options.enable_level_zero_probe = false;
         options.enable_cuda_probe = false;
         options.enable_rocm_probe = false;
+        options.cache_path = cache_path;
         options.product.observability.telemetry_path = unique_temp_file("runtime-product-managed", ".telemetry.tsv");
+
+        jakal::HardwareGraph synthetic_level_zero;
+        synthetic_level_zero.uid = "synthetic:level-zero";
+        synthetic_level_zero.probe = "level-zero";
+        synthetic_level_zero.presentation_name = "Intel Synthetic GPU";
+        synthetic_level_zero.driver_version = "1.2.3";
+        synthetic_level_zero.runtime_version = "1.2.3";
+        synthetic_level_zero.compiler_version = "ocloc-1";
+        const auto level_zero_tag = jakal::runtime_backend_cache_tag_for_graph(synthetic_level_zero);
+        synthetic_level_zero.driver_version = "1.2.4";
+        const auto changed_driver_tag = jakal::runtime_backend_cache_tag_for_graph(synthetic_level_zero);
+        synthetic_level_zero.driver_version = "1.2.3";
+        synthetic_level_zero.compiler_version = "ocloc-2";
+        const auto changed_compiler_tag = jakal::runtime_backend_cache_tag_for_graph(synthetic_level_zero);
+        if (level_zero_tag == changed_driver_tag || level_zero_tag == changed_compiler_tag) {
+            std::cerr << "backend cache tag did not react to version changes\n";
+            return 1;
+        }
 
         jakal::Runtime runtime(options);
         const auto optimized = runtime.optimize(manifest.workload, manifest.graph);
@@ -230,16 +375,96 @@ int main() {
             return 1;
         }
 
+        const auto spatial = runtime.execute_manifest(spatial_manifest_path);
+        if (!spatial.executed) {
+            std::cerr << "spatial manifest did not execute\n";
+            return 1;
+        }
+        if (spatial.asset_prefetch.total_layout_cache_bytes == 0u) {
+            std::cerr << "spatial manifest did not emit layout cache bytes\n";
+            return 1;
+        }
+        const auto has_conv_cache = std::any_of(
+            spatial.asset_prefetch.entries.begin(),
+            spatial.asset_prefetch.entries.end(),
+            [](const jakal::AssetPrefetchEntry& entry) {
+                return entry.derived_cache && entry.materialization_kind == "cpu-conv-patch9";
+            });
+        const auto has_resample_cache = std::any_of(
+            spatial.asset_prefetch.entries.begin(),
+            spatial.asset_prefetch.entries.end(),
+            [](const jakal::AssetPrefetchEntry& entry) {
+                return entry.derived_cache && entry.materialization_kind == "cpu-resample-packed6";
+            });
+        if (!has_conv_cache || !has_resample_cache) {
+            std::cerr << "spatial manifest missing lowered layout cache entries\n";
+            return 1;
+        }
+        const auto persisted_conv_cache = std::find_if(
+            spatial.asset_prefetch.entries.begin(),
+            spatial.asset_prefetch.entries.end(),
+            [](const jakal::AssetPrefetchEntry& entry) {
+                return entry.derived_cache && entry.materialization_kind == "cpu-conv-patch9" &&
+                       entry.path.extension() == ".jpkd" && entry.exists_on_disk;
+            });
+        if (persisted_conv_cache == spatial.asset_prefetch.entries.end() ||
+            !std::filesystem::exists(persisted_conv_cache->path)) {
+            std::cerr << "spatial manifest did not persist conv cache blob\n";
+            return 1;
+        }
+
+        const auto matmul_first = runtime.execute_manifest(matmul_manifest_path);
+        const auto first_blob_it = std::find_if(
+            matmul_first.asset_prefetch.entries.begin(),
+            matmul_first.asset_prefetch.entries.end(),
+            [](const jakal::AssetPrefetchEntry& entry) {
+                return entry.derived_cache && entry.materialization_kind == "cpu-packed-rhs" &&
+                       entry.path.extension() == ".jpkd" && entry.exists_on_disk;
+            });
+        if (first_blob_it == matmul_first.asset_prefetch.entries.end() ||
+            !std::filesystem::exists(first_blob_it->path)) {
+            std::cerr << "matmul manifest did not persist packed rhs blob\n";
+            return 1;
+        }
+        const auto first_blob_time = std::filesystem::last_write_time(first_blob_it->path);
+
+        const auto matmul_second = runtime.execute_manifest(matmul_manifest_path);
+        const auto second_blob_it = std::find_if(
+            matmul_second.asset_prefetch.entries.begin(),
+            matmul_second.asset_prefetch.entries.end(),
+            [](const jakal::AssetPrefetchEntry& entry) {
+                return entry.derived_cache && entry.materialization_kind == "cpu-packed-rhs" &&
+                       entry.path.extension() == ".jpkd" && entry.exists_on_disk;
+            });
+        if (second_blob_it == matmul_second.asset_prefetch.entries.end() ||
+            second_blob_it->path != first_blob_it->path) {
+            std::cerr << "matmul manifest did not reuse packed rhs blob path\n";
+            return 1;
+        }
+        const auto second_blob_time = std::filesystem::last_write_time(second_blob_it->path);
+        if (second_blob_time != first_blob_time) {
+            std::cerr << "matmul manifest rewrote packed rhs blob instead of reusing it\n";
+            return 1;
+        }
+
         std::error_code ec;
         std::filesystem::remove(manifest_path, ec);
         std::filesystem::remove(runtime_manifest_path, ec);
         std::filesystem::remove(blocked_manifest_path, ec);
         std::filesystem::remove(missing_asset_manifest_path, ec);
+        std::filesystem::remove(spatial_manifest_path, ec);
+        std::filesystem::remove(matmul_manifest_path, ec);
         std::filesystem::remove(weight_asset_path, ec);
+        std::filesystem::remove(cache_path, ec);
+        const auto packed_root = cache_path.parent_path() / (cache_path.stem().string() + "-packed-layouts");
+        std::filesystem::remove_all(packed_root, ec);
         std::filesystem::remove(manifest_managed.telemetry_path, ec);
         std::filesystem::remove(runtime_managed.telemetry_path, ec);
         std::filesystem::remove(blocked.telemetry_path, ec);
         std::filesystem::remove(missing_asset.telemetry_path, ec);
+        std::filesystem::remove(spatial.telemetry_path, ec);
+        std::filesystem::remove(matmul_first.telemetry_path, ec);
+        std::filesystem::remove(matmul_second.telemetry_path, ec);
 
         std::cout << "runtime product path ok\n";
         return 0;

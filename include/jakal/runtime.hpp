@@ -115,6 +115,7 @@ struct KernelCoverageReport {
 
 struct AssetPrefetchEntry {
     std::string asset_id;
+    std::string source_asset_id;
     std::filesystem::path path;
     std::string tensor_id;
     std::string device_uid;
@@ -122,11 +123,15 @@ struct AssetPrefetchEntry {
     std::uint64_t bytes = 0;
     std::string queue_hint = "host_io";
     std::string target_residency = "auto";
+    std::string materialization_kind = "raw";
+    std::string backend_hint = "any";
+    std::string backend_cache_tag = "none";
     bool exists_on_disk = false;
     bool preload_required = true;
     bool persistent = true;
     bool host_visible = false;
     bool pin_host_staging = false;
+    bool derived_cache = false;
 };
 
 struct AssetPrefetchReport {
@@ -134,6 +139,7 @@ struct AssetPrefetchReport {
     std::uint64_t total_prefetch_bytes = 0;
     std::uint64_t total_host_io_bytes = 0;
     std::uint64_t total_host_to_device_bytes = 0;
+    std::uint64_t total_layout_cache_bytes = 0;
     bool missing_required_assets = false;
     std::string summary;
 };
@@ -232,6 +238,7 @@ private:
 };
 
 [[nodiscard]] std::string runtime_backend_name_for_graph(const HardwareGraph& graph);
+[[nodiscard]] std::string runtime_backend_cache_tag_for_graph(const HardwareGraph& graph);
 [[nodiscard]] bool runtime_backend_supports_operation(
     const HardwareGraph& graph,
     OperationClass op_class,
