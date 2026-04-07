@@ -68,6 +68,9 @@ struct MemoryPreflightReport {
     std::uint64_t pinned_host_visible_bytes = 0;
     std::uint64_t aggregate_persistent_bytes = 0;
     std::uint64_t aggregate_transient_bytes = 0;
+    std::uint64_t predicted_spill_bytes = 0;
+    std::uint64_t predicted_reload_bytes = 0;
+    std::uint32_t forced_spill_count = 0;
     double peak_pressure_ratio = 0.0;
     bool requires_spill = false;
     bool safe_to_run = true;
@@ -121,12 +124,40 @@ struct AssetPrefetchReport {
     std::string summary;
 };
 
+enum class ResidencyActionKind {
+    prefetch,
+    reload,
+    spill,
+    evict
+};
+
+struct ResidencyAction {
+    ResidencyActionKind kind = ResidencyActionKind::prefetch;
+    std::string tensor_id;
+    std::string device_uid;
+    std::string trigger_operation_name;
+    std::uint32_t operation_index = 0;
+    std::uint64_t bytes = 0;
+    bool persistent = false;
+};
+
+struct ResidencySequenceReport {
+    std::vector<ResidencyAction> actions;
+    std::uint64_t peak_live_bytes = 0;
+    std::uint64_t spill_bytes = 0;
+    std::uint64_t reload_bytes = 0;
+    std::uint32_t forced_spill_count = 0;
+    bool viable_without_spill = true;
+    std::string summary;
+};
+
 struct ManagedExecutionReport {
     DirectExecutionReport execution;
     MemoryPreflightReport memory_preflight;
     StrategySafetyDecision safety;
     KernelCoverageReport kernel_coverage;
     AssetPrefetchReport asset_prefetch;
+    ResidencySequenceReport residency_sequence;
     std::filesystem::path telemetry_path;
     bool executed = false;
 };
@@ -163,6 +194,7 @@ private:
     [[nodiscard]] AssetPrefetchReport build_asset_prefetch(
         const WorkloadManifest& manifest,
         const OptimizationReport& optimization) const;
+    [[nodiscard]] ResidencySequenceReport build_residency_sequence(const OptimizationReport& optimization) const;
     [[nodiscard]] DirectExecutionReport execute_with_feedback(
         const WorkloadSpec& workload,
         const OptimizationReport& optimization,

@@ -7,9 +7,11 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -73,6 +75,7 @@ struct GgufTensorInfo {
     std::uint32_t type = 0;
     std::uint64_t offset = 0;
     std::uint64_t bytes = 0;
+    std::filesystem::path source_path;
 };
 
 struct GgufFileContents {
@@ -81,6 +84,7 @@ struct GgufFileContents {
     std::uint64_t alignment = 32u;
     std::uint64_t data_offset = 0u;
     std::uint64_t total_tensor_bytes = 0u;
+    std::vector<std::filesystem::path> shard_paths;
 };
 
 struct OnnxValueInfo {
@@ -88,6 +92,9 @@ struct OnnxValueInfo {
     std::vector<std::uint64_t> shape;
     std::vector<std::int64_t> int64_data;
     std::string dtype = "f32";
+    std::filesystem::path external_data_path;
+    std::uint64_t external_data_offset = 0u;
+    std::uint64_t external_data_length = 0u;
     bool initializer = false;
     bool persistent = false;
     std::uint64_t bytes = 0;
@@ -1211,6 +1218,24 @@ std::int64_t decode_protobuf_int64(const std::uint64_t value) {
     return std::bit_cast<std::int64_t>(value);
 }
 
+std::pair<std::string, std::string> parse_onnx_string_map_entry(const std::vector<std::uint8_t>& bytes) {
+    std::pair<std::string, std::string> entry;
+    std::size_t offset = 0u;
+    while (offset < bytes.size()) {
+        const auto key = read_protobuf_varint(bytes, offset);
+        const auto field_number = static_cast<std::uint32_t>(key >> 3u);
+        const auto wire_type = static_cast<std::uint32_t>(key & 0x7u);
+        if (field_number == 1u && wire_type == 2u) {
+            entry.first = read_protobuf_string(bytes, offset);
+        } else if (field_number == 2u && wire_type == 2u) {
+            entry.second = read_protobuf_string(bytes, offset);
+        } else {
+            skip_protobuf_field(bytes, offset, wire_type);
+        }
+    }
+    return entry;
+}
+
 std::vector<std::uint8_t> read_protobuf_length_delimited(
     const std::vector<std::uint8_t>& bytes,
     std::size_t& offset) {
@@ -1344,7 +1369,9 @@ OnnxValueInfo parse_onnx_value_info(const std::vector<std::uint8_t>& bytes) {
     return value;
 }
 
-OnnxValueInfo parse_onnx_tensor_proto(const std::vector<std::uint8_t>& bytes) {
+OnnxValueInfo parse_onnx_tensor_proto(
+    const std::vector<std::uint8_t>& bytes,
+    const std::filesystem::path& model_path) {
     OnnxValueInfo value;
     value.initializer = true;
     value.persistent = true;
@@ -1352,6 +1379,7 @@ OnnxValueInfo parse_onnx_tensor_proto(const std::vector<std::uint8_t>& bytes) {
     std::vector<std::uint64_t> dims;
     std::vector<std::uint8_t> raw_data;
     std::uint64_t raw_bytes = 0u;
+    std::uint32_t data_location = 0u;
     while (offset < bytes.size()) {
         const auto key = read_protobuf_varint(bytes, offset);
         const auto field_number = static_cast<std::uint32_t>(key >> 3u);
@@ -1379,11 +1407,43 @@ OnnxValueInfo parse_onnx_tensor_proto(const std::vector<std::uint8_t>& bytes) {
         } else if (field_number == 9u && wire_type == 2u) {
             raw_data = read_protobuf_length_delimited(bytes, offset);
             raw_bytes = static_cast<std::uint64_t>(raw_data.size());
+        } else if (field_number == 13u && wire_type == 2u) {
+            const auto [key_name, key_value] = parse_onnx_string_map_entry(read_protobuf_length_delimited(bytes, offset));
+            if (key_name == "location") {
+                value.external_data_path = model_path.parent_path() / key_value;
+            } else if (key_name == "offset") {
+                value.external_data_offset = parse_u64_string(key_value, 0u);
+            } else if (key_name == "length") {
+                value.external_data_length = parse_u64_string(key_value, 0u);
+            }
+        } else if (field_number == 14u && wire_type == 0u) {
+            data_location = static_cast<std::uint32_t>(read_protobuf_varint(bytes, offset));
         } else {
             skip_protobuf_field(bytes, offset, wire_type);
         }
     }
     value.shape = std::move(dims);
+    if (data_location == 1u && raw_bytes == 0u && !value.external_data_path.empty()) {
+        std::error_code ec;
+        if (std::filesystem::exists(value.external_data_path, ec)) {
+            const auto file_size = static_cast<std::uint64_t>(std::filesystem::file_size(value.external_data_path, ec));
+            raw_bytes = value.external_data_length > 0u
+                            ? value.external_data_length
+                            : (file_size > value.external_data_offset ? file_size - value.external_data_offset : 0u);
+            if ((value.dtype == "i64" || raw_bytes <= (64u * 1024u)) && raw_bytes > 0u) {
+                std::ifstream external_input(value.external_data_path, std::ios::binary);
+                if (external_input.is_open()) {
+                    external_input.seekg(static_cast<std::streamoff>(value.external_data_offset), std::ios::beg);
+                    raw_data.resize(static_cast<std::size_t>(raw_bytes), 0u);
+                    external_input.read(
+                        reinterpret_cast<char*>(raw_data.data()),
+                        static_cast<std::streamsize>(raw_data.size()));
+                    raw_data.resize(static_cast<std::size_t>(external_input.gcount()));
+                    raw_bytes = static_cast<std::uint64_t>(raw_data.size());
+                }
+            }
+        }
+    }
     if (value.dtype == "i64" && value.int64_data.empty() && raw_data.size() >= sizeof(std::int64_t) &&
         raw_data.size() % sizeof(std::int64_t) == 0u) {
         for (std::size_t data_offset = 0u; data_offset < raw_data.size(); data_offset += sizeof(std::int64_t)) {
@@ -1500,7 +1560,9 @@ OnnxNodeInfo parse_onnx_node_proto(const std::vector<std::uint8_t>& bytes) {
     return node;
 }
 
-OnnxGraphInfo parse_onnx_graph_proto(const std::vector<std::uint8_t>& bytes) {
+OnnxGraphInfo parse_onnx_graph_proto(
+    const std::vector<std::uint8_t>& bytes,
+    const std::filesystem::path& model_path) {
     OnnxGraphInfo graph;
     std::size_t offset = 0u;
     while (offset < bytes.size()) {
@@ -1512,7 +1574,7 @@ OnnxGraphInfo parse_onnx_graph_proto(const std::vector<std::uint8_t>& bytes) {
         } else if (field_number == 2u && wire_type == 2u) {
             graph.name = read_protobuf_string(bytes, offset);
         } else if (field_number == 5u && wire_type == 2u) {
-            graph.values.push_back(parse_onnx_tensor_proto(read_protobuf_length_delimited(bytes, offset)));
+            graph.values.push_back(parse_onnx_tensor_proto(read_protobuf_length_delimited(bytes, offset), model_path));
         } else if ((field_number == 11u || field_number == 12u || field_number == 13u) && wire_type == 2u) {
             auto value = parse_onnx_value_info(read_protobuf_length_delimited(bytes, offset));
             if (field_number == 11u) {
@@ -1541,7 +1603,7 @@ OnnxGraphInfo parse_onnx_model(const std::filesystem::path& path) {
         const auto field_number = static_cast<std::uint32_t>(key >> 3u);
         const auto wire_type = static_cast<std::uint32_t>(key & 0x7u);
         if (field_number == 7u && wire_type == 2u) {
-            graph = parse_onnx_graph_proto(read_protobuf_length_delimited(bytes, offset));
+            graph = parse_onnx_graph_proto(read_protobuf_length_delimited(bytes, offset), path);
         } else {
             skip_protobuf_field(bytes, offset, wire_type);
         }

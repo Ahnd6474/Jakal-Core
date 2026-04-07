@@ -4,8 +4,10 @@
 #include <cmath>
 #include <fstream>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace jakal {
@@ -149,6 +151,60 @@ std::uint64_t effective_capacity_bytes(
     }
     const double reserve_ratio = graph.probe == "host" ? policy.host_reserve_ratio : policy.accelerator_reserve_ratio;
     return static_cast<std::uint64_t>(std::max(0.0, static_cast<double>(capacity) * std::max(0.0, 1.0 - reserve_ratio)));
+}
+
+const HardwareGraph* find_graph_by_uid(
+    const std::vector<HardwareGraph>& graphs,
+    const std::string& uid) {
+    const auto it = std::find_if(graphs.begin(), graphs.end(), [&](const HardwareGraph& graph) {
+        return graph.uid == uid;
+    });
+    return it == graphs.end() ? nullptr : &(*it);
+}
+
+std::string backend_name_for_graph(const HardwareGraph& graph) {
+    if (graph.probe == "host") {
+        return "host-direct";
+    }
+    if (graph.probe == "level-zero") {
+        return "level-zero-native";
+    }
+    if (graph.probe == "cuda") {
+        return "cuda-native";
+    }
+    if (graph.probe == "rocm") {
+        return "rocm-native";
+    }
+    if (graph.probe == "vulkan") {
+        return "vulkan-direct";
+    }
+    if (graph.probe == "opencl") {
+        return "opencl-direct";
+    }
+    return graph.probe + "-direct";
+}
+
+bool backend_supports_operation(
+    const HardwareGraph& graph,
+    const OperationClass op_class,
+    std::string* reason = nullptr) {
+    if (graph.probe == "host" || graph.probe == "opencl" || graph.probe == "vulkan" || graph.probe == "cuda" ||
+        graph.probe == "rocm") {
+        return true;
+    }
+    if (graph.probe == "level-zero") {
+        if (op_class == OperationClass::convolution_2d || op_class == OperationClass::resample_2d) {
+            if (reason != nullptr) {
+                *reason = "native kernel missing";
+            }
+            return false;
+        }
+        return true;
+    }
+    if (reason != nullptr) {
+        *reason = "unknown backend kernel coverage";
+    }
+    return false;
 }
 
 }  // namespace
@@ -316,6 +372,13 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
     auto optimization = optimize(effective_workload, workload_graph);
     managed.safety.selected_strategy = optimization.partition_strategy;
     managed.memory_preflight = build_memory_preflight(optimization);
+    managed.kernel_coverage = build_kernel_coverage(optimization);
+    managed.residency_sequence = build_residency_sequence(optimization);
+    managed.memory_preflight.predicted_spill_bytes = managed.residency_sequence.spill_bytes;
+    managed.memory_preflight.predicted_reload_bytes = managed.residency_sequence.reload_bytes;
+    managed.memory_preflight.forced_spill_count = managed.residency_sequence.forced_spill_count;
+    managed.memory_preflight.requires_spill =
+        managed.memory_preflight.requires_spill || managed.residency_sequence.spill_bytes > 0u;
 
     auto force_auto_if_needed = [&](const char* reason) {
         if (optimization.partition_strategy == PartitionStrategy::auto_balanced) {
@@ -329,6 +392,13 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             effective_workload = fallback_workload;
             optimization = std::move(fallback_optimization);
             managed.memory_preflight = std::move(fallback_memory);
+            managed.kernel_coverage = build_kernel_coverage(optimization);
+            managed.residency_sequence = build_residency_sequence(optimization);
+            managed.memory_preflight.predicted_spill_bytes = managed.residency_sequence.spill_bytes;
+            managed.memory_preflight.predicted_reload_bytes = managed.residency_sequence.reload_bytes;
+            managed.memory_preflight.forced_spill_count = managed.residency_sequence.forced_spill_count;
+            managed.memory_preflight.requires_spill =
+                managed.memory_preflight.requires_spill || managed.residency_sequence.spill_bytes > 0u;
             managed.safety.memory_forced_auto = true;
             if (safety_summary.tellp() > 0) {
                 safety_summary << "; ";
@@ -344,6 +414,10 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
 
     if (!managed.memory_preflight.safe_to_run) {
         force_auto_if_needed("memory preflight forced auto");
+    }
+    if (!managed.kernel_coverage.all_supported) {
+        force_auto_if_needed("kernel coverage forced auto");
+        managed.kernel_coverage.forced_auto = managed.safety.memory_forced_auto;
     }
 
     managed.safety.selected_strategy = optimization.partition_strategy;
@@ -408,6 +482,12 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         }
         safety_summary << managed.memory_preflight.summary;
     }
+    if (!managed.residency_sequence.summary.empty()) {
+        if (safety_summary.tellp() > 0) {
+            safety_summary << "; ";
+        }
+        safety_summary << managed.residency_sequence.summary;
+    }
     managed.safety.summary = safety_summary.str();
     persist_telemetry(workload, managed);
     return managed;
@@ -415,7 +495,33 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
 
 ManagedExecutionReport Runtime::execute_manifest(const std::filesystem::path& manifest_path) {
     const auto manifest = load_workload_manifest(manifest_path);
-    return manifest.has_graph ? execute_managed(manifest.workload, manifest.graph) : execute_managed(manifest.workload);
+    ManagedExecutionReport report;
+    report.telemetry_path = telemetry_path();
+    if (!manifest.assets.empty()) {
+        const auto missing_required = std::find_if(
+            manifest.assets.begin(),
+            manifest.assets.end(),
+            [](const WorkloadAsset& asset) {
+                return asset.preload_required && (!asset.path.empty()) && !std::filesystem::exists(asset.path);
+            });
+        if (missing_required != manifest.assets.end()) {
+            report.asset_prefetch.missing_required_assets = true;
+            report.safety.summary = "required asset missing: " + missing_required->id;
+            persist_telemetry(manifest.workload, report);
+            return report;
+        }
+    }
+
+    report = manifest.has_graph ? execute_managed(manifest.workload, manifest.graph) : execute_managed(manifest.workload);
+    if (manifest.has_graph) {
+        report.asset_prefetch = build_asset_prefetch(manifest, report.execution.optimization);
+        if (report.asset_prefetch.missing_required_assets && report.executed) {
+            report.executed = false;
+            report.safety.summary += report.safety.summary.empty() ? "" : "; ";
+            report.safety.summary += report.asset_prefetch.summary;
+        }
+    }
+    return report;
 }
 
 std::filesystem::path Runtime::telemetry_path() const {
@@ -574,6 +680,285 @@ MemoryPreflightReport Runtime::build_memory_preflight(const OptimizationReport& 
     return report;
 }
 
+ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationReport& optimization) const {
+    struct SequencedTensor {
+        std::string tensor_id;
+        std::string device_uid;
+        std::uint64_t bytes = 0;
+        std::uint32_t first = 0;
+        std::uint32_t last = 0;
+        bool persistent = false;
+    };
+
+    ResidencySequenceReport report;
+    if (optimization.workload_graph.operations.empty()) {
+        return report;
+    }
+
+    std::unordered_map<std::string, TensorLifetime> lifetimes_by_id;
+    lifetimes_by_id.reserve(optimization.workload_graph.lifetimes.size());
+    for (const auto& lifetime : optimization.workload_graph.lifetimes) {
+        lifetimes_by_id.emplace(lifetime.tensor_id, lifetime);
+    }
+
+    std::unordered_map<std::string, std::vector<SequencedTensor>> tensors_by_device;
+    for (const auto& optimized : optimization.operations) {
+        for (const auto& entry : optimized.graph.residency_plan) {
+            auto& device_tensors = tensors_by_device[entry.device_uid];
+            const auto duplicate = std::find_if(
+                device_tensors.begin(),
+                device_tensors.end(),
+                [&](const SequencedTensor& tensor) {
+                    return tensor.tensor_id == entry.tensor_id;
+                });
+            const auto lifetime_it = lifetimes_by_id.find(entry.tensor_id);
+            const auto first = lifetime_it == lifetimes_by_id.end() ? 0u : lifetime_it->second.first_operation_index;
+            const auto last = lifetime_it == lifetimes_by_id.end()
+                                  ? static_cast<std::uint32_t>(optimization.workload_graph.operations.size() - 1u)
+                                  : lifetime_it->second.last_operation_index;
+            if (duplicate == device_tensors.end()) {
+                device_tensors.push_back(SequencedTensor{
+                    entry.tensor_id,
+                    entry.device_uid,
+                    entry.bytes,
+                    first,
+                    last,
+                    entry.persistent});
+            } else {
+                duplicate->bytes = std::max(duplicate->bytes, entry.bytes);
+                duplicate->first = std::min(duplicate->first, first);
+                duplicate->last = std::max(duplicate->last, last);
+                duplicate->persistent = duplicate->persistent || entry.persistent;
+            }
+        }
+    }
+
+    std::ostringstream summary;
+    for (const auto& [device_uid, tensors] : tensors_by_device) {
+        const auto* graph = find_graph_by_uid(devices_, device_uid);
+        const auto effective_capacity =
+            graph == nullptr ? 0u : effective_capacity_bytes(*graph, options_.product.memory);
+        const auto safe_capacity = static_cast<std::uint64_t>(
+            static_cast<double>(effective_capacity) * options_.product.memory.max_pressure_ratio);
+
+        std::unordered_map<std::string, SequencedTensor> live_tensors;
+        std::unordered_set<std::string> spilled_tensors;
+        std::uint64_t live_bytes = 0u;
+
+        for (std::uint32_t operation_index = 0u;
+             operation_index < optimization.workload_graph.operations.size();
+             ++operation_index) {
+            const auto& operation = optimization.workload_graph.operations[operation_index];
+            std::set<std::string> current_needed;
+            current_needed.insert(operation.input_tensor_ids.begin(), operation.input_tensor_ids.end());
+            current_needed.insert(operation.output_tensor_ids.begin(), operation.output_tensor_ids.end());
+            current_needed.insert(operation.temporary_tensor_ids.begin(), operation.temporary_tensor_ids.end());
+
+            for (const auto& tensor : tensors) {
+                if (tensor.first > operation_index || tensor.last < operation_index) {
+                    continue;
+                }
+                if (live_tensors.find(tensor.tensor_id) != live_tensors.end()) {
+                    continue;
+                }
+                const bool spilled = spilled_tensors.find(tensor.tensor_id) != spilled_tensors.end();
+                const bool needed_now = current_needed.find(tensor.tensor_id) != current_needed.end() ||
+                                        tensor.first == operation_index || tensor.persistent;
+                if (!needed_now) {
+                    continue;
+                }
+                report.actions.push_back(ResidencyAction{
+                    spilled ? ResidencyActionKind::reload : ResidencyActionKind::prefetch,
+                    tensor.tensor_id,
+                    device_uid,
+                    operation.name,
+                    operation_index,
+                    tensor.bytes,
+                    tensor.persistent});
+                live_tensors.emplace(tensor.tensor_id, tensor);
+                live_bytes += tensor.bytes;
+                if (spilled) {
+                    report.reload_bytes += tensor.bytes;
+                    spilled_tensors.erase(tensor.tensor_id);
+                }
+            }
+
+            report.peak_live_bytes = std::max(report.peak_live_bytes, live_bytes);
+            while (safe_capacity > 0u && live_bytes > safe_capacity) {
+                auto candidate_it = live_tensors.end();
+                for (auto it = live_tensors.begin(); it != live_tensors.end(); ++it) {
+                    if (it->second.persistent || current_needed.find(it->first) != current_needed.end()) {
+                        continue;
+                    }
+                    if (candidate_it == live_tensors.end() || it->second.last > candidate_it->second.last) {
+                        candidate_it = it;
+                    }
+                }
+                if (candidate_it == live_tensors.end()) {
+                    ++report.forced_spill_count;
+                    report.viable_without_spill = false;
+                    break;
+                }
+                report.actions.push_back(ResidencyAction{
+                    ResidencyActionKind::spill,
+                    candidate_it->second.tensor_id,
+                    device_uid,
+                    operation.name,
+                    operation_index,
+                    candidate_it->second.bytes,
+                    candidate_it->second.persistent});
+                report.spill_bytes += candidate_it->second.bytes;
+                live_bytes -= candidate_it->second.bytes;
+                spilled_tensors.insert(candidate_it->second.tensor_id);
+                live_tensors.erase(candidate_it);
+            }
+
+            for (auto it = live_tensors.begin(); it != live_tensors.end();) {
+                if (!it->second.persistent && it->second.last == operation_index) {
+                    report.actions.push_back(ResidencyAction{
+                        ResidencyActionKind::evict,
+                        it->second.tensor_id,
+                        device_uid,
+                        operation.name,
+                        operation_index,
+                        it->second.bytes,
+                        false});
+                    live_bytes -= it->second.bytes;
+                    it = live_tensors.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        if (report.forced_spill_count > 0u) {
+            if (summary.tellp() > 0) {
+                summary << "; ";
+            }
+            summary << device_uid << " forced_spills=" << report.forced_spill_count;
+        }
+    }
+
+    if (report.spill_bytes > 0u && summary.tellp() == 0) {
+        summary << "spill=" << report.spill_bytes << " reload=" << report.reload_bytes;
+    }
+    report.summary = summary.str();
+    return report;
+}
+
+KernelCoverageReport Runtime::build_kernel_coverage(const OptimizationReport& optimization) const {
+    KernelCoverageReport report;
+    std::ostringstream summary;
+    for (const auto& optimized : optimization.operations) {
+        const auto* graph = find_graph_by_uid(devices_, optimized.config.primary_device_uid);
+        if (graph == nullptr) {
+            continue;
+        }
+        std::string reason;
+        if (!backend_supports_operation(*graph, optimized.operation.op_class, &reason)) {
+            report.all_supported = false;
+            report.issues.push_back(KernelCoverageIssue{
+                optimized.operation.name,
+                graph->uid,
+                backend_name_for_graph(*graph),
+                optimized.operation.op_class,
+                false,
+                reason});
+            if (summary.tellp() > 0) {
+                summary << "; ";
+            }
+            summary << optimized.operation.name << '@' << graph->probe << ": " << reason;
+        }
+    }
+    report.summary = summary.str();
+    return report;
+}
+
+AssetPrefetchReport Runtime::build_asset_prefetch(
+    const WorkloadManifest& manifest,
+    const OptimizationReport& optimization) const {
+    AssetPrefetchReport report;
+    if (manifest.assets.empty()) {
+        return report;
+    }
+
+    std::unordered_map<std::string, std::vector<std::string>> tensor_devices;
+    for (const auto& optimized : optimization.operations) {
+        for (const auto& entry : optimized.graph.residency_plan) {
+            if (!entry.persistent) {
+                continue;
+            }
+            auto& devices = tensor_devices[entry.tensor_id];
+            if (std::find(devices.begin(), devices.end(), entry.device_uid) == devices.end()) {
+                devices.push_back(entry.device_uid);
+            }
+        }
+    }
+
+    std::ostringstream summary;
+    for (const auto& asset : manifest.assets) {
+        const bool exists = asset.path.empty() ? false : std::filesystem::exists(asset.path);
+        if (asset.preload_required && !exists) {
+            report.missing_required_assets = true;
+            if (summary.tellp() > 0) {
+                summary << "; ";
+            }
+            summary << "missing asset " << asset.id;
+        }
+        if (asset.tensor_ids.empty()) {
+            report.entries.push_back(AssetPrefetchEntry{
+                asset.id,
+                asset.path,
+                std::string(),
+                std::string(),
+                asset.bytes,
+                exists,
+                asset.preload_required,
+                asset.persistent,
+                asset.host_visible});
+            report.total_prefetch_bytes += asset.bytes;
+            continue;
+        }
+        const auto per_tensor_bytes = asset.bytes == 0u
+                                          ? 0u
+                                          : std::max<std::uint64_t>(
+                                                1u,
+                                                asset.bytes / static_cast<std::uint64_t>(asset.tensor_ids.size()));
+        for (const auto& tensor_id : asset.tensor_ids) {
+            const auto devices_it = tensor_devices.find(tensor_id);
+            if (devices_it == tensor_devices.end() || devices_it->second.empty()) {
+                report.entries.push_back(AssetPrefetchEntry{
+                    asset.id,
+                    asset.path,
+                    tensor_id,
+                    std::string(),
+                    per_tensor_bytes,
+                    exists,
+                    asset.preload_required,
+                    asset.persistent,
+                    asset.host_visible});
+                report.total_prefetch_bytes += per_tensor_bytes;
+                continue;
+            }
+            for (const auto& device_uid : devices_it->second) {
+                report.entries.push_back(AssetPrefetchEntry{
+                    asset.id,
+                    asset.path,
+                    tensor_id,
+                    device_uid,
+                    per_tensor_bytes,
+                    exists,
+                    asset.preload_required,
+                    asset.persistent,
+                    asset.host_visible});
+                report.total_prefetch_bytes += per_tensor_bytes;
+            }
+        }
+    }
+    report.summary = summary.str();
+    return report;
+}
+
 void Runtime::persist_telemetry(
     const WorkloadSpec& workload,
     const ManagedExecutionReport& report) const {
@@ -595,7 +980,7 @@ void Runtime::persist_telemetry(
     }
 
     if (write_header) {
-        output << "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\ttotal_runtime_us\tspeedup_vs_reference\tsummary\n";
+        output << "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\ttotal_runtime_us\tspeedup_vs_reference\tsummary\n";
     }
 
     output << execution_epoch_ << '\t'
@@ -612,6 +997,9 @@ void Runtime::persist_telemetry(
            << (report.safety.rolled_back_to_auto ? 1 : 0) << '\t'
            << (report.safety.blacklisted_before_run ? 1 : 0) << '\t'
            << report.memory_preflight.peak_pressure_ratio << '\t'
+           << report.residency_sequence.spill_bytes << '\t'
+           << report.residency_sequence.reload_bytes << '\t'
+           << report.residency_sequence.forced_spill_count << '\t'
            << (report.executed ? report.execution.total_runtime_us : 0.0) << '\t'
            << (report.executed ? report.execution.speedup_vs_reference : 0.0) << '\t'
            << report.safety.summary << '\n';

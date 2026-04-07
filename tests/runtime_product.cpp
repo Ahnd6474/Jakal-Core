@@ -18,7 +18,8 @@ void write_manifest(
     const std::filesystem::path& path,
     const std::uint64_t working_set_bytes,
     const std::uint64_t tensor_bytes,
-    const bool include_graph = true) {
+    const bool include_graph = true,
+    const std::filesystem::path& weight_asset_path = {}) {
     std::ofstream output(path, std::ios::trunc);
     output << "[workload]\n";
     output << "name=manifest-exec\n";
@@ -32,6 +33,16 @@ void write_manifest(
     output << "latency_sensitive=true\n";
     output << "prefer_unified_memory=true\n";
     output << "matrix_friendly=false\n\n";
+
+    if (!weight_asset_path.empty()) {
+        output << "[asset]\n";
+        output << "id=weights-shard\n";
+        output << "path=" << weight_asset_path.string() << "\n";
+        output << "tensor_ids=weights\n";
+        output << "preload_required=true\n";
+        output << "persistent=true\n";
+        output << "host_visible=true\n\n";
+    }
 
     if (!include_graph) {
         return;
@@ -93,14 +104,28 @@ int main() {
         const auto manifest_path = unique_temp_file("runtime-product-graph", ".workload");
         const auto runtime_manifest_path = unique_temp_file("runtime-product-runtime", ".workload");
         const auto blocked_manifest_path = unique_temp_file("runtime-product-blocked", ".workload");
+        const auto missing_asset_manifest_path = unique_temp_file("runtime-product-missing-asset", ".workload");
+        const auto weight_asset_path = unique_temp_file("runtime-product-weights", ".bin");
+        const auto missing_weight_asset_path = unique_temp_file("runtime-product-weights-missing", ".bin");
 
-        write_manifest(manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, true);
+        {
+            std::ofstream weights(weight_asset_path, std::ios::binary | std::ios::trunc);
+            std::string payload(16ull * 1024ull, '\x5a');
+            weights.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        }
+
+        write_manifest(manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, true, weight_asset_path);
         write_manifest(runtime_manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, false);
         write_manifest(blocked_manifest_path, 1ull << 50u, 16ull * 1024ull, false);
+        write_manifest(missing_asset_manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, true, missing_weight_asset_path);
 
         const auto manifest = jakal::load_workload_manifest(manifest_path);
         if (!manifest.has_graph || manifest.graph.operations.size() != 2u || manifest.graph.tensors.size() != 4u) {
             std::cerr << "manifest graph parsing failed\n";
+            return 1;
+        }
+        if (manifest.assets.size() != 1u || manifest.assets.front().bytes != 16ull * 1024ull) {
+            std::cerr << "manifest asset parsing failed\n";
             return 1;
         }
 
@@ -125,6 +150,14 @@ int main() {
         }
         if (manifest_managed.execution.optimization.operations.size() != manifest.graph.operations.size()) {
             std::cerr << "managed execute optimized unexpected custom graph operation count\n";
+            return 1;
+        }
+        if (manifest_managed.asset_prefetch.entries.empty() || manifest_managed.asset_prefetch.total_prefetch_bytes != 16ull * 1024ull) {
+            std::cerr << "managed execute did not produce asset prefetch plan\n";
+            return 1;
+        }
+        if (!manifest_managed.kernel_coverage.all_supported) {
+            std::cerr << "host-only managed path should have full kernel coverage\n";
             return 1;
         }
 
@@ -157,13 +190,22 @@ int main() {
             return 1;
         }
 
+        const auto missing_asset = runtime.execute_manifest(missing_asset_manifest_path);
+        if (missing_asset.executed || !missing_asset.asset_prefetch.missing_required_assets) {
+            std::cerr << "missing required asset was not blocked\n";
+            return 1;
+        }
+
         std::error_code ec;
         std::filesystem::remove(manifest_path, ec);
         std::filesystem::remove(runtime_manifest_path, ec);
         std::filesystem::remove(blocked_manifest_path, ec);
+        std::filesystem::remove(missing_asset_manifest_path, ec);
+        std::filesystem::remove(weight_asset_path, ec);
         std::filesystem::remove(manifest_managed.telemetry_path, ec);
         std::filesystem::remove(runtime_managed.telemetry_path, ec);
         std::filesystem::remove(blocked.telemetry_path, ec);
+        std::filesystem::remove(missing_asset.telemetry_path, ec);
 
         std::cout << "runtime product path ok\n";
         return 0;
