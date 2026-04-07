@@ -204,6 +204,17 @@ int main() {
     const auto executed = runtime.execute(workload);
     if (executed.operations.empty() || !executed.all_succeeded) {
         std::cerr << "Direct execution failed.\n";
+        for (const auto& operation : executed.operations) {
+            std::cerr << "  op=" << operation.operation_name
+                      << " backend=" << operation.backend_name
+                      << " requested=" << operation.requested_gpu_backend
+                      << " verified=" << operation.verified
+                      << " error=" << operation.relative_error;
+            if (!operation.backend_error.empty()) {
+                std::cerr << " backend_error=" << operation.backend_error;
+            }
+            std::cerr << '\n';
+        }
         return 1;
     }
 

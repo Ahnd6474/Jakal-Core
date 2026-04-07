@@ -1,6 +1,7 @@
 #include "jakal/device.hpp"
 #include "jakal/executor.hpp"
 #include "jakal/jakal_toolkit.hpp"
+#include "jakal/operation_variant_registry.hpp"
 #include "jakal/runtime.hpp"
 #include "jakal/workloads.hpp"
 
@@ -262,6 +263,110 @@ bool verify_gpu_direct_variants() {
     return true;
 }
 
+bool verify_operation_variant_registry() {
+    const auto has_variant = [](const std::vector<jakal::OperationVariantSpec>& variants, const std::string& id) {
+        return std::any_of(variants.begin(), variants.end(), [&](const jakal::OperationVariantSpec& spec) {
+            return spec.id == id;
+        });
+    };
+
+    jakal::WorkloadSpec workload{
+        "registry-check",
+        jakal::WorkloadKind::tensor,
+        "",
+        256ull * 1024ull * 1024ull,
+        64ull * 1024ull * 1024ull,
+        8.0e11,
+        8,
+        false,
+        false,
+        true};
+    auto latency_workload = workload;
+    latency_workload.name = "registry-check-latency";
+    latency_workload.latency_sensitive = true;
+
+    jakal::OperationSpec matmul;
+    matmul.name = "registry-matmul";
+    matmul.op_class = jakal::OperationClass::matmul;
+    matmul.extents = {1024, 1024, 1024};
+    matmul.parallelizable = true;
+    matmul.streaming_friendly = false;
+    matmul.matrix_friendly = true;
+    matmul.max_relative_error = 1.0e-3;
+
+    const jakal::OperationVariantRequest matmul_request{
+        workload,
+        matmul,
+        3u,
+        2u,
+        false,
+        false,
+        true,
+        true,
+        true};
+    const auto matmul_variants = jakal::OperationVariantRegistry::builtin().resolve(matmul_request);
+
+    jakal::OperationSpec conv = matmul;
+    conv.name = "registry-conv";
+    conv.op_class = jakal::OperationClass::convolution_2d;
+    conv.extents = {128, 128};
+    conv.matrix_friendly = false;
+    const jakal::OperationVariantRequest conv_request{
+        workload,
+        conv,
+        3u,
+        2u,
+        false,
+        false,
+        true,
+        true,
+        true};
+    const auto conv_variants = jakal::OperationVariantRegistry::builtin().resolve(conv_request);
+
+    jakal::OperationSpec reduction = matmul;
+    reduction.name = "registry-reduction";
+    reduction.op_class = jakal::OperationClass::reduction;
+    reduction.extents = {4096};
+    reduction.streaming_friendly = false;
+    reduction.matrix_friendly = false;
+    const jakal::OperationVariantRequest reduction_request{
+        workload,
+        reduction,
+        3u,
+        2u,
+        false,
+        false,
+        true,
+        true,
+        true};
+    const auto reduction_variants = jakal::OperationVariantRegistry::builtin().resolve(reduction_request);
+    const jakal::OperationVariantRequest reduction_latency_request{
+        latency_workload,
+        reduction,
+        3u,
+        2u,
+        false,
+        false,
+        true,
+        true,
+        true};
+    const auto reduction_latency_variants = jakal::OperationVariantRegistry::builtin().resolve(reduction_latency_request);
+
+    return has_variant(matmul_variants, "single-device-balanced") &&
+           has_variant(matmul_variants, "throughput-overlap") &&
+           has_variant(matmul_variants, "low-precision-overlap") &&
+           has_variant(matmul_variants, "placement-sharded") &&
+           has_variant(matmul_variants, "accelerator-ddp") &&
+           has_variant(conv_variants, "single-device-balanced") &&
+           has_variant(conv_variants, "throughput-overlap") &&
+           has_variant(conv_variants, "low-precision-overlap") &&
+           has_variant(conv_variants, "accelerator-ddp") &&
+           has_variant(reduction_variants, "single-device-balanced") &&
+           has_variant(reduction_variants, "throughput-overlap") &&
+           has_variant(reduction_variants, "placement-sharded") &&
+           has_variant(reduction_latency_variants, "single-device-latency");
+}
+
 }  // namespace
 
 int main() {
@@ -331,6 +436,10 @@ int main() {
             std::cerr << "Execution config missing identifiers for " << result.operation.name << ".\n";
             return 1;
         }
+        if (result.config.variant_id.empty()) {
+            std::cerr << "Execution config missing variant id for " << result.operation.name << ".\n";
+            return 1;
+        }
         if (result.config.logical_partitions == 0) {
             std::cerr << "Execution config missing logical partitions for " << result.operation.name << ".\n";
             return 1;
@@ -393,6 +502,10 @@ int main() {
     }
     if (!verify_gpu_direct_variants()) {
         std::cerr << "GPU direct variant execution check failed.\n";
+        return 1;
+    }
+    if (!verify_operation_variant_registry()) {
+        std::cerr << "Operation variant registry check failed.\n";
         return 1;
     }
 

@@ -1,6 +1,7 @@
 #include "jakal/execution.hpp"
 
 #include "jakal/device.hpp"
+#include "jakal/operation_variant_registry.hpp"
 
 #include <algorithm>
 #include <array>
@@ -659,6 +660,7 @@ std::string build_config_signature(const std::string& report_signature, const Ex
     std::ostringstream stream;
     stream << report_signature << '|'
            << config.operation_name << '|'
+           << config.variant_id << '|'
            << to_string(config.strategy) << '|'
            << config.primary_device_uid << '|'
            << join_csv(config.participating_devices) << '|'
@@ -1168,6 +1170,10 @@ double auto_accelerator_data_parallel_bias_us(
         bias_us += operation.op_class == OperationClass::matmul ? 900.0 : 500.0;
     }
 
+    if (config.variant_id.find("accelerator-ddp") != std::string::npos && full_accelerator_set) {
+        bias_us -= operation.op_class == OperationClass::matmul ? 2200.0 : 1400.0;
+    }
+
     if (!accelerator_only) {
         bias_us += operation.op_class == OperationClass::matmul ? 2200.0 : 1400.0;
     }
@@ -1185,16 +1191,151 @@ std::vector<ExecutionConfig> build_candidate_configs(
     const SystemProfile& system,
     const ContinuousExecutionState* continuous_state,
     const std::string& report_signature) {
+    struct WeightedStrategy {
+        ExecutionStrategy strategy = ExecutionStrategy::single_device;
+        double weight = -1.0;
+    };
+
+    auto rank_activation_strategies = [&](const bool allow_sharded) {
+        std::vector<WeightedStrategy> ranked;
+        if (continuous_state == nullptr) {
+            return ranked;
+        }
+
+        const auto strategy_weights = strategy_soft_weights(*continuous_state);
+        ranked = {
+            {ExecutionStrategy::single_device, strategy_weights[0]},
+            {ExecutionStrategy::sharded, allow_sharded ? strategy_weights[1] : -1.0},
+            {ExecutionStrategy::streaming, operation.streaming_friendly ? strategy_weights[2] : -1.0},
+            {ExecutionStrategy::overlapped, strategy_weights[3]}};
+        std::sort(ranked.begin(), ranked.end(), [](const WeightedStrategy& left, const WeightedStrategy& right) {
+            return left.weight > right.weight;
+        });
+        return ranked;
+    };
+
+    auto ordered_allocations_for_operation = [&]() {
+        std::vector<std::reference_wrapper<const PlanAllocation>> ordered_allocations;
+        ordered_allocations.reserve(placement.allocations.size());
+        for (const auto& allocation : placement.allocations) {
+            ordered_allocations.emplace_back(allocation);
+        }
+        std::stable_sort(
+            ordered_allocations.begin(),
+            ordered_allocations.end(),
+            [&](const std::reference_wrapper<const PlanAllocation>& left,
+                const std::reference_wrapper<const PlanAllocation>& right) {
+                const auto* left_graph = find_graph(graph_lookup, left.get().device.uid);
+                const auto* right_graph = find_graph(graph_lookup, right.get().device.uid);
+                const bool left_host = is_host_graph(left_graph);
+                const bool right_host = is_host_graph(right_graph);
+                if (should_prefer_host_for_llm_operation(workload, operation) && left_host != right_host) {
+                    return left_host;
+                }
+                if (should_prefer_gpu_for_llm_operation(workload, operation) && left_host != right_host) {
+                    return !left_host;
+                }
+                return left.get().score > right.get().score;
+            });
+        return ordered_allocations;
+    };
+
+    const bool activation_driven = continuous_state != nullptr;
+    const auto ordered_allocations = ordered_allocations_for_operation();
+    const auto accelerators = accelerator_device_uids(placement, graph_lookup);
+    const bool auto_accelerator_ddp =
+        should_auto_accelerator_data_parallel(workload, operation, placement, graph_lookup);
+    const bool allow_placement_sharding =
+        operation.parallelizable &&
+        placement.allocations.size() > 1u &&
+        !workload.latency_sensitive &&
+        !(system.low_spec_mode && system.paging_risk > 0.25) &&
+        !auto_accelerator_ddp;
+
+    auto variant_allowed_by_activation = [&](const OperationVariantSpec& spec, const std::vector<WeightedStrategy>& ranked) {
+        if (spec.scope == OperationVariantScope::accelerator_sharded && auto_accelerator_ddp) {
+            return true;
+        }
+        if (continuous_state == nullptr) {
+            return true;
+        }
+
+        const std::size_t max_ranked_strategies =
+            (system.low_spec_mode || workload.latency_sensitive) ? 1u : 2u;
+        std::size_t accepted = 0;
+        for (const auto& entry : ranked) {
+            if (entry.weight < 0.0) {
+                continue;
+            }
+            if (entry.strategy == spec.strategy) {
+                return accepted < max_ranked_strategies;
+            }
+            ++accepted;
+            if (accepted >= max_ranked_strategies) {
+                break;
+            }
+        }
+        return false;
+    };
+
+    auto supports_variant_on_graph = [&](const OperationVariantSpec& spec, const HardwareGraphSummary& summary) {
+        if (spec.use_low_precision && !supports_low_precision(summary)) {
+            return false;
+        }
+        if (spec.strategy == ExecutionStrategy::streaming &&
+            !(summary.supports_asynchronous_dispatch || system.low_spec_mode)) {
+            return false;
+        }
+        return true;
+    };
+
+    auto apply_variant_to_config =
+        [&](const OperationVariantSpec& spec, const HardwareGraphSummary& summary, ExecutionConfig& config) {
+            config.variant_id = spec.id;
+            config.strategy = spec.strategy;
+            config.overlap_transfers = spec.overlap_transfers;
+            config.use_low_precision = spec.use_low_precision;
+
+            if (spec.forced_queue_depth.has_value()) {
+                config.queue_depth = *spec.forced_queue_depth;
+            } else {
+                config.queue_depth = std::max(config.queue_depth, spec.min_queue_depth);
+            }
+
+            if (spec.forced_stages.has_value()) {
+                config.stages = *spec.forced_stages;
+            } else {
+                config.stages = std::max(config.stages, spec.min_stages);
+            }
+
+            if (spec.forced_logical_partitions.has_value()) {
+                config.logical_partitions = *spec.forced_logical_partitions;
+            } else {
+                config.logical_partitions = std::max(config.logical_partitions, 1u);
+            }
+
+            if (config.strategy == ExecutionStrategy::overlapped && !summary.supports_asynchronous_dispatch) {
+                config.strategy = ExecutionStrategy::single_device;
+                config.overlap_transfers = false;
+            }
+
+            if (config.strategy != ExecutionStrategy::sharded) {
+                config.participating_devices = {config.primary_device_uid};
+            }
+        };
+
     std::vector<ExecutionConfig> candidates;
     if (placement.allocations.empty()) {
         return candidates;
     }
-
-    const bool activation_driven = continuous_state != nullptr;
+    const auto ranked_strategies = rank_activation_strategies(allow_placement_sharding || auto_accelerator_ddp);
 
     auto add_candidate = [&](ExecutionConfig config) {
         config.operation_name = operation.name;
         config.target_error_tolerance = operation.max_relative_error;
+        if (config.variant_id.empty()) {
+            config.variant_id = "legacy";
+        }
         if (const auto* graph = find_graph(graph_lookup, config.primary_device_uid)) {
             const auto summary = summarize_graph(*graph);
             if (config.tile_x == 0 || config.tile_y == 0 || config.tile_k == 0) {
@@ -1224,197 +1365,91 @@ std::vector<ExecutionConfig> build_candidate_configs(
         }
     };
 
-    const auto* primary_graph = find_graph(graph_lookup, placement.allocations.front().device.uid);
-    const auto primary_summary =
-        primary_graph == nullptr ? HardwareGraphSummary{} : summarize_graph(*primary_graph);
-    const auto accelerators = accelerator_device_uids(placement, graph_lookup);
-    const bool auto_accelerator_ddp =
-        should_auto_accelerator_data_parallel(workload, operation, placement, graph_lookup);
+    const OperationVariantRequest request{
+        workload,
+        operation,
+        placement.allocations.size(),
+        accelerators.size(),
+        system.low_spec_mode,
+        activation_driven,
+        operation.max_relative_error >= 4.0e-4,
+        allow_placement_sharding,
+        auto_accelerator_ddp};
 
-    if (auto_accelerator_ddp) {
-        ExecutionConfig sharded_gpu;
-        sharded_gpu.strategy = ExecutionStrategy::sharded;
-        sharded_gpu.primary_device_uid = accelerators.front();
-        sharded_gpu.participating_devices = accelerators;
-        sharded_gpu.overlap_transfers = true;
-        sharded_gpu.queue_depth = std::max(2u, choose_queue_depth(primary_summary));
-        sharded_gpu.stages = std::max(2u, primary_summary.supports_asynchronous_dispatch ? 2u : 1u);
-        sharded_gpu.logical_partitions = 1u;
-        add_candidate(sharded_gpu);
-    }
+    for (const auto& variant : OperationVariantRegistry::builtin().resolve(request)) {
+        if (!variant_allowed_by_activation(variant, ranked_strategies)) {
+            continue;
+        }
 
-    if (activation_driven) {
-        const auto strategy_weights = strategy_soft_weights(*continuous_state);
-        const bool sharded_feasible =
-            operation.parallelizable &&
-            (auto_accelerator_ddp || placement.allocations.size() > 1) &&
-            !workload.latency_sensitive &&
-            !(system.low_spec_mode && system.paging_risk > 0.25);
-        const bool streaming_feasible = operation.streaming_friendly;
-        const bool overlapped_feasible = true;
-
-        struct WeightedStrategy {
-            ExecutionStrategy strategy;
-            double weight;
-        };
-        std::vector<WeightedStrategy> ranked{
-            {ExecutionStrategy::single_device, strategy_weights[0]},
-            {ExecutionStrategy::sharded, sharded_feasible ? strategy_weights[1] : -1.0},
-            {ExecutionStrategy::streaming, streaming_feasible ? strategy_weights[2] : -1.0},
-            {ExecutionStrategy::overlapped, overlapped_feasible ? strategy_weights[3] : -1.0}};
-        std::sort(ranked.begin(), ranked.end(), [](const WeightedStrategy& left, const WeightedStrategy& right) {
-            return left.weight > right.weight;
-        });
-
-        const auto apply_strategy = [&](ExecutionConfig& config, const ExecutionStrategy strategy) {
-            config.strategy = strategy;
-            if (strategy == ExecutionStrategy::sharded) {
-                config.primary_device_uid = placement.allocations.front().device.uid;
-                config.participating_devices.clear();
-                for (const auto& allocation : placement.allocations) {
-                    config.participating_devices.push_back(allocation.device.uid);
+        if (variant.scope == OperationVariantScope::per_allocation) {
+            const std::size_t max_devices =
+                activation_driven ? ((system.low_spec_mode || workload.latency_sensitive) ? 1u : 2u) : ordered_allocations.size();
+            std::size_t added_devices = 0;
+            for (const auto& allocation_ref : ordered_allocations) {
+                const auto& allocation = allocation_ref.get();
+                const auto* graph = find_graph(graph_lookup, allocation.device.uid);
+                if (graph == nullptr) {
+                    continue;
                 }
-                config.overlap_transfers = true;
-            } else {
-                config.participating_devices = {config.primary_device_uid};
-                config.overlap_transfers =
-                    strategy == ExecutionStrategy::streaming || strategy == ExecutionStrategy::overlapped;
-            }
-        };
 
-        const std::size_t max_ranked_strategies =
-            (system.low_spec_mode || workload.latency_sensitive) ? 1u : 2u;
-        for (std::size_t rank = 0; rank < ranked.size() && rank < max_ranked_strategies; ++rank) {
-            if (ranked[rank].weight < 0.0) {
-                continue;
-            }
-            if (ranked[rank].strategy == ExecutionStrategy::sharded) {
+                const auto summary = summarize_graph(*graph);
+                if (!supports_variant_on_graph(variant, summary)) {
+                    continue;
+                }
+
                 ExecutionConfig config;
-                config.primary_device_uid = auto_accelerator_ddp ? accelerators.front() : placement.allocations.front().device.uid;
-                config.queue_depth = choose_queue_depth(primary_summary);
-                config.stages = primary_summary.supports_asynchronous_dispatch ? 2u : 1u;
+                config.primary_device_uid = allocation.device.uid;
+                config.participating_devices = {allocation.device.uid};
+                config.queue_depth = choose_queue_depth(summary);
+                config.stages = summary.supports_asynchronous_dispatch ? 2u : 1u;
+                config.logical_partitions = 1u;
                 if (system.low_spec_mode) {
                     config.queue_depth = std::min(config.queue_depth, 2u);
                     config.stages = 1u;
                 }
-                apply_strategy(config, ranked[rank].strategy);
-                apply_auto_accelerator_data_parallel_policy(workload, operation, placement, graph_lookup, config);
+
+                apply_variant_to_config(variant, summary, config);
                 add_candidate(config);
-            } else {
-                std::size_t added_devices = 0;
-                for (const auto& allocation : placement.allocations) {
-                    const auto* graph = find_graph(graph_lookup, allocation.device.uid);
-                    if (graph == nullptr) {
-                        continue;
-                    }
-                    const auto summary = summarize_graph(*graph);
-                    ExecutionConfig config;
-                    config.primary_device_uid = allocation.device.uid;
-                    config.queue_depth = choose_queue_depth(summary);
-                    config.stages = summary.supports_asynchronous_dispatch ? 2u : 1u;
-                    if (system.low_spec_mode) {
-                        config.queue_depth = std::min(config.queue_depth, 2u);
-                        config.stages = 1u;
-                    }
-                    apply_strategy(config, ranked[rank].strategy);
-                    add_candidate(config);
-                    ++added_devices;
-                    const std::size_t max_devices_for_strategy =
-                        (system.low_spec_mode || workload.latency_sensitive) ? 1u : 2u;
-                    if (ranked[rank].weight > 0.65 && added_devices >= max_devices_for_strategy) {
-                        break;
-                    }
+                ++added_devices;
+                if (added_devices >= max_devices) {
+                    break;
                 }
             }
-        }
-
-        return candidates;
-    }
-
-    std::vector<std::reference_wrapper<const PlanAllocation>> ordered_allocations;
-    ordered_allocations.reserve(placement.allocations.size());
-    for (const auto& allocation : placement.allocations) {
-        ordered_allocations.emplace_back(allocation);
-    }
-    std::stable_sort(
-        ordered_allocations.begin(),
-        ordered_allocations.end(),
-        [&](const std::reference_wrapper<const PlanAllocation>& left,
-            const std::reference_wrapper<const PlanAllocation>& right) {
-            const auto* left_graph = find_graph(graph_lookup, left.get().device.uid);
-            const auto* right_graph = find_graph(graph_lookup, right.get().device.uid);
-            const bool left_host = is_host_graph(left_graph);
-            const bool right_host = is_host_graph(right_graph);
-            if (should_prefer_host_for_llm_operation(workload, operation) && left_host != right_host) {
-                return left_host;
-            }
-            if (should_prefer_gpu_for_llm_operation(workload, operation) && left_host != right_host) {
-                return !left_host;
-            }
-            return left.get().score > right.get().score;
-        });
-
-    for (const auto& allocation_ref : ordered_allocations) {
-        const auto& allocation = allocation_ref.get();
-        const auto* graph = find_graph(graph_lookup, allocation.device.uid);
-        if (graph == nullptr) {
             continue;
         }
 
-        const auto summary = summarize_graph(*graph);
-        ExecutionConfig base;
-        base.strategy = ExecutionStrategy::single_device;
-        base.primary_device_uid = allocation.device.uid;
-        base.participating_devices = {allocation.device.uid};
-        base.queue_depth = choose_queue_depth(summary);
-        base.stages = summary.supports_asynchronous_dispatch ? 2u : 1u;
-        if (system.low_spec_mode) {
-            base.queue_depth = std::min(base.queue_depth, 2u);
-            base.stages = 1u;
-        }
-        add_candidate(base);
-
-        if (operation.streaming_friendly &&
-            (summary.supports_asynchronous_dispatch || system.low_spec_mode)) {
-            ExecutionConfig streaming = base;
-            streaming.strategy = ExecutionStrategy::streaming;
-            streaming.stages = system.low_spec_mode ? 2u : std::max(3u, streaming.stages);
-            streaming.overlap_transfers = true;
-            add_candidate(streaming);
-        }
-
-        if (supports_low_precision(summary) && operation.max_relative_error >= 4.0e-4) {
-            ExecutionConfig low_precision = base;
-            low_precision.use_low_precision = true;
-            low_precision.overlap_transfers = summary.supports_asynchronous_dispatch;
-            low_precision.strategy = operation.parallelizable && summary.supports_asynchronous_dispatch
-                                         ? ExecutionStrategy::overlapped
-                                         : ExecutionStrategy::single_device;
-            add_candidate(low_precision);
-        }
-    }
-
-    if (operation.parallelizable &&
-        (auto_accelerator_ddp || placement.allocations.size() > 1) &&
-        !workload.latency_sensitive &&
-        !(system.low_spec_mode && system.paging_risk > 0.25)) {
-        ExecutionConfig sharded;
-        sharded.strategy = ExecutionStrategy::sharded;
-        sharded.primary_device_uid = auto_accelerator_ddp ? accelerators.front() : placement.allocations.front().device.uid;
-        sharded.participating_devices.clear();
-        if (auto_accelerator_ddp) {
-            sharded.participating_devices = accelerators;
+        std::vector<std::string> participating_devices;
+        if (variant.scope == OperationVariantScope::accelerator_sharded) {
+            participating_devices = accelerators;
         } else {
+            participating_devices.reserve(placement.allocations.size());
             for (const auto& allocation : placement.allocations) {
-                sharded.participating_devices.push_back(allocation.device.uid);
+                participating_devices.push_back(allocation.device.uid);
             }
         }
-        sharded.overlap_transfers = true;
-        sharded.queue_depth = choose_queue_depth(primary_summary);
-        sharded.stages =
-            system.low_spec_mode ? 2u : std::max(2u, primary_summary.supports_asynchronous_dispatch ? 2u : 1u);
-        sharded.logical_partitions = auto_accelerator_ddp ? 1u : sharded.logical_partitions;
-        add_candidate(sharded);
+        if (participating_devices.empty()) {
+            continue;
+        }
+
+        const auto* primary_graph = find_graph(graph_lookup, participating_devices.front());
+        if (primary_graph == nullptr) {
+            continue;
+        }
+        const auto primary_summary = summarize_graph(*primary_graph);
+
+        ExecutionConfig config;
+        config.primary_device_uid = participating_devices.front();
+        config.participating_devices = std::move(participating_devices);
+        config.queue_depth = choose_queue_depth(primary_summary);
+        config.stages = primary_summary.supports_asynchronous_dispatch ? 2u : 1u;
+        config.logical_partitions = 1u;
+        if (system.low_spec_mode) {
+            config.queue_depth = std::min(config.queue_depth, 2u);
+            config.stages = 1u;
+        }
+
+        apply_variant_to_config(variant, primary_summary, config);
+        add_candidate(config);
     }
 
     return candidates;
@@ -2918,7 +2953,12 @@ OperationOptimizationResult optimize_operation(
             evaluations.end(),
             [&](const CandidateEvaluation& evaluation) {
                 return evaluation.config.strategy == ExecutionStrategy::sharded &&
-                       evaluation.config.participating_devices == accelerators;
+                       evaluation.config.participating_devices.size() == accelerators.size() &&
+                       std::is_permutation(
+                           evaluation.config.participating_devices.begin(),
+                           evaluation.config.participating_devices.end(),
+                           accelerators.begin(),
+                           accelerators.end());
             });
         if (forced != evaluations.end()) {
             if (allow_validation) {
@@ -3664,30 +3704,33 @@ void ExecutionOptimizer::load_cache() {
         }
 
         const auto fields = split_tab(line);
-        if (fields.size() != 14 && fields.size() != 21) {
+        if (fields.size() != 14 && fields.size() != 21 && fields.size() != 22) {
             continue;
         }
 
         try {
             ExecutionConfig config;
-            config.operation_name = fields[1];
-            config.strategy = parse_strategy(fields[2]);
-            config.primary_device_uid = fields[3];
-            config.participating_devices = split_csv(fields[4]);
-            config.mapped_structural_nodes = split_csv(fields[5]);
-            config.queue_depth = static_cast<std::uint32_t>(std::stoul(fields[6]));
-            config.stages = static_cast<std::uint32_t>(std::stoul(fields[7]));
-            config.tile_x = static_cast<std::uint32_t>(std::stoul(fields[8]));
-            config.tile_y = static_cast<std::uint32_t>(std::stoul(fields[9]));
-            config.tile_k = static_cast<std::uint32_t>(std::stoul(fields[10]));
-            std::size_t next = 11;
-            if (fields.size() == 21) {
+            const bool has_variant = fields.size() == 22;
+            const bool has_extended = fields.size() == 21 || fields.size() == 22;
+            std::size_t next = 1;
+            config.operation_name = fields[next++];
+            config.variant_id = has_variant ? fields[next++] : "legacy";
+            config.strategy = parse_strategy(fields[next++]);
+            config.primary_device_uid = fields[next++];
+            config.participating_devices = split_csv(fields[next++]);
+            config.mapped_structural_nodes = split_csv(fields[next++]);
+            config.queue_depth = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            config.stages = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            config.tile_x = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            config.tile_y = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            config.tile_k = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            if (has_extended) {
                 config.logical_partitions = static_cast<std::uint32_t>(std::stoul(fields[next++]));
             }
             config.overlap_transfers = std::stoi(fields[next++]) != 0;
             config.use_low_precision = std::stoi(fields[next++]) != 0;
             config.target_error_tolerance = std::stod(fields[next++]);
-            if (fields.size() == 21) {
+            if (has_extended) {
                 config.queue_depth_scale = std::stod(fields[next++]);
                 config.stage_scale = std::stod(fields[next++]);
                 config.tile_scale = std::stod(fields[next++]);
@@ -3712,29 +3755,33 @@ void ExecutionOptimizer::load_cache() {
         }
 
         const auto fields = split_tab(line);
-        if (fields.size() != 19 && fields.size() != 26 && fields.size() != 28) {
+        if (fields.size() != 19 && fields.size() != 26 && fields.size() != 28 && fields.size() != 29) {
             continue;
         }
 
         try {
             PerformanceSummary summary;
-            summary.shape_bucket = fields[1];
-            summary.config.operation_name = fields[2];
-            summary.config.strategy = parse_strategy(fields[3]);
-            summary.config.primary_device_uid = fields[4];
-            summary.config.participating_devices = split_csv(fields[5]);
-            summary.config.queue_depth = static_cast<std::uint32_t>(std::stoul(fields[6]));
-            summary.config.stages = static_cast<std::uint32_t>(std::stoul(fields[7]));
-            summary.config.tile_x = static_cast<std::uint32_t>(std::stoul(fields[8]));
-            summary.config.tile_y = static_cast<std::uint32_t>(std::stoul(fields[9]));
-            summary.config.tile_k = static_cast<std::uint32_t>(std::stoul(fields[10]));
-            std::size_t next = 11;
-            if (fields.size() == 26 || fields.size() == 28) {
+            const bool has_variant = fields.size() == 29;
+            const bool has_extended = fields.size() == 26 || fields.size() == 28 || fields.size() == 29;
+            const bool has_calibration = fields.size() == 28 || fields.size() == 29;
+            std::size_t next = 1;
+            summary.shape_bucket = fields[next++];
+            summary.config.operation_name = fields[next++];
+            summary.config.variant_id = has_variant ? fields[next++] : "legacy";
+            summary.config.strategy = parse_strategy(fields[next++]);
+            summary.config.primary_device_uid = fields[next++];
+            summary.config.participating_devices = split_csv(fields[next++]);
+            summary.config.queue_depth = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            summary.config.stages = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            summary.config.tile_x = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            summary.config.tile_y = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            summary.config.tile_k = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+            if (has_extended) {
                 summary.config.logical_partitions = static_cast<std::uint32_t>(std::stoul(fields[next++]));
             }
             summary.config.overlap_transfers = std::stoi(fields[next++]) != 0;
             summary.config.use_low_precision = std::stoi(fields[next++]) != 0;
-            if (fields.size() == 26 || fields.size() == 28) {
+            if (has_extended) {
                 summary.config.queue_depth_scale = std::stod(fields[next++]);
                 summary.config.stage_scale = std::stod(fields[next++]);
                 summary.config.tile_scale = std::stod(fields[next++]);
@@ -3746,11 +3793,11 @@ void ExecutionOptimizer::load_cache() {
             summary.average_effective_latency_us = std::stod(fields[next++]);
             summary.average_relative_error = std::stod(fields[next++]);
             summary.average_prediction_scale = std::stod(fields[next++]);
-            if (fields.size() == 28) {
+            if (has_calibration) {
                 summary.average_calibration_ratio = std::stod(fields[next++]);
             }
             summary.average_system_penalty_us = std::stod(fields[next++]);
-            if (fields.size() == 28) {
+            if (has_calibration) {
                 summary.average_validation_spread_us = std::stod(fields[next++]);
             }
             summary.average_reward = std::stod(fields[next++]);
@@ -3773,11 +3820,12 @@ void ExecutionOptimizer::persist_cache() const {
         return;
     }
 
-    output << "# signature\toperation\tstrategy\tprimary_device\tparticipating_devices\tmapped_nodes\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\ttolerance\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\n";
+    output << "# signature\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tmapped_nodes\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\ttolerance\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\n";
     for (const auto& [signature, configs] : cache_) {
         for (const auto& cached : configs) {
             output << signature << '\t'
                    << cached.operation_name << '\t'
+                   << cached.config.variant_id << '\t'
                    << to_string(cached.config.strategy) << '\t'
                    << cached.config.primary_device_uid << '\t'
                    << join_csv(cached.config.participating_devices) << '\t'
@@ -3806,11 +3854,12 @@ void ExecutionOptimizer::persist_cache() const {
     }
 
     performance_output
-        << "# key\tshape_bucket\toperation\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_calibration_ratio\tavg_system_penalty\tavg_validation_spread\tavg_reward\n";
+        << "# key\tshape_bucket\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_calibration_ratio\tavg_system_penalty\tavg_validation_spread\tavg_reward\n";
     for (const auto& [key, summary] : performance_cache_) {
         performance_output << key << '\t'
                            << summary.shape_bucket << '\t'
                            << summary.config.operation_name << '\t'
+                           << summary.config.variant_id << '\t'
                            << to_string(summary.config.strategy) << '\t'
                            << summary.config.primary_device_uid << '\t'
                            << join_csv(summary.config.participating_devices) << '\t'

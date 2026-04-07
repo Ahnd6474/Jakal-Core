@@ -1,6 +1,7 @@
 #include "jakal/backend.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cstddef>
 #include <cstring>
@@ -65,12 +66,13 @@ HostStructuralSeed detect_host_seed() {
     const bool has_f16c = (registers[2] & (1 << 29)) != 0;
 
     seed.native_vector_bits = has_avx ? 256u : has_sse ? 128u : 64u;
-    seed.supports_fp16 = has_f16c;
 
     __cpuidex(registers, 7, 0);
     const bool has_avx2 = (registers[1] & (1 << 5)) != 0;
     const bool has_avx512f = (registers[1] & (1 << 16)) != 0;
-    const bool has_avx512_bf16 = false;
+    const bool has_avx512_fp16 = (registers[3] & (1 << 23)) != 0;
+    __cpuidex(registers, 7, 1);
+    const bool has_avx512_bf16 = (registers[0] & (1 << 5)) != 0;
 
     if (has_avx512f) {
         seed.native_vector_bits = 512u;
@@ -78,6 +80,7 @@ HostStructuralSeed detect_host_seed() {
         seed.native_vector_bits = 256u;
     }
 
+    seed.supports_fp16 = has_f16c || has_avx512_fp16;
     seed.supports_bf16 = has_avx512_bf16;
     seed.supports_int8 = has_avx2 || has_avx512f;
 #elif (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__))
@@ -111,6 +114,7 @@ HostStructuralSeed detect_host_seed() {
         __cpuid_count(7, 0, eax, ebx, ecx, edx);
         const bool has_avx2 = (ebx & (1u << 5u)) != 0;
         const bool has_avx512f = (ebx & (1u << 16u)) != 0;
+        const bool has_avx512_fp16 = (edx & (1u << 23u)) != 0;
 
         if (has_avx512f) {
             seed.native_vector_bits = 512u;
@@ -118,6 +122,15 @@ HostStructuralSeed detect_host_seed() {
             seed.native_vector_bits = 256u;
         }
 
+        unsigned int subleaf_eax = 0;
+        unsigned int subleaf_ebx = 0;
+        unsigned int subleaf_ecx = 0;
+        unsigned int subleaf_edx = 0;
+        __cpuid_count(7, 1, subleaf_eax, subleaf_ebx, subleaf_ecx, subleaf_edx);
+        const bool has_avx512_bf16 = (subleaf_eax & (1u << 5u)) != 0;
+
+        seed.supports_fp16 = seed.supports_fp16 || has_avx512_fp16;
+        seed.supports_bf16 = has_avx512_bf16;
         seed.supports_int8 = has_avx2 || has_avx512f;
     }
 #endif

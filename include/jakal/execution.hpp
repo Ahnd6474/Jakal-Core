@@ -201,6 +201,7 @@ struct ExecutionGraph {
 struct ExecutionConfig {
     std::string signature;
     std::string operation_name;
+    std::string variant_id;
     ExecutionStrategy strategy = ExecutionStrategy::single_device;
     std::string primary_device_uid;
     std::vector<std::string> participating_devices;
