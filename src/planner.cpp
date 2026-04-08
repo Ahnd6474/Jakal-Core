@@ -845,7 +845,7 @@ Planner::ResolvedStrategyDecision Planner::resolve_partition_strategy(
             return {};
         }
 
-        if (allow_exploration && has_partitionable_topology(graphs)) {
+        if (allow_exploration && !workload.disable_strategy_exploration && has_partitionable_topology(graphs)) {
             for (const auto strategy : exploration_order_for(workload)) {
                 const auto strategy_it = bucket->find(to_string(strategy));
                 const std::uint32_t observations =
@@ -1023,18 +1023,16 @@ Planner::ResolvedStrategyDecision Planner::resolve_partition_strategy(
                 : workload.heuristic_partition_hint_reason};
     };
 
-    if (!exact_resolution.has_baseline && family_resolution.has_baseline) {
-        if (const auto hinted = resolve_from_heuristic_hint(); hinted.has_value()) {
-            return {
-                hinted->strategy,
+    if (const auto hinted = resolve_from_heuristic_hint(); hinted.has_value()) {
+        return {
+            hinted->strategy,
+            hinted->source,
+            apply_confidence_calibration(
+                confidence_calibration_stats_,
+                workload,
                 hinted->source,
-                apply_confidence_calibration(
-                    confidence_calibration_stats_,
-                    workload,
-                    hinted->source,
-                    hinted->confidence),
-                hinted->reason};
-        }
+                hinted->confidence),
+            hinted->reason};
     }
 
     if (exact_resolution.has_baseline || family_resolution.has_baseline) {
@@ -1058,18 +1056,6 @@ Planner::ResolvedStrategyDecision Planner::resolve_partition_strategy(
                 family_resolution.source,
                 family_resolution.confidence),
             family_resolution.reason};
-    }
-
-    if (const auto hinted = resolve_from_heuristic_hint(); hinted.has_value()) {
-        return {
-            hinted->strategy,
-            hinted->source,
-            apply_confidence_calibration(
-                confidence_calibration_stats_,
-                workload,
-                hinted->source,
-                hinted->confidence),
-            hinted->reason};
     }
 
     return {

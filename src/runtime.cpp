@@ -48,6 +48,7 @@ struct GraphAwareMetaPolicy {
     std::optional<PartitionStrategy> strategy_hint;
     double strategy_confidence = 0.0;
     std::string strategy_reason;
+    bool disable_exploration = false;
     std::optional<ContinuousExecutionState> tuning_state;
     std::optional<std::uint32_t> tuning_graph_passes;
     std::uint32_t tuning_graph_rewrite_level = 1u;
@@ -241,17 +242,25 @@ GraphAwareMetaPolicy derive_graph_aware_meta_policy(
 
     const auto metrics = analyze_workload_graph(workload, workload_graph);
     const auto phase = canonical_workload_phase(workload);
+    const bool decode_projection_dominant =
+        workload.matrix_friendly &&
+        (phase == WorkloadPhase::decode || phase == WorkloadPhase::prefill) &&
+        metrics.matmul_flops_ratio >= 0.40;
     const bool cooperative_auto =
         workload.latency_sensitive &&
-        metrics.small_op_ratio >= 0.55 &&
-        (workload.prefer_unified_memory ||
-         workload_host_exchange_ratio(workload) >= 0.18 ||
-         metrics.host_visible_tensor_ratio >= 0.25);
+        phase != WorkloadPhase::decode &&
+        phase != WorkloadPhase::prefill &&
+        !decode_projection_dominant &&
+        ((workload.prefer_unified_memory && metrics.small_op_ratio >= 0.50) ||
+         (workload.kind == WorkloadKind::tensor &&
+          metrics.small_op_ratio >= 0.55 &&
+          workload_host_exchange_ratio(workload) >= 0.30));
     const bool projection_sharded =
         workload.matrix_friendly &&
-        metrics.matmul_flops_ratio >= 0.55 &&
         !cooperative_auto &&
-        (phase == WorkloadPhase::decode || phase == WorkloadPhase::prefill || workload.latency_sensitive);
+        (decode_projection_dominant ||
+         (metrics.matmul_flops_ratio >= 0.55 &&
+          (phase == WorkloadPhase::decode || phase == WorkloadPhase::prefill || workload.latency_sensitive)));
     const bool reduce_on_gpu =
         workload.matrix_friendly &&
         metrics.has_terminal_reduction &&
@@ -264,16 +273,19 @@ GraphAwareMetaPolicy derive_graph_aware_meta_policy(
         policy.strategy_hint = PartitionStrategy::projection_sharded;
         policy.strategy_confidence =
             phase == WorkloadPhase::decode ? 0.72 : (metrics.dispatch_bound_score < 0.35 ? 0.64 : 0.58);
+        policy.disable_exploration = true;
         summary << "graph-aware heuristic projection_sharded matmul=" << metrics.matmul_flops_ratio
                 << " dispatch=" << metrics.dispatch_bound_score
                 << " tail_reduce=" << (metrics.has_terminal_reduction ? "yes" : "no");
     } else if (reduce_on_gpu) {
         policy.strategy_hint = PartitionStrategy::reduce_on_gpu;
         policy.strategy_confidence = metrics.reduction_count >= 2u ? 0.70 : 0.62;
+        policy.disable_exploration = true;
         summary << "graph-aware heuristic reduce_on_gpu matmul=" << metrics.matmul_flops_ratio
                 << " reductions=" << metrics.reduction_count
                 << " dispatch=" << metrics.dispatch_bound_score;
     } else if (cooperative_auto) {
+        policy.disable_exploration = true;
         summary << "graph-aware heuristic kept auto_balanced cooperative dispatch=" << metrics.dispatch_bound_score
                 << " small_ops=" << metrics.small_op_ratio;
     } else {
@@ -348,6 +360,9 @@ RuntimeOptimizationContext resolve_runtime_optimization_context(
         context.effective_workload.heuristic_partition_hint = meta.strategy_hint;
         context.effective_workload.heuristic_partition_hint_confidence = meta.strategy_confidence;
         context.effective_workload.heuristic_partition_hint_reason = meta.strategy_reason;
+    }
+    if (meta.disable_exploration) {
+        context.effective_workload.disable_strategy_exploration = true;
     }
 
     if (options.optimization.enable_graph_aware_execution_tuning &&
@@ -1234,6 +1249,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         effective_workload.heuristic_partition_hint_reason.clear();
         effective_workload.disable_heuristic_partition_hint = true;
         effective_workload.disable_automatic_execution_tuning = true;
+        effective_workload.disable_strategy_exploration = true;
         managed.safety.blacklisted_before_run = true;
         safety_summary << "strategy blacklisted -> auto";
     }
@@ -1280,6 +1296,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         fallback_workload.heuristic_partition_hint_reason.clear();
         fallback_workload.disable_heuristic_partition_hint = true;
         fallback_workload.disable_automatic_execution_tuning = true;
+        fallback_workload.disable_strategy_exploration = true;
         auto fallback_plan = planner_.build_plan(fallback_workload, devices_);
         auto fallback_optimization = execution_optimizer_.optimize(
             fallback_workload,
@@ -1381,6 +1398,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             fallback_workload.heuristic_partition_hint_reason.clear();
             fallback_workload.disable_heuristic_partition_hint = true;
             fallback_workload.disable_automatic_execution_tuning = true;
+            fallback_workload.disable_strategy_exploration = true;
             auto fallback_optimization = optimize(fallback_workload, workload_graph);
             auto fallback_memory = build_memory_preflight(fallback_optimization);
             if (fallback_memory.safe_to_run || !options_.product.memory.enforce_preflight) {

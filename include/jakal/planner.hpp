@@ -65,6 +65,7 @@ struct WorkloadSpec {
     std::string heuristic_partition_hint_reason;
     bool disable_heuristic_partition_hint = false;
     bool disable_automatic_execution_tuning = false;
+    bool disable_strategy_exploration = false;
 };
 
 struct PlanAllocation {
