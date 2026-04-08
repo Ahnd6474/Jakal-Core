@@ -594,17 +594,18 @@ def main() -> int:
         all_results.extend(initial_results)
         ranked_initial = rank_results(initial_results)
 
-        refine_inputs = ranked_initial[: max(1, args.refine_top_k)]
+        refinement_results: list[StrategyResult] = []
         refinement_pool: list[Candidate] = []
-        for seed_result in refine_inputs:
-            seed_candidate = next(entry for entry in base if entry.label == seed_result.candidate_label)
-            refinement_pool.extend(refine_candidates(seed_candidate))
-        refinement_pool = dedupe_candidates(refinement_pool)
-
-        refinement_results = [
-            run_candidate(profile_exe, manifest_path, workload_name, args.mode, entry, max(1, args.refine_passes))
-            for entry in refinement_pool
-        ]
+        if args.refine_top_k > 0:
+            refine_inputs = ranked_initial[: args.refine_top_k]
+            for seed_result in refine_inputs:
+                seed_candidate = next(entry for entry in base if entry.label == seed_result.candidate_label)
+                refinement_pool.extend(refine_candidates(seed_candidate))
+            refinement_pool = dedupe_candidates(refinement_pool)
+            refinement_results = [
+                run_candidate(profile_exe, manifest_path, workload_name, args.mode, entry, max(1, args.refine_passes))
+                for entry in refinement_pool
+            ]
         all_results.extend(refinement_results)
 
         ranked = rank_results(initial_results + refinement_results)
