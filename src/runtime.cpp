@@ -22,6 +22,13 @@ bool runtime_regressed(
     const DirectExecutionReport& report,
     const double max_runtime_regression_ratio);
 
+WorkloadSpec apply_runtime_optimization_overrides(const RuntimeOptions& options, WorkloadSpec workload) {
+    if (options.optimization.forced_partition_strategy.has_value()) {
+        workload.partition_strategy = *options.optimization.forced_partition_strategy;
+    }
+    return workload;
+}
+
 std::vector<ExecutionFeedbackRecord> make_feedback_records(const DirectExecutionReport& report) {
     std::vector<ExecutionFeedbackRecord> feedback;
     feedback.reserve(report.operations.size());
@@ -764,7 +771,7 @@ ExecutionPlan Runtime::plan(const WorkloadSpec& workload) {
         refresh_hardware();
     }
 
-    return planner_.build_plan(workload, devices_);
+    return planner_.build_plan(apply_runtime_optimization_overrides(options_, workload), devices_);
 }
 
 OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
@@ -772,8 +779,14 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
         refresh_hardware();
     }
 
-    const auto placement = planner_.build_plan(workload, devices_);
-    return execution_optimizer_.optimize(workload, placement, devices_, nullptr);
+    const auto effective_workload = apply_runtime_optimization_overrides(options_, workload);
+    const auto placement = planner_.build_plan(effective_workload, devices_);
+    return execution_optimizer_.optimize(
+        effective_workload,
+        placement,
+        devices_,
+        nullptr,
+        &options_.optimization.execution);
 }
 
 OptimizationReport Runtime::optimize(const WorkloadSpec& workload, const WorkloadGraph& workload_graph) {
@@ -781,8 +794,14 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload, const Workloa
         refresh_hardware();
     }
 
-    const auto placement = planner_.build_plan(workload, devices_);
-    return execution_optimizer_.optimize(workload, placement, devices_, &workload_graph);
+    const auto effective_workload = apply_runtime_optimization_overrides(options_, workload);
+    const auto placement = planner_.build_plan(effective_workload, devices_);
+    return execution_optimizer_.optimize(
+        effective_workload,
+        placement,
+        devices_,
+        &workload_graph,
+        &options_.optimization.execution);
 }
 
 DirectExecutionReport Runtime::execute_with_feedback(
@@ -838,14 +857,15 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
 
     ++execution_epoch_;
 
+    const auto requested_workload = apply_runtime_optimization_overrides(options_, workload);
     ManagedExecutionReport managed;
     managed.telemetry_path = telemetry_path();
-    managed.safety.requested_strategy = workload.partition_strategy;
+    managed.safety.requested_strategy = requested_workload.partition_strategy;
 
     std::ostringstream safety_summary;
-    auto effective_workload = workload;
-    if (workload.partition_strategy != PartitionStrategy::auto_balanced &&
-        is_strategy_blacklisted(workload, workload.partition_strategy)) {
+    auto effective_workload = requested_workload;
+    if (requested_workload.partition_strategy != PartitionStrategy::auto_balanced &&
+        is_strategy_blacklisted(requested_workload, requested_workload.partition_strategy)) {
         effective_workload.partition_strategy = PartitionStrategy::auto_balanced;
         managed.safety.blacklisted_before_run = true;
         safety_summary << "strategy blacklisted -> auto";
@@ -859,7 +879,12 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
 
     auto planned = planner_.build_plan(effective_workload, devices_);
     update_planner_diagnostics(planned);
-    auto optimization = execution_optimizer_.optimize(effective_workload, planned, devices_, &workload_graph);
+    auto optimization = execution_optimizer_.optimize(
+        effective_workload,
+        planned,
+        devices_,
+        &workload_graph,
+        &options_.optimization.execution);
     managed.safety.selected_strategy = optimization.partition_strategy;
     managed.memory_preflight = build_memory_preflight(optimization);
     managed.kernel_coverage = build_kernel_coverage(optimization);
@@ -881,10 +906,15 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         if (optimization.partition_strategy == PartitionStrategy::auto_balanced) {
             return;
         }
-        auto fallback_workload = workload;
+        auto fallback_workload = requested_workload;
         fallback_workload.partition_strategy = PartitionStrategy::auto_balanced;
         auto fallback_plan = planner_.build_plan(fallback_workload, devices_);
-        auto fallback_optimization = execution_optimizer_.optimize(fallback_workload, fallback_plan, devices_, &workload_graph);
+        auto fallback_optimization = execution_optimizer_.optimize(
+            fallback_workload,
+            fallback_plan,
+            devices_,
+            &workload_graph,
+            &options_.optimization.execution);
         auto fallback_memory = build_memory_preflight(fallback_optimization);
         if (fallback_memory.safe_to_run || !managed.memory_preflight.safe_to_run) {
             effective_workload = fallback_workload;
@@ -915,7 +945,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
     };
 
     if (optimization.partition_strategy != PartitionStrategy::auto_balanced &&
-        is_strategy_blacklisted(workload, optimization.partition_strategy)) {
+        is_strategy_blacklisted(requested_workload, optimization.partition_strategy)) {
         force_auto_if_needed("selected strategy blacklisted -> auto");
     }
 
@@ -943,7 +973,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         }
         safety_summary << managed.memory_preflight.summary;
         managed.safety.summary = safety_summary.str();
-        persist_telemetry(workload, managed);
+        persist_telemetry(requested_workload, managed);
         return managed;
     }
 
@@ -968,11 +998,11 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
 
     if (canary_triggered) {
         managed.safety.canary_triggered = true;
-        record_strategy_failure(workload, managed.execution.optimization.partition_strategy);
+        record_strategy_failure(requested_workload, managed.execution.optimization.partition_strategy);
         planner_feedback.runtime_regressed =
             runtime_regressed(managed.execution, options_.product.safety.max_runtime_regression_ratio);
         if (options_.product.safety.enable_strategy_rollback) {
-            auto fallback_workload = workload;
+            auto fallback_workload = requested_workload;
             fallback_workload.partition_strategy = PartitionStrategy::auto_balanced;
             auto fallback_optimization = optimize(fallback_workload, workload_graph);
             auto fallback_memory = build_memory_preflight(fallback_optimization);
@@ -994,11 +1024,11 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             }
         }
     } else if (explicit_strategy) {
-        record_strategy_success(workload, managed.execution.optimization.partition_strategy);
+        record_strategy_success(requested_workload, managed.execution.optimization.partition_strategy);
     }
 
     if (managed.executed) {
-        record_partition_strategy_feedback(planner_, workload, devices_, planner_feedback);
+        record_partition_strategy_feedback(planner_, requested_workload, devices_, planner_feedback);
     }
 
     if (managed.memory_preflight.summary.size() > 0) {
@@ -1022,7 +1052,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         safety_summary << managed.residency_sequence.summary;
     }
     managed.safety.summary = safety_summary.str();
-    persist_telemetry(workload, managed);
+    persist_telemetry(requested_workload, managed);
     return managed;
 }
 

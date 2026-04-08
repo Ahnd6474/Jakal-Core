@@ -81,6 +81,19 @@ OperationVariantRegistry make_builtin_registry() {
     balanced.activation_bias = 0.15;
     registry.register_variant(std::move(balanced));
 
+    auto host_critical = spec(
+        "host-critical-path",
+        "Low-overhead host-friendly path for dispatch-bound stages.",
+        OperationVariantScope::per_allocation,
+        ExecutionStrategy::single_device,
+        15);
+    host_critical.applicable_classes = {OperationClass::elementwise_map, OperationClass::reduction};
+    host_critical.forced_queue_depth = 1u;
+    host_critical.forced_stages = 1u;
+    host_critical.forced_logical_partitions = 1u;
+    host_critical.activation_bias = 0.38;
+    registry.register_variant(std::move(host_critical));
+
     auto latency = spec(
         "single-device-latency",
         "Latency-oriented single-device execution with shallow queues.",
@@ -128,6 +141,24 @@ OperationVariantRegistry make_builtin_registry() {
     throughput_overlap.min_stages = 2u;
     throughput_overlap.activation_bias = 0.28;
     registry.register_variant(std::move(throughput_overlap));
+
+    auto cooperative_split = spec(
+        "cooperative-split",
+        "Split work across host and accelerator with low sharding overhead.",
+        OperationVariantScope::placement_sharded,
+        ExecutionStrategy::sharded,
+        50);
+    cooperative_split.applicable_classes = {
+        OperationClass::reduction,
+        OperationClass::matmul,
+        OperationClass::convolution_2d};
+    cooperative_split.requires_parallelizable = true;
+    cooperative_split.requires_multiple_devices = true;
+    cooperative_split.forced_queue_depth = 1u;
+    cooperative_split.forced_stages = 1u;
+    cooperative_split.forced_logical_partitions = 2u;
+    cooperative_split.activation_bias = 0.48;
+    registry.register_variant(std::move(cooperative_split));
 
     auto low_precision = spec(
         "low-precision-overlap",

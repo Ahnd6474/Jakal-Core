@@ -75,7 +75,7 @@ std::filesystem::path unique_temp_file(const std::string& stem, const std::strin
 }
 
 void print_usage() {
-    std::cout << "Usage: jakal_directml_manifest_bench <path-to-gguf-or-onnx> | --ollama-model <model>"
+    std::cout << "Usage: jakal_directml_manifest_bench <path-to-workload-or-gguf-or-onnx> | --ollama-model <model>"
               << " [--passes N] [--show-ops]\n";
 }
 

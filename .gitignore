@@ -1,10 +1,12 @@
 .idea/
 .venv/
+__pycache__/
 build/
 out/
 
 *.obj
 *.o
+*.pyc
 *.pdb
 *.ilk
 *.exe

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -62,6 +63,12 @@ struct ContinuousExecutionState {
     double sharded_logit = -0.8;
     double streaming_logit = 0.4;
     double overlapped_logit = 0.6;
+};
+
+struct ExecutionTuningOverrides {
+    std::optional<ContinuousExecutionState> initial_state_override;
+    std::optional<std::uint32_t> graph_optimization_passes_override;
+    std::uint32_t graph_rewrite_level = 1u;
 };
 
 struct GraphOptimizationPass {
@@ -402,7 +409,8 @@ public:
         const WorkloadSpec& workload,
         const ExecutionPlan& placement,
         const std::vector<HardwareGraph>& graphs,
-        const WorkloadGraph* workload_graph_override = nullptr);
+        const WorkloadGraph* workload_graph_override = nullptr,
+        const ExecutionTuningOverrides* tuning_overrides = nullptr);
     void ingest_execution_feedback(
         const OptimizationReport& report,
         const std::vector<ExecutionFeedbackRecord>& feedback,

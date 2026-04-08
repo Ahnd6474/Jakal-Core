@@ -248,6 +248,22 @@ The adapter tests currently cover:
 - `.gguf` weights, including shard discovery
 - text-based imported descriptions used for PyTorch-export and GGML-style inputs
 
+There is also a small PyTorch bridge in [`scripts/export_torch_workload.py`](./scripts/export_torch_workload.py).
+It emits `pytorch_export` `.workload` files for built-in tensor-model presets such as:
+
+- `finance-factor-risk-lite`
+- `signal-filterbank-lite`
+- `graph-ranking-lite`
+- `scientific-solver-step-lite`
+
+Example:
+
+```powershell
+python .\scripts\export_torch_workload.py --preset finance-factor-risk-lite --output .\finance-factor-risk-lite.workload
+.\build\Debug\jakal_profile_manifest.exe .\finance-factor-risk-lite.workload --passes 3 --level-zero-only
+.\build\Debug\jakal_directml_manifest_bench.exe .\finance-factor-risk-lite.workload --passes 3
+```
+
 ### Managed execution and manifests
 
 `jakal::RuntimeProductPolicy` is the part of `RuntimeOptions` that controls:
@@ -321,6 +337,21 @@ outputs=hidden
 ```
 
 If `weights.bin` is required and missing, `execute_manifest(...)` returns a managed report with `asset_prefetch.missing_required_assets=true`, marks the run as not executed, and still writes telemetry.
+
+For repeated comparisons across backends, [`scripts/run_manifest_benchmarks.py`](./scripts/run_manifest_benchmarks.py) wraps:
+
+- `jakal_profile_manifest` in `host` and `level-zero` modes
+- optional `opencl` mode
+- `jakal_directml_manifest_bench` when the executable is available
+
+`jakal_directml_manifest_bench` is a standalone DirectML operator baseline. It is useful for backend-to-backend kernel checks, but it is not the same thing as the managed runtime total reported by `jakal_profile_manifest`.
+
+Examples:
+
+```powershell
+python .\scripts\run_manifest_benchmarks.py --all-torch-presets --passes 3
+python .\scripts\run_manifest_benchmarks.py --manifest .\qwen2.5-0.5b.ollama.gguf --passes 3
+```
 
 ### C API
 

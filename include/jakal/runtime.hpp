@@ -9,6 +9,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,6 +46,11 @@ struct RuntimeProductPolicy {
     RuntimeObservabilityOptions observability;
 };
 
+struct RuntimeOptimizationPolicy {
+    std::optional<PartitionStrategy> forced_partition_strategy;
+    ExecutionTuningOverrides execution;
+};
+
 struct RuntimeOptions {
     bool enable_host_probe = true;
     bool enable_opencl_probe = true;
@@ -55,6 +61,7 @@ struct RuntimeOptions {
     std::filesystem::path cache_path;
     std::filesystem::path execution_cache_path;
     RuntimeProductPolicy product;
+    RuntimeOptimizationPolicy optimization;
 };
 
 struct DeviceMemoryReservation {

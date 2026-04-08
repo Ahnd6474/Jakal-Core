@@ -324,6 +324,285 @@ bool verify_partition_strategies() {
     return true;
 }
 
+bool verify_device_agnostic_planning_and_execution() {
+    const auto plan_cache = unique_temp_file("device-agnostic-plan");
+    const auto exec_cache = unique_temp_file("device-agnostic-exec");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const auto host = make_manual_host_graph();
+    auto gpu = make_manual_gpu_graph("gpu:device-agnostic:0", "Balanced GPU", true, true, true);
+    gpu.nodes[2].compute.execution_width = 192;
+    gpu.nodes[2].compute.matrix_engines = 24;
+    gpu.nodes[2].compute.clock_mhz = 1900;
+    attach_cache_and_scratch(gpu, 2ull * 1024ull * 1024ull, 256ull * 1024ull);
+    const std::vector<jakal::HardwareGraph> graphs{host, gpu};
+
+    const jakal::WorkloadSpec host_exchange_workload{
+        "device-agnostic-risk-lite",
+        jakal::WorkloadKind::tensor,
+        "device-agnostic-risk-lite",
+        384ull * 1024ull * 1024ull,
+        160ull * 1024ull * 1024ull,
+        8.0e10,
+        1,
+        true,
+        true,
+        false,
+        jakal::PartitionStrategy::auto_balanced};
+    const auto host_exchange_plan = planner.build_plan(host_exchange_workload, graphs);
+    if (host_exchange_plan.allocations.size() < 2u) {
+        std::cerr << "device-agnostic: expected mixed plan, got "
+                  << host_exchange_plan.allocations.size() << " allocations\n";
+        return false;
+    }
+
+    const auto host_allocation = std::find_if(
+        host_exchange_plan.allocations.begin(),
+        host_exchange_plan.allocations.end(),
+        [&](const jakal::PlanAllocation& allocation) {
+            return allocation.device.uid == host.uid;
+        });
+    const auto accelerator_allocation = std::find_if(
+        host_exchange_plan.allocations.begin(),
+        host_exchange_plan.allocations.end(),
+        [&](const jakal::PlanAllocation& allocation) {
+            return allocation.device.uid == gpu.uid;
+        });
+    if (host_allocation == host_exchange_plan.allocations.end() ||
+        accelerator_allocation == host_exchange_plan.allocations.end()) {
+        std::cerr << "device-agnostic: missing host or accelerator allocation\n";
+        return false;
+    }
+    if (host_allocation->ratio < 0.18 || accelerator_allocation->ratio < 0.18) {
+        std::cerr << "device-agnostic: expected meaningful host/accelerator split host="
+                  << host_allocation->ratio << " accel=" << accelerator_allocation->ratio << '\n';
+        return false;
+    }
+
+    const jakal::WorkloadSpec matrix_workload{
+        "device-agnostic-matmul-lite",
+        jakal::WorkloadKind::inference,
+        "device-agnostic-matmul-lite",
+        384ull * 1024ull * 1024ull,
+        8ull * 1024ull * 1024ull,
+        3.5e12,
+        8,
+        false,
+        false,
+        true,
+        jakal::PartitionStrategy::auto_balanced};
+    const auto matrix_plan = planner.build_plan(matrix_workload, graphs);
+    const auto matrix_host = std::find_if(
+        matrix_plan.allocations.begin(),
+        matrix_plan.allocations.end(),
+        [&](const jakal::PlanAllocation& allocation) {
+            return allocation.device.uid == host.uid;
+        });
+    const auto matrix_accel = std::find_if(
+        matrix_plan.allocations.begin(),
+        matrix_plan.allocations.end(),
+        [&](const jakal::PlanAllocation& allocation) {
+            return allocation.device.uid == gpu.uid;
+        });
+    if (matrix_host == matrix_plan.allocations.end() ||
+        matrix_accel == matrix_plan.allocations.end() ||
+        matrix_accel->ratio <= matrix_host->ratio) {
+        std::cerr << "device-agnostic: matrix workload lost accelerator preference host="
+                  << (matrix_host == matrix_plan.allocations.end() ? -1.0 : matrix_host->ratio)
+                  << " accel="
+                  << (matrix_accel == matrix_plan.allocations.end() ? -1.0 : matrix_accel->ratio) << '\n';
+        return false;
+    }
+
+    jakal::WorkloadGraph workload_graph;
+    workload_graph.signature = "device-agnostic-manual";
+    workload_graph.tensors = {
+        {"risk-input", "risk-input", "", {"feature-normalize"}, 8ull * 1024ull * 1024ull, true, false, true},
+        {"risk-normalized", "risk-normalized", "feature-normalize", {"risk-reduce", "projection-update"}, 8ull * 1024ull * 1024ull, false, true, true},
+        {"risk-summary", "risk-summary", "risk-reduce", {}, 1ull * 1024ull * 1024ull, false, true, true},
+        {"projection-weights", "projection-weights", "", {"projection-update"}, 24ull * 1024ull * 1024ull, true, false, false},
+        {"projection-output", "projection-output", "projection-update", {}, 8ull * 1024ull * 1024ull, false, false, false}};
+    workload_graph.operations = {
+        {"feature-normalize",
+         jakal::OperationClass::elementwise_map,
+         {2'097'152},
+         8ull * 1024ull * 1024ull,
+         8ull * 1024ull * 1024ull,
+         1ull * 1024ull * 1024ull,
+         2.0e8,
+         1.0e-4,
+         true,
+         false,
+         false,
+         false,
+         {"risk-input"},
+         {"risk-normalized"}},
+        {"risk-reduce",
+         jakal::OperationClass::reduction,
+         {2'097'152},
+         8ull * 1024ull * 1024ull,
+         1ull * 1024ull * 1024ull,
+         1ull * 1024ull * 1024ull,
+         1.5e8,
+         1.0e-4,
+         true,
+         true,
+         false,
+         false,
+         {"risk-normalized"},
+         {"risk-summary"}},
+        {"projection-update",
+         jakal::OperationClass::matmul,
+         {1024, 1024, 512},
+         32ull * 1024ull * 1024ull,
+         8ull * 1024ull * 1024ull,
+         4ull * 1024ull * 1024ull,
+         4.0e10,
+         1.0e-3,
+         true,
+         false,
+         false,
+         true,
+         {"risk-normalized", "projection-weights"},
+         {"projection-output"}}};
+
+    const auto report =
+        optimizer.optimize(host_exchange_workload, host_exchange_plan, graphs, &workload_graph);
+    const auto* normalize = find_operation_by_name(report, "feature-normalize");
+    const auto* reduce = find_operation_by_name(report, "risk-reduce");
+    const auto* projection = find_operation_by_name(report, "projection-update");
+    if (normalize == nullptr || reduce == nullptr || projection == nullptr) {
+        std::cerr << "device-agnostic: missing optimized operations\n";
+        return false;
+    }
+    if (normalize->config.primary_device_uid != host.uid ||
+        reduce->config.primary_device_uid != host.uid) {
+        std::cerr << "device-agnostic: expected host placement for small ops normalize="
+                  << normalize->config.primary_device_uid
+                  << " reduce=" << reduce->config.primary_device_uid << '\n';
+        return false;
+    }
+    if (projection->config.primary_device_uid != gpu.uid) {
+        std::cerr << "device-agnostic: expected accelerator placement for projection, got "
+                  << projection->config.primary_device_uid << '\n';
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    return true;
+}
+
+bool verify_aggressive_graph_rewrites() {
+    const auto exec_cache = unique_temp_file("rewrite-exec");
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+
+    auto host = make_manual_host_graph();
+    auto gpu = make_manual_gpu_graph("gpu:rewrite:0", "Rewrite GPU", true, true, true);
+    attach_cache_and_scratch(host, 2ull * 1024ull * 1024ull, 64ull * 1024ull);
+    attach_cache_and_scratch(gpu, 2ull * 1024ull * 1024ull, 128ull * 1024ull);
+
+    jakal::ExecutionPlan plan;
+    plan.signature = "manual-rewrite";
+    plan.allocations.push_back({host, 0.4, 1.0});
+    plan.allocations.push_back({gpu, 0.6, 2.0});
+
+    const jakal::WorkloadSpec workload{
+        "rewrite-risk-lite",
+        jakal::WorkloadKind::tensor,
+        "rewrite-risk-lite",
+        256ull * 1024ull * 1024ull,
+        96ull * 1024ull * 1024ull,
+        6.0e10,
+        1,
+        true,
+        true,
+        false};
+
+    jakal::WorkloadGraph graph;
+    graph.signature = "rewrite-manual";
+    graph.tensors = {
+        {"input", "input", "", {"ew-pre"}, 8ull * 1024ull * 1024ull, true, false, true},
+        {"norm-1", "norm-1", "ew-pre", {"ew-post"}, 8ull * 1024ull * 1024ull, false, true, true},
+        {"norm-2", "norm-2", "ew-post", {"projection"}, 8ull * 1024ull * 1024ull, false, true, true},
+        {"weights", "weights", "", {"projection"}, 16ull * 1024ull * 1024ull, true, false, false},
+        {"output", "output", "projection", {}, 8ull * 1024ull * 1024ull, false, false, false}};
+    graph.operations = {
+        {"ew-pre",
+         jakal::OperationClass::elementwise_map,
+         {2'097'152},
+         8ull * 1024ull * 1024ull,
+         8ull * 1024ull * 1024ull,
+         1ull * 1024ull * 1024ull,
+         2.0e8,
+         1.0e-4,
+         true,
+         false,
+         false,
+         false,
+         {"input"},
+         {"norm-1"}},
+        {"ew-post",
+         jakal::OperationClass::elementwise_map,
+         {2'097'152},
+         8ull * 1024ull * 1024ull,
+         8ull * 1024ull * 1024ull,
+         1ull * 1024ull * 1024ull,
+         2.5e8,
+         1.0e-4,
+         true,
+         false,
+         false,
+         false,
+         {"norm-1"},
+         {"norm-2"}},
+        {"projection",
+         jakal::OperationClass::matmul,
+         {1024, 1024, 512},
+         24ull * 1024ull * 1024ull,
+         8ull * 1024ull * 1024ull,
+         4ull * 1024ull * 1024ull,
+         5.0e10,
+         1.0e-3,
+         true,
+         false,
+         false,
+         true,
+         {"norm-2", "weights"},
+         {"output"}}};
+
+    jakal::ExecutionTuningOverrides tuning;
+    tuning.graph_rewrite_level = 2u;
+    tuning.graph_optimization_passes_override = 1u;
+    const auto report = optimizer.optimize(workload, plan, {host, gpu}, &graph, &tuning);
+    const auto* fused = find_operation_by_name(report, "ew-pre");
+    const auto* removed = find_operation_by_name(report, "ew-post");
+    if (fused == nullptr || removed != nullptr) {
+        std::cerr << "rewrite: expected ew-post to fuse into ew-pre\n";
+        return false;
+    }
+    if (std::find(
+            fused->operation.fused_operation_names.begin(),
+            fused->operation.fused_operation_names.end(),
+            "ew-post") == fused->operation.fused_operation_names.end()) {
+        std::cerr << "rewrite: ew-pre missing fused ew-post tag\n";
+        return false;
+    }
+    if (report.workload_graph.operations.size() != 2u) {
+        std::cerr << "rewrite: expected 2 ops after aggressive rewrite, got "
+                  << report.workload_graph.operations.size() << '\n';
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    return true;
+}
+
 bool verify_cache_aware_tiling_for_inference() {
     const auto weak_cache = unique_temp_file("tiling-weak-exec");
     const auto strong_cache = unique_temp_file("tiling-strong-exec");
@@ -872,7 +1151,9 @@ bool verify_operation_variant_registry() {
     const auto reduction_latency_variants = jakal::OperationVariantRegistry::builtin().resolve(reduction_latency_request);
 
     return has_variant(matmul_variants, "single-device-balanced") &&
+           has_variant(reduction_variants, "host-critical-path") &&
            has_variant(matmul_variants, "throughput-overlap") &&
+           has_variant(matmul_variants, "cooperative-split") &&
            has_variant(matmul_variants, "low-precision-overlap") &&
            has_variant(matmul_variants, "placement-sharded") &&
            has_variant(matmul_variants, "accelerator-ddp") &&
@@ -1053,6 +1334,16 @@ int main() {
         return 1;
     }
     std::cerr << "stage: partition\n";
+    if (!verify_device_agnostic_planning_and_execution()) {
+        std::cerr << "Device-agnostic planning check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: device-agnostic\n";
+    if (!verify_aggressive_graph_rewrites()) {
+        std::cerr << "Aggressive graph rewrite check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: rewrites\n";
     if (!verify_cache_aware_tiling_for_inference()) {
         std::cerr << "Inference cache-aware tiling check failed.\n";
         return 1;

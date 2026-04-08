@@ -26,6 +26,7 @@ constexpr std::uint32_t kMinimumAutoBaselineObservations = 1u;
 constexpr std::uint32_t kMinimumFamilyAutoBaselineObservations = 2u;
 constexpr std::uint32_t kStrategyExplorationTargetObservations = 1u;
 constexpr std::uint64_t kMaximumFamilyStalenessEpochs = 32u;
+constexpr std::string_view kPlannerHeuristicRevision = "planner-r2-device-agnostic";
 
 struct PartitionAllocationBias {
     double host_ratio = 0.0;
@@ -104,7 +105,8 @@ std::string build_signature(const WorkloadSpec& workload, const std::vector<Hard
     std::sort(fingerprints.begin(), fingerprints.end());
 
     std::ostringstream signature;
-    signature << workload.name << '|'
+    signature << kPlannerHeuristicRevision << '|'
+              << workload.name << '|'
               << to_string(workload.kind) << '|'
               << workload.dataset_tag << '|'
               << to_string(canonical_workload_phase(workload)) << '|'
@@ -134,7 +136,8 @@ std::string build_learning_key(const WorkloadSpec& workload, const std::vector<H
     std::sort(fingerprints.begin(), fingerprints.end());
 
     std::ostringstream key;
-    key << workload.name << '|'
+    key << kPlannerHeuristicRevision << '|'
+        << workload.name << '|'
         << to_string(workload.kind) << '|'
         << workload.dataset_tag << '|'
         << to_string(canonical_workload_phase(workload)) << '|'
@@ -161,7 +164,8 @@ std::string build_family_learning_key(const WorkloadSpec& workload, const std::v
     std::sort(family_tokens.begin(), family_tokens.end());
 
     std::ostringstream key;
-    key << workload.name << '|'
+    key << kPlannerHeuristicRevision << '|'
+        << workload.name << '|'
         << to_string(workload.kind) << '|'
         << workload.dataset_tag << '|'
         << to_string(canonical_workload_phase(workload)) << '|'
@@ -310,6 +314,61 @@ PartitionAllocationBias partition_allocation_bias(const PartitionStrategy strate
     }
 }
 
+double workload_host_exchange_ratio(const WorkloadSpec& workload) {
+    const auto working_set = std::max<std::uint64_t>(workload.working_set_bytes, 1ull);
+    return std::clamp(
+        static_cast<double>(workload.host_exchange_bytes) / static_cast<double>(working_set),
+        0.0,
+        4.0);
+}
+
+double workload_compute_intensity(const WorkloadSpec& workload) {
+    if (workload.working_set_bytes == 0ull || workload.estimated_flops <= 0.0) {
+        return workload.matrix_friendly ? 48.0 : 12.0;
+    }
+    return workload.estimated_flops / static_cast<double>(workload.working_set_bytes);
+}
+
+double workload_dispatch_sensitivity(const WorkloadSpec& workload) {
+    double sensitivity = 0.0;
+    if (workload.latency_sensitive) {
+        sensitivity += workload.batch_size <= 1u ? 0.55 : 0.28;
+    }
+    sensitivity += std::clamp(workload_host_exchange_ratio(workload) * 0.45, 0.0, 0.30);
+    if (!workload.matrix_friendly) {
+        sensitivity += 0.18;
+    }
+    if (workload.prefer_unified_memory) {
+        sensitivity += 0.08;
+    }
+    return std::clamp(sensitivity, 0.0, 1.0);
+}
+
+double auto_host_ratio_floor(const WorkloadSpec& workload) {
+    double floor = 0.0;
+    if (workload.latency_sensitive) {
+        floor += workload.batch_size <= 1u ? 0.10 : 0.05;
+    }
+    floor += std::clamp(workload_host_exchange_ratio(workload) * 0.40, 0.0, 0.16);
+    if (!workload.matrix_friendly) {
+        floor += 0.08;
+    }
+    if (workload.prefer_unified_memory) {
+        floor += 0.03;
+    }
+    return std::clamp(floor, 0.0, 0.32);
+}
+
+double auto_accelerator_ratio_floor(const WorkloadSpec& workload) {
+    double floor = 0.0;
+    if (workload.matrix_friendly) {
+        floor += workload.latency_sensitive ? 0.42 : 0.55;
+    } else if (workload.estimated_flops >= 5.0e10) {
+        floor += 0.12;
+    }
+    return std::clamp(floor, 0.0, 0.60);
+}
+
 double strategy_selection_score(
     const WorkloadSpec& workload,
     const std::uint32_t observations,
@@ -350,11 +409,22 @@ double strategy_selection_score(
 
 double compute_weight_from_workload(const WorkloadSpec& workload) {
     if (workload.working_set_bytes == 0 || workload.estimated_flops <= 0.0) {
-        return workload.matrix_friendly ? 0.72 : 0.60;
+        double fallback = workload.matrix_friendly ? 0.72 : 0.60;
+        fallback -= workload_dispatch_sensitivity(workload) * (workload.matrix_friendly ? 0.10 : 0.18);
+        return std::clamp(fallback, 0.18, workload.matrix_friendly ? 0.82 : 0.70);
     }
 
-    const double intensity = workload.estimated_flops / static_cast<double>(workload.working_set_bytes);
-    return std::clamp(intensity / 64.0, 0.25, workload.matrix_friendly ? 0.88 : 0.82);
+    const double intensity = workload_compute_intensity(workload);
+    const double dispatch_sensitivity = workload_dispatch_sensitivity(workload);
+    const double exchange_ratio = workload_host_exchange_ratio(workload);
+
+    double weight = std::clamp(intensity / 64.0, 0.22, workload.matrix_friendly ? 0.88 : 0.76);
+    weight -= dispatch_sensitivity * (workload.matrix_friendly ? 0.14 : 0.22);
+    weight -= std::clamp(exchange_ratio * 0.12, 0.0, 0.18);
+    if (workload.latency_sensitive && workload.batch_size <= 1u && !workload.matrix_friendly) {
+        weight -= 0.08;
+    }
+    return std::clamp(weight, 0.18, workload.matrix_friendly ? 0.82 : 0.70);
 }
 
 double effective_host_link_gbps(const HardwareGraphSummary& summary) {
@@ -390,6 +460,7 @@ double effective_sync_latency_us(const HardwareGraphSummary& summary) {
 
 ScoreComponents score_graph(const HardwareGraph& graph, const WorkloadSpec& workload) {
     const auto summary = summarize_graph(graph);
+    const bool host_graph = is_host_graph(graph);
     const double execution_objects = static_cast<double>(std::max(summary.execution_objects, 1u));
     const double lanes_per_object = static_cast<double>(std::max(summary.lanes_per_object, 1u));
     const double resident_contexts = static_cast<double>(std::max(summary.resident_contexts, 1u));
@@ -402,6 +473,9 @@ ScoreComponents score_graph(const HardwareGraph& graph, const WorkloadSpec& work
     const double addressable_gib = static_cast<double>(summary.addressable_bytes) / kGiB;
     const double scratch_kib = static_cast<double>(summary.local_scratch_bytes) / kKiB;
     const double cache_mib = static_cast<double>(summary.cache_bytes) / kMiB;
+    const double dispatch_sensitivity = workload_dispatch_sensitivity(workload);
+    const double exchange_ratio = workload_host_exchange_ratio(workload);
+    const double compute_intensity = workload_compute_intensity(workload);
 
     const double structural_parallelism =
         execution_objects * std::sqrt(lanes_per_object) * std::log2(resident_contexts + 1.0) * clock_ghz;
@@ -418,6 +492,9 @@ ScoreComponents score_graph(const HardwareGraph& graph, const WorkloadSpec& work
     if (summary.unified_address_space && workload.prefer_unified_memory) {
         memory_score *= 1.10;
     }
+    if (host_graph && dispatch_sensitivity > 0.0) {
+        memory_score *= 1.0 + (dispatch_sensitivity * 0.05);
+    }
 
     double graph_bonus = 1.0;
     if (workload.matrix_friendly) {
@@ -430,6 +507,25 @@ ScoreComponents score_graph(const HardwareGraph& graph, const WorkloadSpec& work
         }
         if (summary.supports_int8) {
             graph_bonus += 0.08;
+        }
+    }
+    if (host_graph) {
+        graph_bonus += dispatch_sensitivity * 0.28;
+        graph_bonus += std::clamp(exchange_ratio * 0.30, 0.0, 0.28);
+        if (workload.latency_sensitive && workload.batch_size <= 1u) {
+            graph_bonus += 0.12;
+        }
+        if (workload.matrix_friendly && compute_intensity >= 48.0) {
+            graph_bonus -= 0.22;
+            memory_score *= 0.96;
+        }
+    } else {
+        graph_bonus -= dispatch_sensitivity * (workload.matrix_friendly ? 0.06 : 0.16);
+        if (!workload.matrix_friendly && compute_intensity < 24.0) {
+            graph_bonus -= 0.06;
+        }
+        if (workload.matrix_friendly && compute_intensity >= 48.0) {
+            graph_bonus += 0.12;
         }
     }
 
@@ -455,6 +551,17 @@ ScoreComponents score_graph(const HardwareGraph& graph, const WorkloadSpec& work
     } else if (!summary.unified_address_space) {
         transfer_penalty += workload.latency_sensitive ? 0.30 : 0.10;
     }
+    if (host_graph) {
+        transfer_penalty *= workload.host_exchange_bytes > 0 ? 0.45 : 0.60;
+    } else {
+        transfer_penalty += exchange_ratio * (workload.latency_sensitive ? 0.90 : 0.45);
+        if (dispatch_sensitivity > 0.0 && !summary.unified_address_space) {
+            transfer_penalty += dispatch_sensitivity * 0.35;
+        }
+        if (workload.matrix_friendly && compute_intensity >= 48.0) {
+            transfer_penalty *= 0.92;
+        }
+    }
 
     if (workload.prefer_unified_memory && summary.unified_address_space) {
         transfer_penalty *= 0.75;
@@ -479,7 +586,7 @@ ScoreComponents score_graph(const HardwareGraph& graph, const WorkloadSpec& work
     return ScoreComponents{
         structural_parallelism,
         memory_score,
-        graph_bonus,
+        std::max(0.55, graph_bonus),
         transfer_penalty,
         memory_fit_cap};
 }
@@ -1012,6 +1119,24 @@ ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vecto
         candidates.resize(2);
     }
 
+    const auto normalize_candidate_ratios = [&]() {
+        double total_ratio = 0.0;
+        for (const auto& candidate : candidates) {
+            total_ratio += candidate.ratio;
+        }
+
+        if (total_ratio <= 0.0 && !candidates.empty()) {
+            candidates.front().ratio = 1.0;
+            total_ratio = 1.0;
+        }
+
+        if (total_ratio > 0.0) {
+            for (auto& candidate : candidates) {
+                candidate.ratio /= total_ratio;
+            }
+        }
+    };
+
     double total_score = 0.0;
     for (const auto& candidate : candidates) {
         total_score += candidate.score;
@@ -1024,19 +1149,51 @@ ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vecto
         candidate.ratio = std::min(candidate.score / total_score, candidate.cap);
     }
 
-    double total_ratio = 0.0;
-    for (const auto& candidate : candidates) {
-        total_ratio += candidate.ratio;
-    }
+    normalize_candidate_ratios();
 
-    if (total_ratio <= 0.0 && !candidates.empty()) {
-        candidates.front().ratio = 1.0;
-        total_ratio = 1.0;
-    }
+    if (effective_workload.partition_strategy == PartitionStrategy::auto_balanced && candidates.size() > 1u) {
+        const auto enforce_group_floor = [&](const auto& predicate, const double target_floor) {
+            if (!(target_floor > 0.0) || !(target_floor < 1.0)) {
+                return;
+            }
 
-    if (total_ratio > 0.0) {
-        for (auto& candidate : candidates) {
-            candidate.ratio /= total_ratio;
+            double group_ratio = 0.0;
+            double other_ratio = 0.0;
+            for (const auto& candidate : candidates) {
+                if (predicate(candidate)) {
+                    group_ratio += candidate.ratio;
+                } else {
+                    other_ratio += candidate.ratio;
+                }
+            }
+
+            if (group_ratio >= target_floor || group_ratio <= 0.0 || other_ratio <= 0.0) {
+                return;
+            }
+
+            const double scale_group = target_floor / group_ratio;
+            const double scale_other = (1.0 - target_floor) / other_ratio;
+            for (auto& candidate : candidates) {
+                candidate.ratio *= predicate(candidate) ? scale_group : scale_other;
+            }
+        };
+
+        const bool has_host = std::any_of(candidates.begin(), candidates.end(), [](const Candidate& candidate) {
+            return is_host_graph(candidate.graph);
+        });
+        const bool has_accelerator =
+            std::any_of(candidates.begin(), candidates.end(), [](const Candidate& candidate) {
+                return !is_host_graph(candidate.graph);
+            });
+
+        if (has_host && has_accelerator) {
+            enforce_group_floor(
+                [](const Candidate& candidate) { return is_host_graph(candidate.graph); },
+                auto_host_ratio_floor(effective_workload));
+            enforce_group_floor(
+                [](const Candidate& candidate) { return !is_host_graph(candidate.graph); },
+                auto_accelerator_ratio_floor(effective_workload));
+            normalize_candidate_ratios();
         }
     }
 
@@ -1053,15 +1210,7 @@ ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vecto
         candidates.front().ratio = 1.0;
     }
 
-    total_ratio = 0.0;
-    for (const auto& candidate : candidates) {
-        total_ratio += candidate.ratio;
-    }
-    if (total_ratio > 0.0) {
-        for (auto& candidate : candidates) {
-            candidate.ratio /= total_ratio;
-        }
-    }
+    normalize_candidate_ratios();
 
     if (uses_explicit_partition_strategy(effective_workload)) {
         const auto host_graph_it = std::find_if(graphs.begin(), graphs.end(), [](const HardwareGraph& graph) {
