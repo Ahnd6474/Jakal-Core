@@ -140,6 +140,71 @@ std::unordered_map<std::string, std::uint32_t> operation_indices(const WorkloadG
     return indices;
 }
 
+std::string join_signature_fields(const std::vector<std::string>& values) {
+    std::ostringstream stream;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0u) {
+            stream << ',';
+        }
+        stream << values[index];
+    }
+    return stream.str();
+}
+
+std::string compiled_graph_signature(const WorkloadGraph& graph) {
+    std::ostringstream stream;
+    stream << "base=" << graph.signature << '|';
+    for (const auto& tensor : graph.tensors) {
+        stream << "tensor:" << tensor.id
+               << ':' << tensor.alias_group
+               << ':' << tensor.producer_operation
+               << ':' << join_signature_fields(tensor.consumer_operations)
+               << ':' << tensor.bytes
+               << ':' << tensor.persistent
+               << ':' << tensor.temporary
+               << ':' << tensor.host_visible
+               << '|';
+    }
+    for (const auto& lifetime : graph.lifetimes) {
+        stream << "life:" << lifetime.tensor_id
+               << ':' << lifetime.first_operation_index
+               << ':' << lifetime.last_operation_index
+               << ':' << lifetime.bytes
+               << ':' << lifetime.persistent
+               << '|';
+    }
+    for (const auto& dependency : graph.dependencies) {
+        stream << "dep:" << dependency.source_operation_name
+               << ':' << dependency.target_operation_name
+               << ':' << dependency.tensor_id
+               << ':' << dependency.requires_residency
+               << '|';
+    }
+    for (const auto& operation : graph.operations) {
+        stream << "op:" << operation.name
+               << ':' << to_string(operation.op_class)
+               << ':' << operation.input_bytes
+               << ':' << operation.output_bytes
+               << ':' << operation.temporary_bytes
+               << ':' << std::defaultfloat << std::setprecision(17) << operation.estimated_flops
+               << ':' << operation.max_relative_error
+               << ':' << operation.parallelizable
+               << ':' << operation.reduction_like
+               << ':' << operation.streaming_friendly
+               << ':' << operation.matrix_friendly
+               << ':' << join_signature_fields(operation.input_tensor_ids)
+               << ':' << join_signature_fields(operation.output_tensor_ids)
+               << ':' << join_signature_fields(operation.temporary_tensor_ids)
+               << ':' << join_signature_fields(operation.dependency_operation_names)
+               << ':' << join_signature_fields(operation.fused_operation_names)
+               << '|';
+        for (const auto extent : operation.extents) {
+            stream << "extent:" << extent << '|';
+        }
+    }
+    return stream.str();
+}
+
 std::uint32_t lookup_index(
     const std::unordered_map<std::string, std::uint32_t>& indices,
     const std::string& operation_name,
@@ -2555,6 +2620,83 @@ void finalize_workload_graph(WorkloadGraph& graph) {
 
 void normalize_workload_graph(WorkloadGraph& graph) {
     finalize_workload_graph(graph);
+}
+
+CompiledWorkloadGraph compile_workload_graph(const WorkloadGraph& graph) {
+    CompiledWorkloadGraph compiled;
+    compiled.signature = compiled_graph_signature(graph);
+    compiled.tensors.reserve(graph.tensors.size());
+    compiled.operations.reserve(graph.operations.size());
+    compiled.tensor_indices.reserve(graph.tensors.size());
+    compiled.operation_indices.reserve(graph.operations.size());
+
+    for (std::uint32_t index = 0; index < graph.tensors.size(); ++index) {
+        const auto& tensor = graph.tensors[index];
+        compiled.tensor_indices.emplace(tensor.id, index);
+    }
+    for (std::uint32_t index = 0; index < graph.operations.size(); ++index) {
+        compiled.operation_indices.emplace(graph.operations[index].name, index);
+    }
+
+    std::unordered_map<std::string, std::uint32_t> lifetime_indices;
+    lifetime_indices.reserve(graph.lifetimes.size());
+    for (std::uint32_t index = 0; index < graph.lifetimes.size(); ++index) {
+        lifetime_indices.emplace(graph.lifetimes[index].tensor_id, index);
+    }
+
+    for (const auto& tensor : graph.tensors) {
+        CompiledTensorRef compiled_tensor;
+        compiled_tensor.id = tensor.id;
+        compiled_tensor.alias_group = tensor.alias_group;
+        compiled_tensor.bytes = tensor.bytes;
+        compiled_tensor.persistent = tensor.persistent;
+        compiled_tensor.temporary = tensor.temporary;
+        compiled_tensor.host_visible = tensor.host_visible;
+        if (const auto it = lifetime_indices.find(tensor.id); it != lifetime_indices.end()) {
+            const auto& lifetime = graph.lifetimes[it->second];
+            compiled_tensor.lifetime_index = it->second;
+            compiled_tensor.first_operation_index = lifetime.first_operation_index;
+            compiled_tensor.last_operation_index = lifetime.last_operation_index;
+            compiled_tensor.has_lifetime = true;
+        }
+        compiled.tensors.push_back(std::move(compiled_tensor));
+    }
+
+    for (std::uint32_t operation_index = 0; operation_index < graph.operations.size(); ++operation_index) {
+        const auto& operation = graph.operations[operation_index];
+        CompiledOperationRef compiled_operation;
+        compiled_operation.name = operation.name;
+        compiled_operation.operation_index = operation_index;
+        compiled_operation.input_tensor_indices.reserve(operation.input_tensor_ids.size());
+        compiled_operation.output_tensor_indices.reserve(operation.output_tensor_ids.size());
+        compiled_operation.temporary_tensor_indices.reserve(operation.temporary_tensor_ids.size());
+        compiled_operation.dependency_operation_indices.reserve(operation.dependency_operation_names.size());
+
+        for (const auto& tensor_id : operation.input_tensor_ids) {
+            if (const auto it = compiled.tensor_indices.find(tensor_id); it != compiled.tensor_indices.end()) {
+                compiled_operation.input_tensor_indices.push_back(it->second);
+            }
+        }
+        for (const auto& tensor_id : operation.output_tensor_ids) {
+            if (const auto it = compiled.tensor_indices.find(tensor_id); it != compiled.tensor_indices.end()) {
+                compiled_operation.output_tensor_indices.push_back(it->second);
+            }
+        }
+        for (const auto& tensor_id : operation.temporary_tensor_ids) {
+            if (const auto it = compiled.tensor_indices.find(tensor_id); it != compiled.tensor_indices.end()) {
+                compiled_operation.temporary_tensor_indices.push_back(it->second);
+            }
+        }
+        for (const auto& dependency_name : operation.dependency_operation_names) {
+            if (const auto it = compiled.operation_indices.find(dependency_name); it != compiled.operation_indices.end()) {
+                compiled_operation.dependency_operation_indices.push_back(it->second);
+            }
+        }
+
+        compiled.operations.push_back(std::move(compiled_operation));
+    }
+
+    return compiled;
 }
 
 WorkloadManifest load_workload_source(const std::filesystem::path& path) {

@@ -165,6 +165,8 @@ struct ResidencyAction {
     std::string tensor_id;
     std::string device_uid;
     std::string trigger_operation_name;
+    std::uint32_t tensor_index = kInvalidExecutionIndex;
+    std::uint32_t device_index = kInvalidExecutionIndex;
     std::uint32_t operation_index = 0;
     std::uint64_t bytes = 0;
     bool persistent = false;
@@ -172,6 +174,9 @@ struct ResidencyAction {
 
 struct ResidencySequenceReport {
     std::vector<ResidencyAction> actions;
+    std::vector<std::string> indexed_tensors;
+    std::vector<std::string> indexed_devices;
+    std::vector<std::string> indexed_operations;
     std::uint64_t peak_live_bytes = 0;
     std::uint64_t spill_bytes = 0;
     std::uint64_t reload_bytes = 0;

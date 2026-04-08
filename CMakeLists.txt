@@ -101,7 +101,9 @@ if(JAKAL_CORE_BUILD_TESTS)
     add_executable(jakal_optimization tests/optimization.cpp)
     target_link_libraries(jakal_optimization PRIVATE jakal::core)
 
-    add_test(NAME jakal_optimization COMMAND jakal_optimization)
+    add_test(NAME jakal_optimization COMMAND jakal_optimization --fast)
+    add_test(NAME jakal_optimization_long COMMAND jakal_optimization --long)
+    set_tests_properties(jakal_optimization_long PROPERTIES TIMEOUT 900)
 
     add_executable(jakal_planner_learning
         tests/planner_strategy_learning.cpp

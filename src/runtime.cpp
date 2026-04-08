@@ -59,7 +59,21 @@ struct RuntimeOptimizationContext {
     WorkloadSpec requested_workload;
     WorkloadSpec effective_workload;
     ExecutionTuningOverrides execution_tuning;
+    std::string optimizer_budget_source = "heuristic";
     std::string meta_summary;
+};
+
+struct ResolvedOptimizerBudget {
+    std::optional<std::uint32_t> budget_ms;
+    std::string source = "heuristic";
+};
+
+struct TelemetryBudgetSignal {
+    std::size_t samples = 0u;
+    double average_speedup_vs_reference = 0.0;
+    double average_transfer_overlap_ratio = 0.0;
+    double average_copy_share = 0.0;
+    double budget_exhaustion_ratio = 0.0;
 };
 
 bool is_host_graph(const HardwareGraph& graph) {
@@ -90,10 +104,247 @@ bool has_partitionable_topology(const std::vector<HardwareGraph>& graphs) {
     return false;
 }
 
+std::filesystem::path default_runtime_telemetry_path() {
+    try {
+        return std::filesystem::temp_directory_path() / "jakal_core_runtime_telemetry.tsv";
+    } catch (const std::exception&) {
+        return std::filesystem::path("jakal_core_runtime_telemetry.tsv");
+    }
+}
+
+std::vector<std::string> split_tab_fields(const std::string& line) {
+    std::vector<std::string> fields;
+    std::stringstream stream(line);
+    std::string field;
+    while (std::getline(stream, field, '\t')) {
+        fields.push_back(field);
+    }
+    return fields;
+}
+
+double parse_double_or(const std::string& value, const double fallback = 0.0) {
+    try {
+        return std::stod(value);
+    } catch (const std::exception&) {
+        return fallback;
+    }
+}
+
+std::uint32_t parse_uint32_or(const std::string& value, const std::uint32_t fallback = 0u) {
+    try {
+        return static_cast<std::uint32_t>(std::stoul(value));
+    } catch (const std::exception&) {
+        return fallback;
+    }
+}
+
+std::size_t header_index_or(
+    const std::unordered_map<std::string, std::size_t>& header_index,
+    const std::string& key,
+    const std::size_t fallback = std::numeric_limits<std::size_t>::max()) {
+    if (const auto it = header_index.find(key); it != header_index.end()) {
+        return it->second;
+    }
+    return fallback;
+}
+
+TelemetryBudgetSignal load_runtime_budget_signal(
+    const std::filesystem::path& telemetry_path,
+    const WorkloadSpec& workload) {
+    TelemetryBudgetSignal signal;
+    if (telemetry_path.empty() || !std::filesystem::exists(telemetry_path)) {
+        return signal;
+    }
+
+    std::ifstream input(telemetry_path);
+    if (!input.is_open()) {
+        return signal;
+    }
+
+    std::string header_line;
+    if (!std::getline(input, header_line)) {
+        return signal;
+    }
+    if (!header_line.empty() && header_line.front() == '#') {
+        header_line.erase(header_line.begin());
+        if (!header_line.empty() && header_line.front() == ' ') {
+            header_line.erase(header_line.begin());
+        }
+    }
+    const auto header_fields = split_tab_fields(header_line);
+    std::unordered_map<std::string, std::size_t> header_index;
+    for (std::size_t index = 0; index < header_fields.size(); ++index) {
+        header_index.emplace(header_fields[index], index);
+    }
+
+    const auto kind_index = header_index_or(header_index, "kind");
+    const auto phase_index = header_index_or(header_index, "phase");
+    const auto bucket_index = header_index_or(header_index, "shape_bucket");
+    const auto executed_index = header_index_or(header_index, "executed");
+    const auto speedup_index = header_index_or(header_index, "speedup_vs_reference");
+    const auto overlap_index = header_index_or(header_index, "transfer_overlap_ratio");
+    const auto copy_index = header_index_or(header_index, "copy_runtime_us");
+    const auto compute_index = header_index_or(header_index, "compute_runtime_us");
+    const auto budget_index = header_index_or(header_index, "optimizer_budget_ms");
+    const auto exhausted_index = header_index_or(header_index, "budget_exhausted");
+    if (kind_index == std::numeric_limits<std::size_t>::max() ||
+        phase_index == std::numeric_limits<std::size_t>::max() ||
+        bucket_index == std::numeric_limits<std::size_t>::max() ||
+        executed_index == std::numeric_limits<std::size_t>::max()) {
+        return signal;
+    }
+
+    const auto expected_kind = to_string(workload.kind);
+    const auto expected_phase = to_string(canonical_workload_phase(workload));
+    const auto expected_bucket = canonical_workload_shape_bucket(workload);
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto fields = split_tab_fields(line);
+        const auto field_at = [&](const std::size_t index) -> std::string {
+            return index < fields.size() ? fields[index] : std::string();
+        };
+        if (field_at(kind_index) != expected_kind ||
+            field_at(phase_index) != expected_phase ||
+            field_at(bucket_index) != expected_bucket ||
+            parse_uint32_or(field_at(executed_index), 0u) == 0u) {
+            continue;
+        }
+
+        const double copy_runtime_us = parse_double_or(field_at(copy_index), 0.0);
+        const double compute_runtime_us = parse_double_or(field_at(compute_index), 0.0);
+        const double total_copy_compute = std::max(copy_runtime_us + compute_runtime_us, 1.0);
+        ++signal.samples;
+        const double sample_count = static_cast<double>(signal.samples);
+        signal.average_speedup_vs_reference +=
+            (parse_double_or(field_at(speedup_index), 0.0) - signal.average_speedup_vs_reference) / sample_count;
+        signal.average_transfer_overlap_ratio +=
+            (parse_double_or(field_at(overlap_index), 0.0) - signal.average_transfer_overlap_ratio) / sample_count;
+        signal.average_copy_share += ((copy_runtime_us / total_copy_compute) - signal.average_copy_share) / sample_count;
+        signal.budget_exhaustion_ratio +=
+            ((parse_uint32_or(field_at(exhausted_index), 0u) > 0u ? 1.0 : 0.0) - signal.budget_exhaustion_ratio) /
+            sample_count;
+        (void)budget_index;
+    }
+
+    return signal;
+}
+
+std::uint32_t clamp_runtime_optimizer_budget(
+    const WorkloadSpec& workload,
+    const std::uint32_t budget_ms) {
+    const auto phase = canonical_workload_phase(workload);
+    if (workload.kind == WorkloadKind::training) {
+        return std::clamp<std::uint32_t>(budget_ms, 100u, 400u);
+    }
+    if (workload.kind == WorkloadKind::custom) {
+        return std::clamp<std::uint32_t>(budget_ms, 80u, 320u);
+    }
+    if (workload.kind == WorkloadKind::inference &&
+        workload.latency_sensitive &&
+        (phase == WorkloadPhase::decode || phase == WorkloadPhase::prefill)) {
+        return std::clamp<std::uint32_t>(budget_ms, 15u, 80u);
+    }
+    if (workload.kind == WorkloadKind::gaming || workload.kind == WorkloadKind::image) {
+        return std::clamp<std::uint32_t>(budget_ms, 20u, 90u);
+    }
+    if (workload.latency_sensitive) {
+        return std::clamp<std::uint32_t>(budget_ms, 25u, 120u);
+    }
+    return std::clamp<std::uint32_t>(budget_ms, 40u, 160u);
+}
+
 bool has_manual_execution_tuning(const ExecutionTuningOverrides& tuning) {
     return tuning.initial_state_override.has_value() ||
            tuning.graph_optimization_passes_override.has_value() ||
-           tuning.graph_rewrite_level > 1u;
+           tuning.optimizer_wall_time_budget_ms.has_value() ||
+           tuning.graph_rewrite_level > 1u ||
+           tuning.validation_tier != ValidationTier::adaptive;
+}
+
+ValidationTier choose_runtime_validation_tier(
+    const WorkloadSpec& workload,
+    const WorkloadGraph* workload_graph,
+    const ValidationTier configured_tier) {
+    if (configured_tier != ValidationTier::adaptive) {
+        return configured_tier;
+    }
+
+    const auto phase = canonical_workload_phase(workload);
+    const std::size_t operation_count = workload_graph == nullptr ? 0u : workload_graph->operations.size();
+    if (workload.kind == WorkloadKind::training || workload.kind == WorkloadKind::custom) {
+        return ValidationTier::full;
+    }
+    if (workload.kind == WorkloadKind::inference &&
+        workload.latency_sensitive &&
+        (phase == WorkloadPhase::decode || phase == WorkloadPhase::prefill || workload.batch_size <= 4u)) {
+        return ValidationTier::minimal;
+    }
+    if (workload.latency_sensitive && operation_count > 0u && operation_count <= 3u) {
+        return ValidationTier::minimal;
+    }
+    if (workload.kind == WorkloadKind::gaming || workload.kind == WorkloadKind::image) {
+        return ValidationTier::minimal;
+    }
+    return ValidationTier::adaptive;
+}
+
+ResolvedOptimizerBudget choose_runtime_optimizer_budget_ms(
+    const WorkloadSpec& workload,
+    const WorkloadGraph* workload_graph,
+    const std::optional<std::uint32_t>& configured_budget_ms,
+    const std::filesystem::path& telemetry_path) {
+    ResolvedOptimizerBudget resolved;
+    if (configured_budget_ms.has_value()) {
+        resolved.budget_ms = configured_budget_ms;
+        resolved.source = "configured";
+        return resolved;
+    }
+
+    const auto phase = canonical_workload_phase(workload);
+    const std::size_t operation_count = workload_graph == nullptr ? 0u : workload_graph->operations.size();
+    std::uint32_t budget_ms = 90u;
+    if (workload.kind == WorkloadKind::training) {
+        budget_ms = 250u;
+    } else if (workload.kind == WorkloadKind::custom) {
+        budget_ms = 180u;
+    } else if (
+        workload.kind == WorkloadKind::inference &&
+        workload.latency_sensitive &&
+        (phase == WorkloadPhase::decode || phase == WorkloadPhase::prefill)) {
+        budget_ms = operation_count > 6u ? 35u : 25u;
+    } else if (workload.kind == WorkloadKind::gaming || workload.kind == WorkloadKind::image) {
+        budget_ms = 40u;
+    } else if (workload.latency_sensitive) {
+        budget_ms = 55u;
+    }
+
+    const auto signal = load_runtime_budget_signal(telemetry_path, workload);
+    if (signal.samples >= 2u) {
+        int delta_ms = 0;
+        if (signal.budget_exhaustion_ratio >= 0.30) {
+            delta_ms += workload.latency_sensitive ? 12 : 24;
+            resolved.source = "telemetry-expand";
+        }
+        if (signal.average_copy_share >= 0.30 && signal.average_transfer_overlap_ratio <= 0.25) {
+            delta_ms += workload.latency_sensitive ? 8 : 16;
+            resolved.source = resolved.source == "heuristic" ? "telemetry-overlap" : resolved.source;
+        }
+        if (signal.budget_exhaustion_ratio <= 0.05 &&
+            signal.average_speedup_vs_reference >= 1.20 &&
+            signal.average_copy_share <= 0.18 &&
+            signal.average_transfer_overlap_ratio >= 0.50) {
+            delta_ms -= workload.latency_sensitive ? 5 : 10;
+            if (resolved.source == "heuristic") {
+                resolved.source = "telemetry-shrink";
+            }
+        }
+        budget_ms = clamp_runtime_optimizer_budget(
+            workload,
+            static_cast<std::uint32_t>(std::max(1, static_cast<int>(budget_ms) + delta_ms)));
+    }
+
+    resolved.budget_ms = budget_ms;
+    return resolved;
 }
 
 ContinuousExecutionState tuning_profile_state(const std::string& profile_name) {
@@ -346,6 +597,21 @@ RuntimeOptimizationContext resolve_runtime_optimization_context(
     }
     context.effective_workload = context.requested_workload;
     context.execution_tuning = options.optimization.execution;
+    context.execution_tuning.validation_tier = choose_runtime_validation_tier(
+        context.requested_workload,
+        workload_graph,
+        options.optimization.execution.validation_tier);
+    const auto telemetry_path =
+        options.product.observability.telemetry_path.empty()
+            ? default_runtime_telemetry_path()
+            : options.product.observability.telemetry_path;
+    const auto resolved_budget = choose_runtime_optimizer_budget_ms(
+        context.requested_workload,
+        workload_graph,
+        options.optimization.execution.optimizer_wall_time_budget_ms,
+        telemetry_path);
+    context.execution_tuning.optimizer_wall_time_budget_ms = resolved_budget.budget_ms;
+    context.optimizer_budget_source = resolved_budget.source;
 
     if (workload_graph == nullptr) {
         return context;
@@ -395,7 +661,21 @@ RuntimeOptimizationContext resolve_runtime_optimization_context(
             } else {
                 summary << "auto";
             }
+            summary << " budget=";
+            if (context.execution_tuning.optimizer_wall_time_budget_ms.has_value()) {
+                summary << *context.execution_tuning.optimizer_wall_time_budget_ms << "ms"
+                        << '[' << context.optimizer_budget_source << ']';
+            } else {
+                summary << "auto";
+            }
         }
+        context.meta_summary = summary.str();
+    } else if (context.execution_tuning.optimizer_wall_time_budget_ms.has_value() &&
+               context.optimizer_budget_source != "heuristic") {
+        std::ostringstream summary;
+        summary << "execution tuning budget="
+                << *context.execution_tuning.optimizer_wall_time_budget_ms
+                << "ms[" << context.optimizer_budget_source << ']';
         context.meta_summary = summary.str();
     }
 
@@ -1649,6 +1929,8 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
     struct SequencedTensor {
         std::string tensor_id;
         std::string device_uid;
+        std::uint32_t tensor_index = kInvalidExecutionIndex;
+        std::uint32_t device_index = kInvalidExecutionIndex;
         std::uint64_t bytes = 0;
         std::uint32_t first = 0;
         std::uint32_t last = 0;
@@ -1659,6 +1941,15 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
     if (optimization.workload_graph.operations.empty()) {
         return report;
     }
+    const auto compiled_workload = compile_workload_graph(optimization.workload_graph);
+    report.indexed_tensors.reserve(optimization.workload_graph.tensors.size());
+    for (const auto& tensor : optimization.workload_graph.tensors) {
+        report.indexed_tensors.push_back(tensor.id);
+    }
+    report.indexed_operations.reserve(optimization.workload_graph.operations.size());
+    for (const auto& operation : optimization.workload_graph.operations) {
+        report.indexed_operations.push_back(operation.name);
+    }
 
     std::unordered_map<std::string, TensorLifetime> lifetimes_by_id;
     lifetimes_by_id.reserve(optimization.workload_graph.lifetimes.size());
@@ -1666,16 +1957,24 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
         lifetimes_by_id.emplace(lifetime.tensor_id, lifetime);
     }
 
+    std::unordered_map<std::string, std::uint32_t> device_indices;
+    auto device_index_for = [&](const std::string& device_uid) {
+        if (const auto it = device_indices.find(device_uid); it != device_indices.end()) {
+            return it->second;
+        }
+        const auto index = static_cast<std::uint32_t>(report.indexed_devices.size());
+        report.indexed_devices.push_back(device_uid);
+        device_indices.emplace(device_uid, index);
+        return index;
+    };
+
     std::unordered_map<std::string, std::vector<SequencedTensor>> tensors_by_device;
     for (const auto& optimized : optimization.operations) {
         for (const auto& entry : optimized.graph.residency_plan) {
             auto& device_tensors = tensors_by_device[entry.device_uid];
-            const auto duplicate = std::find_if(
-                device_tensors.begin(),
-                device_tensors.end(),
-                [&](const SequencedTensor& tensor) {
-                    return tensor.tensor_id == entry.tensor_id;
-                });
+            const auto duplicate = std::find_if(device_tensors.begin(), device_tensors.end(), [&](const SequencedTensor& tensor) {
+                return tensor.tensor_index == entry.tensor_index;
+            });
             const auto lifetime_it = lifetimes_by_id.find(entry.tensor_id);
             const auto first = lifetime_it == lifetimes_by_id.end() ? 0u : lifetime_it->second.first_operation_index;
             const auto last = lifetime_it == lifetimes_by_id.end()
@@ -1685,6 +1984,8 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
                 device_tensors.push_back(SequencedTensor{
                     entry.tensor_id,
                     entry.device_uid,
+                    entry.tensor_index,
+                    device_index_for(entry.device_uid),
                     entry.bytes,
                     first,
                     last,
@@ -1714,10 +2015,19 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
              operation_index < optimization.workload_graph.operations.size();
              ++operation_index) {
             const auto& operation = optimization.workload_graph.operations[operation_index];
-            std::set<std::string> current_needed;
-            current_needed.insert(operation.input_tensor_ids.begin(), operation.input_tensor_ids.end());
-            current_needed.insert(operation.output_tensor_ids.begin(), operation.output_tensor_ids.end());
-            current_needed.insert(operation.temporary_tensor_ids.begin(), operation.temporary_tensor_ids.end());
+            std::unordered_set<std::uint32_t> current_needed_indices;
+            if (operation_index < compiled_workload.operations.size()) {
+                const auto& compiled_operation = compiled_workload.operations[operation_index];
+                current_needed_indices.insert(
+                    compiled_operation.input_tensor_indices.begin(),
+                    compiled_operation.input_tensor_indices.end());
+                current_needed_indices.insert(
+                    compiled_operation.output_tensor_indices.begin(),
+                    compiled_operation.output_tensor_indices.end());
+                current_needed_indices.insert(
+                    compiled_operation.temporary_tensor_indices.begin(),
+                    compiled_operation.temporary_tensor_indices.end());
+            }
 
             for (const auto& tensor : tensors) {
                 if (tensor.first > operation_index || tensor.last < operation_index) {
@@ -1727,7 +2037,7 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
                     continue;
                 }
                 const bool spilled = spilled_tensors.find(tensor.tensor_id) != spilled_tensors.end();
-                const bool needed_now = current_needed.find(tensor.tensor_id) != current_needed.end() ||
+                const bool needed_now = current_needed_indices.find(tensor.tensor_index) != current_needed_indices.end() ||
                                         tensor.first == operation_index || tensor.persistent;
                 if (!needed_now) {
                     continue;
@@ -1737,6 +2047,8 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
                     tensor.tensor_id,
                     device_uid,
                     operation.name,
+                    tensor.tensor_index,
+                    tensor.device_index,
                     operation_index,
                     tensor.bytes,
                     tensor.persistent});
@@ -1752,7 +2064,8 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
             while (safe_capacity > 0u && live_bytes > safe_capacity) {
                 auto candidate_it = live_tensors.end();
                 for (auto it = live_tensors.begin(); it != live_tensors.end(); ++it) {
-                    if (it->second.persistent || current_needed.find(it->first) != current_needed.end()) {
+                    if (it->second.persistent ||
+                        current_needed_indices.find(it->second.tensor_index) != current_needed_indices.end()) {
                         continue;
                     }
                     if (candidate_it == live_tensors.end() || it->second.last > candidate_it->second.last) {
@@ -1769,6 +2082,8 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
                     candidate_it->second.tensor_id,
                     device_uid,
                     operation.name,
+                    candidate_it->second.tensor_index,
+                    candidate_it->second.device_index,
                     operation_index,
                     candidate_it->second.bytes,
                     candidate_it->second.persistent});
@@ -1785,6 +2100,8 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
                         it->second.tensor_id,
                         device_uid,
                         operation.name,
+                        it->second.tensor_index,
+                        it->second.device_index,
                         operation_index,
                         it->second.bytes,
                         false});
@@ -2083,7 +2400,7 @@ void Runtime::persist_telemetry(
     }
 
     if (write_header) {
-        output << "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tsummary\n";
+        output << "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tcopy_runtime_us\tcompute_runtime_us\tcopy_overlap_ratio\ttransfer_us\toverlapped_transfer_us\ttransfer_overlap_gain_us\ttransfer_overlap_ratio\toptimizer_budget_ms\tbudget_exhausted\tsummary\n";
     }
 
     output << execution_epoch_ << '\t'
@@ -2111,6 +2428,15 @@ void Runtime::persist_telemetry(
            << report.asset_prefetch.total_host_to_device_bytes << '\t'
            << (report.executed ? report.execution.total_runtime_us : 0.0) << '\t'
            << (report.executed ? report.execution.speedup_vs_reference : 0.0) << '\t'
+           << (report.executed ? report.execution.total_copy_runtime_us : 0.0) << '\t'
+           << (report.executed ? report.execution.total_compute_runtime_us : 0.0) << '\t'
+           << (report.executed ? report.execution.copy_overlap_ratio : 0.0) << '\t'
+           << (report.executed ? report.execution.total_predicted_transfer_runtime_us : 0.0) << '\t'
+           << (report.executed ? report.execution.total_overlapped_transfer_runtime_us : 0.0) << '\t'
+           << (report.executed ? report.execution.total_transfer_overlap_gain_us : 0.0) << '\t'
+           << (report.executed ? report.execution.transfer_overlap_ratio : 0.0) << '\t'
+           << (report.executed ? report.execution.optimization.graph_optimization.time_budget_ms : 0u) << '\t'
+           << (report.executed && report.execution.optimization.graph_optimization.budget_exhausted ? 1 : 0) << '\t'
            << report.safety.summary << '\n';
 }
 

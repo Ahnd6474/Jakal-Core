@@ -16,14 +16,25 @@ struct OperationExecutionRecord {
     std::string requested_gpu_backend;
     std::vector<std::string> participating_devices;
     double runtime_us = 0.0;
+    double submit_runtime_us = 0.0;
+    double synchronize_runtime_us = 0.0;
+    double copy_runtime_us = 0.0;
+    double compute_runtime_us = 0.0;
+    double copy_overlap_ratio = 0.0;
+    double predicted_transfer_runtime_us = 0.0;
+    double overlapped_transfer_runtime_us = 0.0;
+    double transfer_overlap_ratio = 0.0;
+    double transfer_overlap_gain_us = 0.0;
     double reference_runtime_us = 0.0;
     double speedup_vs_reference = 1.0;
     double relative_error = 0.0;
     bool verified = false;
     bool used_host = false;
     bool used_opencl = false;
+    bool async_dispatch_capable = false;
     bool used_multiple_devices = false;
     std::uint32_t logical_partitions_used = 1;
+    std::uint32_t fused_operation_count = 0;
 };
 
 struct DirectExecutionReport {
@@ -31,6 +42,13 @@ struct DirectExecutionReport {
     std::vector<OperationExecutionRecord> operations;
     double total_runtime_us = 0.0;
     double total_reference_runtime_us = 0.0;
+    double total_copy_runtime_us = 0.0;
+    double total_compute_runtime_us = 0.0;
+    double copy_overlap_ratio = 0.0;
+    double total_predicted_transfer_runtime_us = 0.0;
+    double total_overlapped_transfer_runtime_us = 0.0;
+    double total_transfer_overlap_gain_us = 0.0;
+    double transfer_overlap_ratio = 0.0;
     double speedup_vs_reference = 1.0;
     bool all_succeeded = false;
 };

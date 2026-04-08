@@ -325,6 +325,31 @@ int main() {
             std::cerr << "managed execute did not emit residency sequence\n";
             return 1;
         }
+        if (manifest_managed.residency_sequence.indexed_tensors.empty() ||
+            manifest_managed.residency_sequence.indexed_devices.empty() ||
+            manifest_managed.residency_sequence.indexed_operations.empty()) {
+            std::cerr << "managed execute did not index residency sequence metadata\n";
+            return 1;
+        }
+        for (const auto& action : manifest_managed.residency_sequence.actions) {
+            if (action.tensor_index >= manifest_managed.residency_sequence.indexed_tensors.size() ||
+                manifest_managed.residency_sequence.indexed_tensors[action.tensor_index] != action.tensor_id ||
+                action.device_index >= manifest_managed.residency_sequence.indexed_devices.size() ||
+                manifest_managed.residency_sequence.indexed_devices[action.device_index] != action.device_uid ||
+                action.operation_index >= manifest_managed.residency_sequence.indexed_operations.size() ||
+                manifest_managed.residency_sequence.indexed_operations[action.operation_index] !=
+                    action.trigger_operation_name) {
+                std::cerr << "managed execute emitted invalid residency action indices\n";
+                return 1;
+            }
+        }
+        if (!manifest_managed.executed ||
+            manifest_managed.execution.total_predicted_transfer_runtime_us <= 0.0 ||
+            manifest_managed.execution.transfer_overlap_ratio < 0.0 ||
+            manifest_managed.execution.transfer_overlap_ratio > 1.0) {
+            std::cerr << "managed execute did not capture transfer overlap metrics\n";
+            return 1;
+        }
 
         const auto runtime_managed = runtime.execute_manifest(runtime_manifest_path);
         if (!runtime_managed.executed) {
@@ -356,6 +381,12 @@ int main() {
         }
         if (blocked.residency_sequence.actions.empty()) {
             std::cerr << "blocked managed path did not emit residency sequence\n";
+            return 1;
+        }
+        if (blocked.residency_sequence.indexed_tensors.empty() ||
+            blocked.residency_sequence.indexed_devices.empty() ||
+            blocked.residency_sequence.indexed_operations.empty()) {
+            std::cerr << "blocked managed path did not index residency metadata\n";
             return 1;
         }
         if (blocked.memory_preflight.predicted_spill_bytes != blocked.residency_sequence.spill_bytes ||
@@ -439,6 +470,19 @@ int main() {
         if (second_blob_it == matmul_second.asset_prefetch.entries.end() ||
             second_blob_it->path != first_blob_it->path) {
             std::cerr << "matmul manifest did not reuse packed rhs blob path\n";
+            return 1;
+        }
+
+        std::ifstream telemetry(manifest_managed.telemetry_path);
+        std::string telemetry_header;
+        std::string telemetry_row;
+        std::getline(telemetry, telemetry_header);
+        std::getline(telemetry, telemetry_row);
+        if (telemetry_header.find("transfer_us") == std::string::npos ||
+            telemetry_header.find("overlapped_transfer_us") == std::string::npos ||
+            telemetry_header.find("transfer_overlap_ratio") == std::string::npos ||
+            telemetry_row.empty()) {
+            std::cerr << "runtime telemetry missing transfer overlap columns\n";
             return 1;
         }
         const auto second_blob_time = std::filesystem::last_write_time(second_blob_it->path);

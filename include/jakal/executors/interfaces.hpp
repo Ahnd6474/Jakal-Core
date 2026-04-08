@@ -36,9 +36,16 @@ struct BackendRunResult {
     std::vector<float> output;
     double scalar_output = 0.0;
     double runtime_us = 0.0;
+    double submit_runtime_us = 0.0;
+    double synchronize_runtime_us = 0.0;
+    double copy_runtime_us = 0.0;
+    double compute_runtime_us = 0.0;
+    double copy_overlap_ratio = 0.0;
+    std::uint32_t persistent_resource_reuse_hits = 0;
     bool success = false;
     bool used_host = true;
     bool used_opencl = false;
+    bool async_dispatch_capable = false;
     std::string error;
 };
 
@@ -48,6 +55,7 @@ public:
 
     [[nodiscard]] virtual bool matches(const HardwareGraph& graph) const = 0;
     [[nodiscard]] virtual std::string name() const = 0;
+    [[nodiscard]] virtual bool supports_async_dispatch(const HardwareGraph& graph) const = 0;
 
     virtual BackendRunResult run_elementwise(
         const HardwareGraph& graph,

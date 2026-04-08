@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -13,7 +14,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -1779,6 +1779,31 @@ BackendRunResult dispatch_backend(
 
 }  // namespace
 
+struct TransferOverlapMetrics {
+    double predicted_transfer_runtime_us = 0.0;
+    double overlapped_transfer_runtime_us = 0.0;
+    double transfer_overlap_gain_us = 0.0;
+    double transfer_overlap_ratio = 0.0;
+};
+
+TransferOverlapMetrics summarize_transfer_overlap(const ExecutionGraph& graph) {
+    TransferOverlapMetrics metrics;
+    for (const auto& transfer : graph.transfer_schedule) {
+        metrics.predicted_transfer_runtime_us += transfer.predicted_latency_us;
+        metrics.overlapped_transfer_runtime_us += transfer.predicted_latency_us * transfer.overlap_ratio;
+    }
+    metrics.transfer_overlap_gain_us =
+        std::min(metrics.predicted_transfer_runtime_us, std::max(graph.predicted_overlap_gain_us, 0.0));
+    if (metrics.predicted_transfer_runtime_us > 0.0) {
+        metrics.transfer_overlap_ratio =
+            std::clamp(
+                metrics.overlapped_transfer_runtime_us / metrics.predicted_transfer_runtime_us,
+                0.0,
+                1.0);
+    }
+    return metrics;
+}
+
 DirectExecutionReport DirectExecutor::execute(
     const OptimizationReport& optimization,
     const std::vector<HardwareGraph>& graphs,
@@ -1823,6 +1848,13 @@ DirectExecutionReport DirectExecutor::execute(
             record.participating_devices = optimized.config.participating_devices;
             record.used_multiple_devices = assignments.size() > 1;
             record.logical_partitions_used = optimized.config.logical_partitions;
+            record.fused_operation_count =
+                static_cast<std::uint32_t>(optimized.operation.fused_operation_names.size());
+            const auto transfer_metrics = summarize_transfer_overlap(optimized.graph);
+            record.predicted_transfer_runtime_us = transfer_metrics.predicted_transfer_runtime_us;
+            record.overlapped_transfer_runtime_us = transfer_metrics.overlapped_transfer_runtime_us;
+            record.transfer_overlap_gain_us = transfer_metrics.transfer_overlap_gain_us;
+            record.transfer_overlap_ratio = transfer_metrics.transfer_overlap_ratio;
             for (const auto& assignment : assignments) {
                 if (assignment.graph->probe == "host") {
                     continue;
@@ -1990,13 +2022,14 @@ DirectExecutionReport DirectExecutor::execute(
                 }
             }
 
-            std::vector<std::future<BackendRunResult>> futures;
-            futures.reserve(assignments.size());
             double simulated_runtime_us = 0.0;
             const auto wall_runtime_us = measure_us([&]() {
                 const auto merge_shard = [&](const BackendRunResult& shard, const DeviceAssignment& assignment) {
                     record.used_host = record.used_host || shard.used_host;
                     record.used_opencl = record.used_opencl || shard.used_opencl;
+                    record.async_dispatch_capable = record.async_dispatch_capable || shard.async_dispatch_capable;
+                    record.submit_runtime_us += shard.submit_runtime_us;
+                    record.synchronize_runtime_us += shard.synchronize_runtime_us;
                     if (!shard.error.empty()) {
                         if (!record.backend_error.empty()) {
                             record.backend_error += "; ";
@@ -2065,22 +2098,29 @@ DirectExecutionReport DirectExecutor::execute(
                     return;
                 }
 
-                for (const auto& assignment : assignments) {
-                    futures.push_back(std::async(
-                        std::launch::async,
-                        [&optimized,
-                         &operation_data,
-                         &host_backend,
-                         &opencl_backend,
-                         &level_zero_backend,
-                         &cuda_backend,
-                         &rocm_backend,
-                         &vulkan_backend,
-                         &jakal_toolkit_index,
-                         assignment]() {
-                            const auto* preferred_gpu_variant =
-                                find_preferred_gpu_variant(assignment, jakal_toolkit_index, optimized.operation);
-                            return dispatch_backend(
+                std::vector<BackendRunResult> shard_results(assignments.size());
+                std::vector<std::vector<std::size_t>> assignment_groups;
+                assignment_groups.reserve(assignments.size());
+                std::unordered_map<std::string, std::size_t> group_index_by_device;
+                for (std::size_t index = 0; index < assignments.size(); ++index) {
+                    const auto* graph = assignments[index].graph;
+                    const auto group_key = graph == nullptr
+                                               ? std::string("unknown:")
+                                               : (graph->uid.empty() ? ("probe:" + graph->probe) : graph->uid);
+                    const auto [it, inserted] = group_index_by_device.emplace(group_key, assignment_groups.size());
+                    if (inserted) {
+                        assignment_groups.push_back({});
+                    }
+                    assignment_groups[it->second].push_back(index);
+                }
+
+                const auto run_group = [&](const std::vector<std::size_t>& group) {
+                    for (const auto assignment_index : group) {
+                        const auto& assignment = assignments[assignment_index];
+                        const auto* preferred_gpu_variant =
+                            find_preferred_gpu_variant(assignment, jakal_toolkit_index, optimized.operation);
+                        shard_results[assignment_index] =
+                            dispatch_backend(
                                 assignment,
                                 optimized,
                                 operation_data,
@@ -2091,17 +2131,64 @@ DirectExecutionReport DirectExecutor::execute(
                                 *rocm_backend,
                                 *vulkan_backend,
                                 preferred_gpu_variant);
-                        }));
+                    }
+                };
+
+                const auto max_workers = std::max(1u, std::thread::hardware_concurrency());
+                const auto worker_count = std::min<std::size_t>(assignment_groups.size(), max_workers);
+                if (worker_count <= 1u) {
+                    for (const auto& group : assignment_groups) {
+                        run_group(group);
+                    }
+                } else {
+                    std::atomic_size_t next_group{0u};
+                    std::vector<std::thread> workers;
+                    workers.reserve(worker_count);
+                    for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+                        workers.emplace_back([&]() {
+                            while (true) {
+                                const auto group_index = next_group.fetch_add(1u);
+                                if (group_index >= assignment_groups.size()) {
+                                    break;
+                                }
+                                run_group(assignment_groups[group_index]);
+                            }
+                        });
+                    }
+                    for (auto& worker : workers) {
+                        worker.join();
+                    }
                 }
 
                 for (std::size_t index = 0; index < assignments.size(); ++index) {
-                    auto shard = futures[index].get();
+                    auto& shard = shard_results[index];
                     if (!shard.success) {
                         all_succeeded = false;
                         continue;
                     }
 
                     merge_shard(shard, assignments[index]);
+                }
+
+                if (!assignment_groups.empty()) {
+                    double async_group_runtime_us = 0.0;
+                    for (const auto& group : assignment_groups) {
+                        double submit_total_us = 0.0;
+                        double sync_tail_us = 0.0;
+                        double sequential_total_us = 0.0;
+                        bool async_group = true;
+                        for (const auto assignment_index : group) {
+                            const auto& shard = shard_results[assignment_index];
+                            sequential_total_us += shard.runtime_us;
+                            submit_total_us += shard.submit_runtime_us;
+                            sync_tail_us = std::max(sync_tail_us, shard.synchronize_runtime_us);
+                            async_group = async_group && shard.async_dispatch_capable;
+                        }
+                        const double group_runtime_us =
+                            async_group ? (submit_total_us + sync_tail_us) : sequential_total_us;
+                        async_group_runtime_us = std::max(async_group_runtime_us, group_runtime_us);
+                    }
+                    simulated_runtime_us = std::max(simulated_runtime_us, async_group_runtime_us);
                 }
             });
 
@@ -2122,6 +2209,9 @@ DirectExecutionReport DirectExecutor::execute(
             all_succeeded = all_succeeded && record.verified;
             report.total_runtime_us += record.runtime_us;
             report.total_reference_runtime_us += record.reference_runtime_us;
+            report.total_predicted_transfer_runtime_us += record.predicted_transfer_runtime_us;
+            report.total_overlapped_transfer_runtime_us += record.overlapped_transfer_runtime_us;
+            report.total_transfer_overlap_gain_us += record.transfer_overlap_gain_us;
             report.operations.push_back(std::move(record));
             const auto& completed = report.operations.back();
             trace_execution_line(
@@ -2146,6 +2236,13 @@ DirectExecutionReport DirectExecutor::execute(
         }
     }
 
+    if (report.total_predicted_transfer_runtime_us > 0.0) {
+        report.transfer_overlap_ratio =
+            std::clamp(
+                report.total_overlapped_transfer_runtime_us / report.total_predicted_transfer_runtime_us,
+                0.0,
+                1.0);
+    }
     report.speedup_vs_reference =
         report.total_runtime_us > 0.0 ? (report.total_reference_runtime_us / report.total_runtime_us) : 1.0;
     report.all_succeeded = all_succeeded;

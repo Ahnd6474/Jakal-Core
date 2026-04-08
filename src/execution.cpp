@@ -37,6 +37,7 @@ constexpr double kBytesPerGb = 1.0e9;
 constexpr double kMicrosecondsPerSecond = 1.0e6;
 constexpr std::uint32_t kLearningWarmupSamples = 3u;
 constexpr std::uint32_t kValidationMeasurementRounds = 2u;
+constexpr std::uint32_t kMinimumValidationMeasurementRounds = 1u;
 constexpr std::uint32_t kGraphOptimizationPasses = 4u;
 constexpr std::string_view kExecutionHeuristicRevision = "exec-r2-device-agnostic";
 
@@ -83,6 +84,8 @@ bool gpu_materialized_lowering_active(const OperationSpec& operation) {
 
 std::string join_csv(const std::vector<std::string>& values);
 const WorkloadTensor* find_workload_tensor(const WorkloadGraph& workload_graph, std::string_view tensor_id);
+const WorkloadTensor* find_workload_tensor(const WorkloadGraph& workload_graph, const CompiledWorkloadGraph& compiled, std::string_view tensor_id);
+const WorkloadTensor* find_workload_tensor(const WorkloadGraph& workload_graph, const CompiledWorkloadGraph& compiled, std::uint32_t tensor_index);
 const HardwareGraph* find_graph(
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     const std::string& uid);
@@ -95,6 +98,15 @@ std::filesystem::path performance_cache_path_for(const std::filesystem::path& ca
     }
     auto path = cache_path;
     path += ".perf";
+    return path;
+}
+
+std::filesystem::path graph_family_cache_path_for(const std::filesystem::path& cache_path) {
+    if (cache_path.empty()) {
+        return std::filesystem::path("jakal_core_execution_cache.tsv.perf.family");
+    }
+    auto path = cache_path;
+    path += ".perf.family";
     return path;
 }
 
@@ -411,6 +423,99 @@ bool fuse_elementwise_chain(
     return true;
 }
 
+bool can_fuse_elementwise_into_reduction(
+    const WorkloadGraph& graph,
+    const OperationSpec& producer,
+    const OperationSpec& consumer) {
+    if (producer.op_class != OperationClass::elementwise_map ||
+        consumer.op_class != OperationClass::reduction ||
+        producer.output_tensor_ids.size() != 1u ||
+        consumer.output_tensor_ids.empty()) {
+        return false;
+    }
+
+    const auto& intermediate_tensor = producer.output_tensor_ids.front();
+    if (std::find(consumer.input_tensor_ids.begin(), consumer.input_tensor_ids.end(), intermediate_tensor) ==
+        consumer.input_tensor_ids.end()) {
+        return false;
+    }
+
+    std::size_t consumer_count = 0u;
+    for (const auto& operation : graph.operations) {
+        if (operation.name == producer.name) {
+            continue;
+        }
+        if (std::find(operation.input_tensor_ids.begin(), operation.input_tensor_ids.end(), intermediate_tensor) !=
+            operation.input_tensor_ids.end()) {
+            ++consumer_count;
+            if (operation.name != consumer.name) {
+                return false;
+            }
+        }
+    }
+    return consumer_count == 1u;
+}
+
+bool fuse_elementwise_into_reduction(
+    WorkloadGraph& graph,
+    const std::string& producer_name,
+    const std::string& consumer_name) {
+    auto* producer = find_workload_operation_mutable(graph, producer_name);
+    auto* consumer = find_workload_operation_mutable(graph, consumer_name);
+    if (producer == nullptr || consumer == nullptr || !can_fuse_elementwise_into_reduction(graph, *producer, *consumer)) {
+        return false;
+    }
+
+    const auto intermediate_tensor = producer->output_tensor_ids.front();
+    for (const auto& tensor_id : producer->input_tensor_ids) {
+        if (append_unique(consumer->input_tensor_ids, tensor_id)) {
+            consumer->input_bytes += tensor_bytes_of(graph, tensor_id);
+        }
+        if (auto* tensor = find_workload_tensor_mutable(graph, tensor_id)) {
+            tensor->consumer_operations.erase(
+                std::remove(tensor->consumer_operations.begin(), tensor->consumer_operations.end(), producer_name),
+                tensor->consumer_operations.end());
+            append_unique(tensor->consumer_operations, consumer_name);
+        }
+    }
+
+    consumer->temporary_tensor_ids.insert(
+        consumer->temporary_tensor_ids.end(),
+        producer->temporary_tensor_ids.begin(),
+        producer->temporary_tensor_ids.end());
+    consumer->estimated_flops += producer->estimated_flops;
+    consumer->temporary_bytes += producer->temporary_bytes + (producer->output_bytes / 16u);
+    consumer->input_bytes = std::max(consumer->input_bytes, producer->input_bytes);
+    consumer->max_relative_error = std::max(consumer->max_relative_error, producer->max_relative_error);
+    consumer->streaming_friendly = consumer->streaming_friendly || producer->streaming_friendly;
+    append_unique(consumer->fused_operation_names, producer_name);
+    for (const auto& fused : producer->fused_operation_names) {
+        append_unique(consumer->fused_operation_names, fused);
+    }
+    for (const auto& dependency_name : producer->dependency_operation_names) {
+        append_unique(consumer->dependency_operation_names, dependency_name);
+    }
+
+    if (auto* tensor = find_workload_tensor_mutable(graph, intermediate_tensor)) {
+        tensor->consumer_operations.clear();
+    }
+    graph.tensors.erase(
+        std::remove_if(
+            graph.tensors.begin(),
+            graph.tensors.end(),
+            [&](const WorkloadTensor& tensor) {
+                return tensor.id == intermediate_tensor && !tensor.persistent && tensor.consumer_operations.empty();
+            }),
+        graph.tensors.end());
+    graph.operations.erase(
+        std::remove_if(
+            graph.operations.begin(),
+            graph.operations.end(),
+            [&](const OperationSpec& operation) { return operation.name == producer_name; }),
+        graph.operations.end());
+    return true;
+}
+
 void apply_operation_lowering_hints(
     const WorkloadSpec& workload,
     const HardwareGraphSummary& host_summary,
@@ -505,15 +610,20 @@ void apply_operation_lowering_hints(
             break;
         case OperationClass::reduction:
             operation.cpu_input_layout = "cpu-reduction-linear";
-            operation.cpu_output_layout = "cpu-scalar-reduced";
+            operation.cpu_output_layout =
+                operation.fused_operation_names.empty() ? "cpu-scalar-reduced" : "cpu-fused-reduction";
             operation.gpu_input_layout = "gpu-reduction-linear";
-            operation.gpu_output_layout = "gpu-scalar-reduced";
+            operation.gpu_output_layout =
+                operation.fused_operation_names.empty() ? "gpu-scalar-reduced" : "gpu-fused-reduction";
             operation.cpu_vectorized = has_host && host_summary.native_vector_bits >= 128u;
             operation.gpu_tensorized = has_accelerator &&
                                        (accelerator_summary.cache_bytes >= (512ull * kKiB) ||
                                         accelerator_summary.matrix_units > 0u);
             operation.cpu_micro_kernel_unroll = operation.cpu_vectorized ? 2u : 1u;
             operation.gpu_micro_kernel_unroll = operation.gpu_tensorized ? 4u : 1u;
+            if (!operation.fused_operation_names.empty()) {
+                operation.temporary_bytes += std::max<std::uint64_t>(operation.output_bytes / 8u, 16u);
+            }
             break;
         case OperationClass::resample_2d:
         default:
@@ -599,6 +709,33 @@ void optimize_workload_operations_for_targets(
                 break;
             }
         }
+        if (changed || graph_rewrite_level < 3u) {
+            continue;
+        }
+
+        for (std::size_t index = 0; index < graph.operations.size(); ++index) {
+            const auto& producer = graph.operations[index];
+            if (producer.op_class != OperationClass::elementwise_map || producer.output_tensor_ids.size() != 1u) {
+                continue;
+            }
+            const auto consumer_it = std::find_if(
+                graph.operations.begin(),
+                graph.operations.end(),
+                [&](const OperationSpec& operation) {
+                    return operation.name != producer.name &&
+                           std::find(
+                               operation.input_tensor_ids.begin(),
+                               operation.input_tensor_ids.end(),
+                               producer.output_tensor_ids.front()) != operation.input_tensor_ids.end();
+                });
+            if (consumer_it == graph.operations.end()) {
+                continue;
+            }
+            if (fuse_elementwise_into_reduction(graph, producer.name, consumer_it->name)) {
+                changed = true;
+                break;
+            }
+        }
     }
 
     normalize_workload_graph(graph);
@@ -622,13 +759,15 @@ std::string summarize_graph_set(const std::vector<HardwareGraph>& graphs) {
 }
 
 std::string performance_key(
+    const std::string& report_signature,
     const std::string& graph_set_signature,
     const WorkloadSpec& workload,
     const SystemProfile& system,
     const std::string& shape_bucket,
     const ExecutionConfig& config) {
     std::ostringstream stream;
-    stream << graph_set_signature << '|'
+    stream << report_signature << '|'
+           << graph_set_signature << '|'
            << to_string(workload.kind) << '|'
            << workload.dataset_tag << '|'
            << to_string(canonical_workload_phase(workload)) << '|'
@@ -662,12 +801,14 @@ std::string performance_key(
 }
 
 std::string backend_penalty_key(
+    const std::string& report_signature,
     const std::string& graph_set_signature,
     const WorkloadSpec& workload,
     const std::string& operation_name,
     const ExecutionConfig& config) {
     std::ostringstream stream;
-    stream << graph_set_signature << '|'
+    stream << report_signature << '|'
+           << graph_set_signature << '|'
            << to_string(workload.kind) << '|'
            << workload.dataset_tag << '|'
            << to_string(canonical_workload_phase(workload)) << '|'
@@ -679,6 +820,161 @@ std::string backend_penalty_key(
            << to_string(config.strategy) << '|'
            << config.logical_partitions;
     return stream.str();
+}
+
+std::string performance_family_key(
+    const std::string& report_signature,
+    const std::string& shape_bucket,
+    const ExecutionConfig& config) {
+    std::ostringstream stream;
+    stream << report_signature << '|'
+           << shape_bucket << '|'
+           << to_string(config.strategy) << '|'
+           << config.primary_device_uid << '|'
+           << config.participating_devices.size() << '|'
+           << config.logical_partitions << '|'
+           << config.overlap_transfers << '|'
+           << config.use_low_precision;
+    return stream.str();
+}
+
+using OptimizationDeadline = std::optional<std::chrono::steady_clock::time_point>;
+
+OptimizationDeadline make_optimizer_deadline(const ExecutionTuningOverrides* tuning_overrides) {
+    if (tuning_overrides == nullptr || !tuning_overrides->optimizer_wall_time_budget_ms.has_value()) {
+        return std::nullopt;
+    }
+    const auto budget_ms = *tuning_overrides->optimizer_wall_time_budget_ms;
+    if (budget_ms == 0u) {
+        return std::nullopt;
+    }
+    return std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
+}
+
+bool deadline_reached(const OptimizationDeadline& deadline) {
+    return deadline.has_value() && std::chrono::steady_clock::now() >= *deadline;
+}
+
+std::uint32_t budget_ms_or_zero(const OptimizationDeadline& deadline) {
+    if (!deadline.has_value()) {
+        return 0u;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= *deadline) {
+        return 0u;
+    }
+    return static_cast<std::uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now).count());
+}
+
+std::string fallback_device_family_token(const std::string& uid) {
+    const auto split = uid.find(':');
+    return split == std::string::npos ? uid : uid.substr(0, split);
+}
+
+std::string device_family_token(const HardwareGraph* graph, const std::string& uid) {
+    if (graph == nullptr) {
+        return fallback_device_family_token(uid);
+    }
+    if (is_host_graph(graph)) {
+        return "host";
+    }
+    return graph->probe.empty() ? fallback_device_family_token(uid) : graph->probe;
+}
+
+std::string device_family_signature_for_config(
+    const ExecutionConfig& config,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup) {
+    std::vector<std::string> families;
+    families.reserve(config.participating_devices.size());
+    for (const auto& device_uid : config.participating_devices) {
+        families.push_back(device_family_token(find_graph(graph_lookup, device_uid), device_uid));
+    }
+    std::sort(families.begin(), families.end());
+    families.erase(std::unique(families.begin(), families.end()), families.end());
+    return join_csv(families);
+}
+
+std::vector<std::uint64_t> parse_shape_bucket_numbers(const std::string& bucket) {
+    std::vector<std::uint64_t> values;
+    std::uint64_t current = 0u;
+    bool reading = false;
+    for (const unsigned char ch : bucket) {
+        if (std::isdigit(ch) != 0) {
+            current = (current * 10u) + static_cast<std::uint64_t>(ch - static_cast<unsigned char>('0'));
+            reading = true;
+            continue;
+        }
+        if (reading) {
+            values.push_back(current);
+            current = 0u;
+            reading = false;
+        }
+    }
+    if (reading) {
+        values.push_back(current);
+    }
+    return values;
+}
+
+double shape_bucket_similarity_score(const std::string& left, const std::string& right) {
+    if (left == right) {
+        return 1.0;
+    }
+    const auto left_values = parse_shape_bucket_numbers(left);
+    const auto right_values = parse_shape_bucket_numbers(right);
+    if (left_values.empty() || right_values.empty()) {
+        return left == right ? 1.0 : 0.35;
+    }
+    const auto overlap = std::min(left_values.size(), right_values.size());
+    double ratio_error = 0.0;
+    for (std::size_t index = 0; index < overlap; ++index) {
+        const double lhs = static_cast<double>(std::max<std::uint64_t>(left_values[index], 1u));
+        const double rhs = static_cast<double>(std::max<std::uint64_t>(right_values[index], 1u));
+        ratio_error += std::abs(std::log2(lhs / rhs));
+    }
+    ratio_error /= static_cast<double>(overlap);
+    return std::clamp(1.0 - (ratio_error / 4.0), 0.0, 1.0);
+}
+
+const PerformanceSummary* best_graph_family_summary(
+    const std::unordered_map<std::string, PerformanceSummary>& graph_family_performance_cache,
+    const std::string& report_signature,
+    const std::string& shape_bucket,
+    const ExecutionConfig& candidate,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup) {
+    const std::string key_prefix = report_signature + '|';
+    const auto candidate_family = device_family_signature_for_config(candidate, graph_lookup);
+    const auto candidate_primary_family =
+        device_family_token(find_graph(graph_lookup, candidate.primary_device_uid), candidate.primary_device_uid);
+
+    const PerformanceSummary* best = nullptr;
+    double best_score = 0.0;
+    for (const auto& [key, summary] : graph_family_performance_cache) {
+        if (key.rfind(key_prefix, 0u) != 0u) {
+            continue;
+        }
+
+        double score = 0.0;
+        score += shape_bucket_similarity_score(shape_bucket, summary.shape_bucket) * 0.40;
+        score += candidate.strategy == summary.config.strategy ? 0.18 : 0.0;
+        score += candidate.logical_partitions == summary.config.logical_partitions ? 0.08 : 0.0;
+        score += candidate.use_low_precision == summary.config.use_low_precision ? 0.08 : 0.0;
+        score += candidate.overlap_transfers == summary.config.overlap_transfers ? 0.06 : 0.0;
+        score += candidate.participating_devices.size() == summary.config.participating_devices.size() ? 0.08 : 0.0;
+
+        const auto summary_primary_family =
+            device_family_token(find_graph(graph_lookup, summary.config.primary_device_uid), summary.config.primary_device_uid);
+        score += candidate_primary_family == summary_primary_family ? 0.07 : 0.0;
+        score += candidate_family == summary.device_family_signature ? 0.13 : 0.0;
+
+        if (score > best_score) {
+            best_score = score;
+            best = &summary;
+        }
+    }
+
+    return best_score >= 0.55 ? best : nullptr;
 }
 
 WorkloadSpec effective_workload_for_placement(const WorkloadSpec& workload, const ExecutionPlan& placement) {
@@ -939,6 +1235,57 @@ SampleProfile profile_measurements(const std::uint32_t rounds, Func&& func) {
     return profile;
 }
 
+std::uint32_t choose_validation_rounds(
+    const std::uint32_t observations,
+    const double average_relative_error,
+    const double validation_spread_us,
+    const double calibration_ratio,
+    const bool prefer_fast_path,
+    const ValidationTier validation_tier) {
+    switch (validation_tier) {
+    case ValidationTier::disabled:
+        return 0u;
+    case ValidationTier::minimal:
+        return kMinimumValidationMeasurementRounds;
+    case ValidationTier::full:
+        return std::max(kValidationMeasurementRounds, 3u);
+    case ValidationTier::adaptive:
+    default:
+        break;
+    }
+    if (prefer_fast_path &&
+        observations >= (kLearningWarmupSamples * 2u) &&
+        average_relative_error <= 1.0e-4 &&
+        validation_spread_us <= 12.0 &&
+        std::abs(calibration_ratio - 1.0) <= 0.12) {
+        return kMinimumValidationMeasurementRounds;
+    }
+    if (observations >= (kLearningWarmupSamples * 4u) &&
+        average_relative_error <= 2.0e-4 &&
+        validation_spread_us <= 18.0 &&
+        std::abs(calibration_ratio - 1.0) <= 0.20) {
+        return kMinimumValidationMeasurementRounds;
+    }
+    if (observations >= kLearningWarmupSamples &&
+        (validation_spread_us >= 45.0 || std::abs(calibration_ratio - 1.0) >= 0.35)) {
+        return std::max(kValidationMeasurementRounds + 1u, 3u);
+    }
+    return kValidationMeasurementRounds;
+}
+
+bool is_small_dispatch_bound_operation(const OperationSpec& operation) {
+    const auto total_bytes =
+        std::max<std::uint64_t>(operation.input_bytes + operation.output_bytes + operation.temporary_bytes, 1ull);
+    const bool tiny_bytes = total_bytes <= (1ull * kMiB);
+    const bool tiny_flops = operation.estimated_flops <= 6.0e6;
+    const bool scalarish = operation.op_class == OperationClass::elementwise_map ||
+                           operation.op_class == OperationClass::reduction;
+    const bool fused_tail = !operation.fused_operation_names.empty() &&
+                            operation.op_class != OperationClass::matmul &&
+                            operation.op_class != OperationClass::convolution_2d;
+    return (scalarish && tiny_bytes && tiny_flops) || fused_tail;
+}
+
 float quantize_value(const float value, const bool low_precision) {
     if (!low_precision) {
         return value;
@@ -1084,6 +1431,17 @@ const WorkloadTensor* find_workload_tensor(const WorkloadGraph& workload_graph, 
     return it == workload_graph.tensors.end() ? nullptr : &(*it);
 }
 
+const WorkloadTensor* find_workload_tensor(
+    const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled,
+    const std::string_view tensor_id) {
+    const auto it = compiled.tensor_indices.find(std::string(tensor_id));
+    if (it == compiled.tensor_indices.end() || it->second >= workload_graph.tensors.size()) {
+        return nullptr;
+    }
+    return &workload_graph.tensors[it->second];
+}
+
 const TensorLifetime* find_tensor_lifetime(const WorkloadGraph& workload_graph, const std::string_view tensor_id) {
     const auto it = std::find_if(
         workload_graph.lifetimes.begin(),
@@ -1092,13 +1450,39 @@ const TensorLifetime* find_tensor_lifetime(const WorkloadGraph& workload_graph, 
     return it == workload_graph.lifetimes.end() ? nullptr : &(*it);
 }
 
-std::unordered_map<std::string, std::uint32_t> build_operation_index(const WorkloadGraph& workload_graph) {
-    std::unordered_map<std::string, std::uint32_t> indices;
-    indices.reserve(workload_graph.operations.size());
-    for (std::uint32_t index = 0; index < workload_graph.operations.size(); ++index) {
-        indices.emplace(workload_graph.operations[index].name, index);
+const WorkloadTensor* find_workload_tensor(
+    const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled,
+    const std::uint32_t tensor_index) {
+    if (tensor_index >= compiled.tensors.size() || tensor_index >= workload_graph.tensors.size()) {
+        return nullptr;
     }
-    return indices;
+    return &workload_graph.tensors[tensor_index];
+}
+
+const TensorLifetime* find_tensor_lifetime(
+    const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled,
+    const std::string_view tensor_id) {
+    const auto it = compiled.tensor_indices.find(std::string(tensor_id));
+    if (it == compiled.tensor_indices.end() || it->second >= compiled.tensors.size()) {
+        return nullptr;
+    }
+    const auto& compiled_tensor = compiled.tensors[it->second];
+    if (!compiled_tensor.has_lifetime || compiled_tensor.lifetime_index >= workload_graph.lifetimes.size()) {
+        return nullptr;
+    }
+    return &workload_graph.lifetimes[compiled_tensor.lifetime_index];
+}
+
+const TensorLifetime* find_tensor_lifetime(
+    const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled,
+    const std::uint32_t tensor_index) {
+    if (tensor_index >= compiled.tensors.size()) {
+        return nullptr;
+    }
+    return find_tensor_lifetime(workload_graph, compiled, compiled.tensors[tensor_index].id);
 }
 
 std::uint32_t operation_index_or_default(
@@ -1185,11 +1569,13 @@ double scheduled_transfer_latency_us(
 std::string build_report_signature(
     const WorkloadSpec& workload,
     const ExecutionPlan& placement,
+    const std::string& compiled_workload_signature,
     const std::vector<OperationSpec>& operations,
     const ExecutionTuningOverrides* tuning_overrides) {
     std::ostringstream stream;
     stream << kExecutionHeuristicRevision << '|'
            << placement.signature << '|'
+           << "graph=" << compiled_workload_signature << '|'
            << workload.name << '|'
            << to_string(workload.kind) << '|'
            << to_string(canonical_workload_phase(workload)) << '|'
@@ -1247,7 +1633,7 @@ double operation_compute_intensity(const OperationSpec& operation) {
 
 std::string tuning_signature_suffix(const ExecutionTuningOverrides* tuning_overrides) {
     if (tuning_overrides == nullptr) {
-        return "rewrite=1|passes=auto|state=auto";
+        return "rewrite=1|passes=auto|budget=auto|validation=adaptive|state=auto";
     }
 
     std::ostringstream stream;
@@ -1257,7 +1643,15 @@ std::string tuning_signature_suffix(const ExecutionTuningOverrides* tuning_overr
     } else {
         stream << "passes=auto";
     }
-    stream << '|';
+    stream << '|'
+           << "budget=";
+    if (tuning_overrides->optimizer_wall_time_budget_ms.has_value()) {
+        stream << *tuning_overrides->optimizer_wall_time_budget_ms << "ms";
+    } else {
+        stream << "auto";
+    }
+    stream << '|'
+           << "validation=" << to_string(tuning_overrides->validation_tier) << '|';
     if (!tuning_overrides->initial_state_override.has_value()) {
         stream << "state=auto";
         return stream.str();
@@ -2398,6 +2792,79 @@ double auto_accelerator_data_parallel_bias_us(
     return bias_us;
 }
 
+struct WorkloadCandidatePolicy {
+    std::size_t max_ranked_strategies = 2u;
+    std::size_t max_devices = 2u;
+    std::size_t max_candidates = 8u;
+    std::size_t validation_shortlist = 2u;
+};
+
+WorkloadCandidatePolicy candidate_policy_for_workload(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const SystemProfile& system,
+    const bool activation_driven,
+    const StructuralPlacementAffinity& affinity) {
+    WorkloadCandidatePolicy policy;
+    if (workload.kind == WorkloadKind::training || workload.kind == WorkloadKind::custom) {
+        policy.max_ranked_strategies = 3u;
+        policy.max_devices = 3u;
+        policy.max_candidates = 12u;
+        policy.validation_shortlist = 3u;
+        return policy;
+    }
+    if (workload.kind == WorkloadKind::inference &&
+        workload.latency_sensitive &&
+        canonical_workload_phase(workload) == WorkloadPhase::decode) {
+        policy.max_ranked_strategies = 1u;
+        policy.max_devices = 1u;
+        policy.max_candidates = operation.matrix_friendly ? 6u : 4u;
+        policy.validation_shortlist = 1u;
+        return policy;
+    }
+    if (workload.kind == WorkloadKind::gaming || workload.kind == WorkloadKind::image) {
+        policy.max_ranked_strategies = 1u;
+        policy.max_devices = 1u;
+        policy.max_candidates = 5u;
+        policy.validation_shortlist = 1u;
+        return policy;
+    }
+    if (is_small_dispatch_bound_operation(operation)) {
+        policy.max_ranked_strategies = 1u;
+        policy.max_devices = 1u;
+        policy.max_candidates = operation.fused_operation_names.empty() ? 4u : 3u;
+        policy.validation_shortlist = 1u;
+        return policy;
+    }
+    if (system.low_spec_mode || affinity.prefer_low_overhead || (!operation.matrix_friendly && activation_driven)) {
+        policy.max_ranked_strategies = 1u;
+        policy.max_devices = 1u;
+        policy.max_candidates = 5u;
+        policy.validation_shortlist = 1u;
+        return policy;
+    }
+    if (operation.matrix_friendly) {
+        policy.max_ranked_strategies = 2u;
+        policy.max_devices = 2u;
+        policy.max_candidates = 8u;
+        policy.validation_shortlist = 2u;
+    } else {
+        policy.max_ranked_strategies = 1u;
+        policy.max_devices = 2u;
+        policy.max_candidates = 6u;
+        policy.validation_shortlist = 1u;
+    }
+    return policy;
+}
+
+CandidatePolicySummary summarize_candidate_policy(const WorkloadCandidatePolicy& policy) {
+    return CandidatePolicySummary{
+        static_cast<std::uint32_t>(policy.max_ranked_strategies),
+        static_cast<std::uint32_t>(policy.max_devices),
+        static_cast<std::uint32_t>(policy.max_candidates),
+        static_cast<std::uint32_t>(policy.validation_shortlist)};
+}
+
 std::vector<ExecutionConfig> build_candidate_configs(
     const OperationSpec& operation,
     const WorkloadSpec& workload,
@@ -2430,6 +2897,8 @@ std::vector<ExecutionConfig> build_candidate_configs(
     };
 
     const auto placement_affinity = structural_placement_affinity(workload, operation);
+    const auto candidate_policy =
+        candidate_policy_for_workload(workload, operation, system, continuous_state != nullptr, placement_affinity);
     auto ordered_allocations_for_operation = [&]() {
         std::vector<std::reference_wrapper<const PlanAllocation>> ordered_allocations;
         ordered_allocations.reserve(placement.allocations.size());
@@ -2500,8 +2969,7 @@ std::vector<ExecutionConfig> build_candidate_configs(
             return true;
         }
 
-        const std::size_t max_ranked_strategies =
-            (system.low_spec_mode || workload.latency_sensitive || placement_affinity.prefer_low_overhead) ? 1u : 2u;
+        const std::size_t max_ranked_strategies = candidate_policy.max_ranked_strategies;
         std::size_t accepted = 0;
         for (const auto& entry : ranked) {
             if (entry.weight < 0.0) {
@@ -2600,9 +3068,23 @@ std::vector<ExecutionConfig> build_candidate_configs(
             apply_auto_accelerator_data_parallel_policy(workload, operation, placement, graph_lookup, config);
             apply_partition_strategy_execution_policy(workload, operation, placement, graph_lookup, config);
             stabilize_level_zero_host_mix_policy(operation, graph_lookup, config);
-            if (is_host_graph(graph) && cpu_materialized_lowering_active(operation)) {
+            const auto* resolved_primary_graph = find_graph(graph_lookup, config.primary_device_uid);
+            if (config.participating_devices.size() <= 1u &&
+                config.strategy == ExecutionStrategy::sharded) {
+                config.strategy = ExecutionStrategy::single_device;
+                config.logical_partitions = 1u;
+                config.overlap_transfers = false;
+            }
+            if (is_host_graph(resolved_primary_graph) &&
+                config.participating_devices.size() <= 1u &&
+                operation.op_class == OperationClass::matmul) {
+                config.logical_partitions = 1u;
+                config.queue_depth = std::min(config.queue_depth, 2u);
+                config.stages = 1u;
+            }
+            if (is_host_graph(resolved_primary_graph) && cpu_materialized_lowering_active(operation)) {
                 append_variant_suffix(config.variant_id, "+cpu-lowered");
-            } else if (!is_host_graph(graph) && gpu_materialized_lowering_active(operation)) {
+            } else if (!is_host_graph(resolved_primary_graph) && gpu_materialized_lowering_active(operation)) {
                 append_variant_suffix(config.variant_id, "+gpu-lowered");
             }
             if (!operation.fused_operation_names.empty()) {
@@ -2640,12 +3122,10 @@ std::vector<ExecutionConfig> build_candidate_configs(
         if (variant.scope == OperationVariantScope::per_allocation) {
             const std::size_t max_devices =
                 activation_driven
-                    ? ((system.low_spec_mode || workload.latency_sensitive || placement_affinity.prefer_low_overhead)
-                           ? 1u
-                           : 2u)
+                    ? candidate_policy.max_devices
                     : (placement_affinity.preferred == StructuralPlacementPreference::neutral
-                           ? ordered_allocations.size()
-                           : std::min<std::size_t>(ordered_allocations.size(), 2u));
+                           ? std::min<std::size_t>(ordered_allocations.size(), candidate_policy.max_devices)
+                           : std::min<std::size_t>(ordered_allocations.size(), candidate_policy.max_devices));
             std::size_t added_devices = 0;
             for (const auto& allocation_ref : ordered_allocations) {
                 const auto& allocation = allocation_ref.get();
@@ -2676,6 +3156,9 @@ std::vector<ExecutionConfig> build_candidate_configs(
                 if (added_devices >= max_devices) {
                     break;
                 }
+                if (candidates.size() >= candidate_policy.max_candidates) {
+                    break;
+                }
             }
             continue;
         }
@@ -2691,6 +3174,9 @@ std::vector<ExecutionConfig> build_candidate_configs(
         }
         if (participating_devices.empty()) {
             continue;
+        }
+        if (participating_devices.size() > candidate_policy.max_devices) {
+            participating_devices.resize(candidate_policy.max_devices);
         }
 
         const auto* primary_graph = find_graph(graph_lookup, participating_devices.front());
@@ -2712,6 +3198,9 @@ std::vector<ExecutionConfig> build_candidate_configs(
 
         apply_variant_to_config(variant, primary_summary, config);
         add_candidate(config);
+        if (candidates.size() >= candidate_policy.max_candidates) {
+            break;
+        }
     }
 
     return candidates;
@@ -2751,56 +3240,72 @@ double effective_edge_latency(const ExecutionEdge& edge) {
 }
 
 double finalize_graph_latency(ExecutionGraph& graph) {
-    std::unordered_map<std::string, double> node_latency;
-    std::unordered_map<std::string, int> indegree;
-    std::unordered_map<std::string, std::vector<const ExecutionEdge*>> outgoing;
-    node_latency.reserve(graph.nodes.size());
-    indegree.reserve(graph.nodes.size());
-    outgoing.reserve(graph.nodes.size());
-
-    for (const auto& node : graph.nodes) {
-        node_latency.emplace(node.id, node.predicted_latency_us);
-        indegree.emplace(node.id, 0);
+    if (graph.nodes.empty()) {
+        graph.predicted_latency_us = 0.0;
+        return 0.0;
     }
 
-    for (const auto& edge : graph.edges) {
-        ++indegree[edge.target_id];
-        outgoing[edge.source_id].push_back(&edge);
+    std::vector<double> node_latency(graph.nodes.size(), 0.0);
+    std::vector<int> indegree(graph.nodes.size(), 0);
+    std::vector<std::vector<const ExecutionEdge*>> outgoing(graph.nodes.size());
+    std::unordered_map<std::string, std::uint32_t> node_indices;
+    node_indices.reserve(graph.nodes.size());
+
+    for (std::uint32_t index = 0; index < graph.nodes.size(); ++index) {
+        const auto& node = graph.nodes[index];
+        node_latency[index] = node.predicted_latency_us;
+        node_indices.emplace(node.id, index);
     }
 
-    std::vector<std::string> frontier;
+    for (auto& edge : graph.edges) {
+        if (edge.source_node_index == kInvalidExecutionIndex) {
+            if (const auto it = node_indices.find(edge.source_id); it != node_indices.end()) {
+                edge.source_node_index = it->second;
+            }
+        }
+        if (edge.target_node_index == kInvalidExecutionIndex) {
+            if (const auto it = node_indices.find(edge.target_id); it != node_indices.end()) {
+                edge.target_node_index = it->second;
+            }
+        }
+        if (edge.source_node_index == kInvalidExecutionIndex || edge.target_node_index == kInvalidExecutionIndex) {
+            continue;
+        }
+        ++indegree[edge.target_node_index];
+        outgoing[edge.source_node_index].push_back(&edge);
+    }
+
+    std::vector<std::uint32_t> frontier;
     frontier.reserve(graph.nodes.size());
-    for (const auto& [node_id, degree] : indegree) {
-        if (degree == 0) {
-            frontier.push_back(node_id);
+    std::vector<double> longest(graph.nodes.size(), 0.0);
+    std::vector<bool> seen(graph.nodes.size(), false);
+    for (std::uint32_t index = 0; index < graph.nodes.size(); ++index) {
+        if (indegree[index] == 0) {
+            frontier.push_back(index);
+            longest[index] = node_latency[index];
+            seen[index] = true;
         }
     }
 
-    std::unordered_map<std::string, double> longest;
-    longest.reserve(graph.nodes.size());
-    for (const auto& node_id : frontier) {
-        longest[node_id] = node_latency[node_id];
-    }
-
-    for (std::size_t index = 0; index < frontier.size(); ++index) {
-        const auto current = frontier[index];
+    for (std::size_t frontier_index = 0; frontier_index < frontier.size(); ++frontier_index) {
+        const auto current = frontier[frontier_index];
         const double base = longest[current];
-
-        if (const auto out_it = outgoing.find(current); out_it != outgoing.end()) {
-            for (const auto* edge : out_it->second) {
-                const double candidate = base + effective_edge_latency(*edge) + node_latency[edge->target_id];
-                auto& target_distance = longest[edge->target_id];
-                target_distance = std::max(target_distance, candidate);
-                if (--indegree[edge->target_id] == 0) {
-                    frontier.push_back(edge->target_id);
-                }
+        for (const auto* edge : outgoing[current]) {
+            const auto target = edge->target_node_index;
+            const double candidate = base + effective_edge_latency(*edge) + node_latency[target];
+            longest[target] = std::max(longest[target], candidate);
+            seen[target] = true;
+            if (--indegree[target] == 0) {
+                frontier.push_back(target);
             }
         }
     }
 
     double total = 0.0;
-    for (const auto& [node_id, distance] : longest) {
-        total = std::max(total, distance);
+    for (std::uint32_t index = 0; index < longest.size(); ++index) {
+        if (seen[index]) {
+            total = std::max(total, longest[index]);
+        }
     }
     graph.predicted_latency_us = total;
     return total;
@@ -2809,37 +3314,80 @@ double finalize_graph_latency(ExecutionGraph& graph) {
 ExecutionGraph build_execution_graph(
     const std::string& report_signature,
     const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled_workload,
     const OperationSpec& operation,
     ExecutionConfig& config,
     const ExecutionPlan& placement,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     const std::unordered_map<std::string, ExecutionConfig>& selected_configs) {
+    (void)workload_graph;
     ExecutionGraph graph;
     graph.workload_signature = report_signature;
     graph.operation = operation;
     graph.participating_devices = config.participating_devices;
+    graph.indexed_devices = config.participating_devices;
+    graph.indexed_operations.reserve(compiled_workload.operations.size());
+    for (const auto& compiled_operation : compiled_workload.operations) {
+        graph.indexed_operations.push_back(compiled_operation.name);
+    }
     config.mapped_structural_nodes.clear();
 
     const auto ratios = normalized_ratios(placement, config);
-    const auto operation_indices = build_operation_index(workload_graph);
-    const auto operation_index = operation_index_or_default(operation_indices, operation.name, 0u);
+    const auto operation_index = operation_index_or_default(compiled_workload.operation_indices, operation.name, 0u);
     std::unordered_map<std::string, std::uint64_t> resident_bytes_by_device;
     std::unordered_map<std::string, double> resident_pressure_by_device;
+    std::unordered_map<std::string, std::uint32_t> node_indices;
+    node_indices.reserve(32u);
+    std::unordered_map<std::string, std::uint32_t> device_indices;
+    device_indices.reserve(graph.indexed_devices.size() + 1u);
+    for (std::uint32_t index = 0; index < graph.indexed_devices.size(); ++index) {
+        device_indices.emplace(graph.indexed_devices[index], index);
+    }
 
+    auto device_index_for = [&](const std::string& device_uid) {
+        if (const auto it = device_indices.find(device_uid); it != device_indices.end()) {
+            return it->second;
+        }
+        const auto index = static_cast<std::uint32_t>(graph.indexed_devices.size());
+        graph.indexed_devices.push_back(device_uid);
+        device_indices.emplace(device_uid, index);
+        return index;
+    };
+    auto structural_index_for = [&](const std::string& structural_node_id) {
+        if (structural_node_id.empty()) {
+            return kInvalidExecutionIndex;
+        }
+        const auto it = std::find(graph.indexed_structural_nodes.begin(), graph.indexed_structural_nodes.end(), structural_node_id);
+        if (it != graph.indexed_structural_nodes.end()) {
+            return static_cast<std::uint32_t>(std::distance(graph.indexed_structural_nodes.begin(), it));
+        }
+        graph.indexed_structural_nodes.push_back(structural_node_id);
+        return static_cast<std::uint32_t>(graph.indexed_structural_nodes.size() - 1u);
+    };
     auto add_node = [&](ExecutionNode node) {
+        node.node_index = static_cast<std::uint32_t>(graph.nodes.size());
+        node.device_index = device_index_for(node.device_uid);
+        node.structural_node_index = structural_index_for(node.structural_node_id);
+        node.operation_index = operation_index;
+        node_indices.emplace(node.id, node.node_index);
         graph.nodes.push_back(std::move(node));
     };
 
     auto add_edge = [&](ExecutionEdge edge) {
+        if (const auto it = node_indices.find(edge.source_id); it != node_indices.end()) {
+            edge.source_node_index = it->second;
+        }
+        if (const auto it = node_indices.find(edge.target_id); it != node_indices.end()) {
+            edge.target_node_index = it->second;
+        }
         graph.edges.push_back(std::move(edge));
     };
 
     const std::string global_sink_id = operation.name + ".sink";
     const std::string global_sync_id = operation.name + ".sync";
-    const bool needs_sync =
-        config.participating_devices.size() > 1 ||
-        config.logical_partitions > 1 ||
-        config.strategy != ExecutionStrategy::single_device;
+    const bool needs_sync = config.participating_devices.size() > 1;
+    const bool uses_partitioned_execution =
+        config.logical_partitions > 1 || config.strategy != ExecutionStrategy::single_device;
 
     if (needs_sync) {
         add_node(ExecutionNode{
@@ -2847,6 +3395,11 @@ ExecutionGraph build_execution_graph(
             operation.name + "-sync",
             config.primary_device_uid,
             "",
+            kInvalidExecutionIndex,
+            kInvalidExecutionIndex,
+            kInvalidExecutionIndex,
+            operation_index,
+            kInvalidExecutionIndex,
             ExecutionNodeKind::synchronize,
             operation.output_bytes,
             0.0,
@@ -2858,6 +3411,11 @@ ExecutionGraph build_execution_graph(
         operation.name + "-sink",
         config.primary_device_uid,
         "",
+        kInvalidExecutionIndex,
+        kInvalidExecutionIndex,
+        kInvalidExecutionIndex,
+        operation_index,
+        kInvalidExecutionIndex,
         ExecutionNodeKind::sink,
         operation.output_bytes,
         0.0,
@@ -2897,13 +3455,13 @@ ExecutionGraph build_execution_graph(
                 kMicrosecondsPerSecond;
 
             if (control_node != nullptr) {
-                config.mapped_structural_nodes.push_back(control_node->id + "#p" + std::to_string(partition));
+                append_unique(config.mapped_structural_nodes, control_node->id + "#p" + std::to_string(partition));
             }
             if (compute_node != nullptr) {
-                config.mapped_structural_nodes.push_back(compute_node->id + "#p" + std::to_string(partition));
+                append_unique(config.mapped_structural_nodes, compute_node->id + "#p" + std::to_string(partition));
             }
             if (storage_node != nullptr) {
-                config.mapped_structural_nodes.push_back(storage_node->id + "#p" + std::to_string(partition));
+                append_unique(config.mapped_structural_nodes, storage_node->id + "#p" + std::to_string(partition));
             }
 
             const std::string partition_suffix =
@@ -2920,12 +3478,12 @@ ExecutionGraph build_execution_graph(
             double output_transfer_latency_us = 0.0;
 
             for (const auto& tensor_id : operation.input_tensor_ids) {
-                const auto* tensor = find_workload_tensor(workload_graph, tensor_id);
+                const auto* tensor = find_workload_tensor(workload_graph, compiled_workload, tensor_id);
                 if (tensor == nullptr) {
                     continue;
                 }
 
-                const auto* lifetime = find_tensor_lifetime(workload_graph, tensor_id);
+                const auto* lifetime = find_tensor_lifetime(workload_graph, compiled_workload, tensor_id);
                 const auto mapped_bytes =
                     bytes_for_tensor_mapping(*tensor, operation, config, partition_ratio, partitions);
                 partition_input_bytes += mapped_bytes;
@@ -2943,11 +3501,17 @@ ExecutionGraph build_execution_graph(
                     scheduled_transfer_latency_us(mapped_bytes, source_summary_ptr, summary, cross_device);
                 input_transfer_latency_us = std::max(input_transfer_latency_us, transfer_latency);
                 graph.predicted_transfer_latency_us += transfer_latency;
+                graph.predicted_overlap_gain_us +=
+                    transfer_latency * std::max(config.overlap_ratio, config.overlap_transfers ? 0.35 : 0.0);
 
                 graph.residency_plan.push_back(TensorResidencyPlanEntry{
                     tensor->id,
                     device_uid,
                     storage_node == nullptr ? std::string() : storage_node->id,
+                    compiled_workload.tensor_indices.contains(tensor->id) ? compiled_workload.tensor_indices.at(tensor->id)
+                                                                         : kInvalidExecutionIndex,
+                    device_index_for(device_uid),
+                    structural_index_for(storage_node == nullptr ? std::string() : storage_node->id),
                     mapped_bytes,
                     tensor->persistent,
                     true,
@@ -2962,6 +3526,14 @@ ExecutionGraph build_execution_graph(
                         device_uid,
                         tensor->producer_operation,
                         operation.name,
+                        compiled_workload.tensor_indices.contains(tensor->id) ? compiled_workload.tensor_indices.at(tensor->id)
+                                                                             : kInvalidExecutionIndex,
+                        device_index_for(source_device_uid),
+                        device_index_for(device_uid),
+                        tensor->producer_operation.empty()
+                            ? kInvalidExecutionIndex
+                            : operation_index_or_default(compiled_workload.operation_indices, tensor->producer_operation, kInvalidExecutionIndex),
+                        operation_index,
                         mapped_bytes,
                         transfer_latency,
                         std::max(config.overlap_ratio, config.overlap_transfers ? 0.35 : 0.0),
@@ -2970,12 +3542,12 @@ ExecutionGraph build_execution_graph(
             }
 
             for (const auto& tensor_id : operation.output_tensor_ids) {
-                const auto* tensor = find_workload_tensor(workload_graph, tensor_id);
+                const auto* tensor = find_workload_tensor(workload_graph, compiled_workload, tensor_id);
                 if (tensor == nullptr) {
                     continue;
                 }
 
-                const auto* lifetime = find_tensor_lifetime(workload_graph, tensor_id);
+                const auto* lifetime = find_tensor_lifetime(workload_graph, compiled_workload, tensor_id);
                 const auto mapped_bytes =
                     bytes_for_tensor_mapping(*tensor, operation, config, partition_ratio, partitions);
                 partition_output_bytes += mapped_bytes;
@@ -2983,6 +3555,10 @@ ExecutionGraph build_execution_graph(
                     tensor->id,
                     device_uid,
                     storage_node == nullptr ? std::string() : storage_node->id,
+                    compiled_workload.tensor_indices.contains(tensor->id) ? compiled_workload.tensor_indices.at(tensor->id)
+                                                                         : kInvalidExecutionIndex,
+                    device_index_for(device_uid),
+                    structural_index_for(storage_node == nullptr ? std::string() : storage_node->id),
                     mapped_bytes,
                     tensor->persistent,
                     false,
@@ -3003,12 +3579,19 @@ ExecutionGraph build_execution_graph(
                                                              true);
                     output_transfer_latency_us = std::max(output_transfer_latency_us, transfer_latency);
                     graph.predicted_transfer_latency_us += transfer_latency;
+                    graph.predicted_overlap_gain_us += transfer_latency * (config.overlap_ratio * 0.7);
                     graph.transfer_schedule.push_back(TransferScheduleEntry{
                         tensor->id,
                         device_uid,
                         config.primary_device_uid,
                         operation.name,
                         operation.name,
+                        compiled_workload.tensor_indices.contains(tensor->id) ? compiled_workload.tensor_indices.at(tensor->id)
+                                                                             : kInvalidExecutionIndex,
+                        device_index_for(device_uid),
+                        device_index_for(config.primary_device_uid),
+                        operation_index,
+                        operation_index,
                         mapped_bytes,
                         transfer_latency,
                         config.overlap_ratio * 0.7,
@@ -3017,7 +3600,7 @@ ExecutionGraph build_execution_graph(
             }
 
             for (const auto& tensor_id : operation.temporary_tensor_ids) {
-                const auto* tensor = find_workload_tensor(workload_graph, tensor_id);
+                const auto* tensor = find_workload_tensor(workload_graph, compiled_workload, tensor_id);
                 if (tensor == nullptr) {
                     continue;
                 }
@@ -3029,6 +3612,10 @@ ExecutionGraph build_execution_graph(
                     tensor->id,
                     device_uid,
                     storage_node == nullptr ? std::string() : storage_node->id,
+                    compiled_workload.tensor_indices.contains(tensor->id) ? compiled_workload.tensor_indices.at(tensor->id)
+                                                                         : kInvalidExecutionIndex,
+                    device_index_for(device_uid),
+                    structural_index_for(storage_node == nullptr ? std::string() : storage_node->id),
                     mapped_bytes,
                     false,
                     false,
@@ -3053,6 +3640,11 @@ ExecutionGraph build_execution_graph(
                 hardware->presentation_name + partition_suffix + "-source",
                 device_uid,
                 storage_node == nullptr ? std::string() : storage_node->id,
+                kInvalidExecutionIndex,
+                kInvalidExecutionIndex,
+                kInvalidExecutionIndex,
+                operation_index,
+                kInvalidExecutionIndex,
                 ExecutionNodeKind::source,
                 partition_input_bytes == 0u ? input_share : partition_input_bytes,
                 0.0,
@@ -3063,6 +3655,11 @@ ExecutionGraph build_execution_graph(
                 hardware->presentation_name + partition_suffix + "-dispatch",
                 device_uid,
                 control_node == nullptr ? std::string() : control_node->id,
+                kInvalidExecutionIndex,
+                kInvalidExecutionIndex,
+                kInvalidExecutionIndex,
+                operation_index,
+                kInvalidExecutionIndex,
                 ExecutionNodeKind::dispatch,
                 0,
                 0.0,
@@ -3073,6 +3670,11 @@ ExecutionGraph build_execution_graph(
                 hardware->presentation_name + partition_suffix + "-compute",
                 device_uid,
                 compute_node == nullptr ? std::string() : compute_node->id,
+                kInvalidExecutionIndex,
+                kInvalidExecutionIndex,
+                kInvalidExecutionIndex,
+                operation_index,
+                kInvalidExecutionIndex,
                 ExecutionNodeKind::compute,
                 partition_output_bytes == 0u ? output_share : partition_output_bytes,
                 flops_share,
@@ -3081,6 +3683,8 @@ ExecutionGraph build_execution_graph(
             add_edge(ExecutionEdge{
                 source_id,
                 dispatch_id,
+                kInvalidExecutionIndex,
+                kInvalidExecutionIndex,
                 ExecutionEdgeKind::dataflow,
                 true,
                 partition_input_bytes == 0u ? input_share : partition_input_bytes,
@@ -3092,6 +3696,8 @@ ExecutionGraph build_execution_graph(
             add_edge(ExecutionEdge{
                 dispatch_id,
                 compute_id,
+                kInvalidExecutionIndex,
+                kInvalidExecutionIndex,
                 ExecutionEdgeKind::control,
                 true,
                 0,
@@ -3104,6 +3710,11 @@ ExecutionGraph build_execution_graph(
                     hardware->presentation_name + partition_suffix + "-aggregate",
                     device_uid,
                     compute_node == nullptr ? std::string() : compute_node->id,
+                    kInvalidExecutionIndex,
+                    kInvalidExecutionIndex,
+                    kInvalidExecutionIndex,
+                    operation_index,
+                    kInvalidExecutionIndex,
                     ExecutionNodeKind::aggregate,
                     operation.output_bytes,
                     static_cast<double>(operation.output_bytes),
@@ -3112,6 +3723,8 @@ ExecutionGraph build_execution_graph(
                 add_edge(ExecutionEdge{
                     compute_id,
                     aggregate_id,
+                    kInvalidExecutionIndex,
+                    kInvalidExecutionIndex,
                     ExecutionEdgeKind::aggregation,
                     true,
                     output_share,
@@ -3122,6 +3735,8 @@ ExecutionGraph build_execution_graph(
                     add_edge(ExecutionEdge{
                         aggregate_id,
                         global_sync_id,
+                        kInvalidExecutionIndex,
+                        kInvalidExecutionIndex,
                         ExecutionEdgeKind::dependency,
                         true,
                         operation.output_bytes,
@@ -3131,6 +3746,8 @@ ExecutionGraph build_execution_graph(
                     add_edge(ExecutionEdge{
                         aggregate_id,
                         global_sink_id,
+                        kInvalidExecutionIndex,
+                        kInvalidExecutionIndex,
                         ExecutionEdgeKind::dataflow,
                         true,
                         operation.output_bytes,
@@ -3141,6 +3758,8 @@ ExecutionGraph build_execution_graph(
                 add_edge(ExecutionEdge{
                     compute_id,
                     global_sync_id,
+                    kInvalidExecutionIndex,
+                    kInvalidExecutionIndex,
                     ExecutionEdgeKind::dependency,
                     true,
                     partition_output_bytes == 0u ? output_share : partition_output_bytes,
@@ -3152,11 +3771,13 @@ ExecutionGraph build_execution_graph(
                 add_edge(ExecutionEdge{
                     compute_id,
                     global_sink_id,
+                    kInvalidExecutionIndex,
+                    kInvalidExecutionIndex,
                     ExecutionEdgeKind::dataflow,
                     true,
                     output_share,
                     transfer_cost_us(output_share, summary),
-                    config.overlap_ratio * 0.7});
+                    uses_partitioned_execution ? std::max(config.overlap_ratio, 0.20) : (config.overlap_ratio * 0.7)});
             }
         }
     }
@@ -3177,6 +3798,8 @@ ExecutionGraph build_execution_graph(
         add_edge(ExecutionEdge{
             global_sync_id,
             global_sink_id,
+            kInvalidExecutionIndex,
+            kInvalidExecutionIndex,
             ExecutionEdgeKind::dataflow,
             true,
             operation.output_bytes,
@@ -3203,21 +3826,24 @@ ExecutionGraph build_execution_graph(
     return graph;
 }
 
-ValidationResult validate_elementwise(const OperationSpec& operation, const ExecutionConfig& config) {
+ValidationResult validate_elementwise(
+    const OperationSpec& operation,
+    const ExecutionConfig& config,
+    const std::uint32_t rounds) {
     const auto count = static_cast<std::size_t>(operation.extents.at(0));
     const auto a = make_pattern(count, 1.0f);
     const auto b = make_pattern(count, 2.0f);
     std::vector<float> reference(count, 0.0f);
     std::vector<float> candidate(count, 0.0f);
 
-    const auto reference_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto reference_profile = profile_measurements(rounds, [&]() {
         for (std::size_t index = 0; index < count; ++index) {
             reference[index] = (a[index] * 1.125f) + (b[index] * 0.25f) - 0.03125f;
         }
     });
 
     const std::size_t tile = std::max<std::size_t>(config.tile_x, 128u);
-    const auto candidate_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto candidate_profile = profile_measurements(rounds, [&]() {
         for (std::size_t base = 0; base < count; base += tile) {
             const auto end = std::min(base + tile, count);
             for (std::size_t index = base; index < end; ++index) {
@@ -3237,13 +3863,16 @@ ValidationResult validate_elementwise(const OperationSpec& operation, const Exec
         candidate_profile.samples};
 }
 
-ValidationResult validate_reduction(const OperationSpec& operation, const ExecutionConfig& config) {
+ValidationResult validate_reduction(
+    const OperationSpec& operation,
+    const ExecutionConfig& config,
+    const std::uint32_t rounds) {
     const auto count = static_cast<std::size_t>(operation.extents.at(0));
     const auto data = make_pattern(count, 3.0f);
     double reference_value = 0.0;
     double candidate_value = 0.0;
 
-    const auto reference_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto reference_profile = profile_measurements(rounds, [&]() {
         double total = 0.0;
         for (const auto value : data) {
             total += value;
@@ -3252,7 +3881,7 @@ ValidationResult validate_reduction(const OperationSpec& operation, const Execut
     });
 
     const std::size_t tile = std::max<std::size_t>(config.tile_x, 256u);
-    const auto candidate_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto candidate_profile = profile_measurements(rounds, [&]() {
         float total = 0.0f;
         for (std::size_t base = 0; base < count; base += tile) {
             const auto end = std::min(base + tile, count);
@@ -3274,7 +3903,10 @@ ValidationResult validate_reduction(const OperationSpec& operation, const Execut
         candidate_profile.samples};
 }
 
-ValidationResult validate_matmul(const OperationSpec& operation, const ExecutionConfig& config) {
+ValidationResult validate_matmul(
+    const OperationSpec& operation,
+    const ExecutionConfig& config,
+    const std::uint32_t rounds) {
     const auto m = static_cast<std::size_t>(operation.extents.at(0));
     const auto n = static_cast<std::size_t>(operation.extents.at(1));
     const auto k = static_cast<std::size_t>(operation.extents.at(2));
@@ -3283,7 +3915,7 @@ ValidationResult validate_matmul(const OperationSpec& operation, const Execution
     std::vector<float> reference(m * n, 0.0f);
     std::vector<float> candidate(m * n, 0.0f);
 
-    const auto reference_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto reference_profile = profile_measurements(rounds, [&]() {
         for (std::size_t row = 0; row < m; ++row) {
             for (std::size_t col = 0; col < n; ++col) {
                 float acc = 0.0f;
@@ -3298,7 +3930,7 @@ ValidationResult validate_matmul(const OperationSpec& operation, const Execution
     const std::size_t tile_m = std::max<std::size_t>(config.tile_x, 16u);
     const std::size_t tile_n = std::max<std::size_t>(config.tile_y, 16u);
     const std::size_t tile_k = std::max<std::size_t>(config.tile_k, 8u);
-    const auto candidate_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto candidate_profile = profile_measurements(rounds, [&]() {
         for (std::size_t row_base = 0; row_base < m; row_base += tile_m) {
             for (std::size_t col_base = 0; col_base < n; col_base += tile_n) {
                 for (std::size_t inner_base = 0; inner_base < k; inner_base += tile_k) {
@@ -3330,7 +3962,10 @@ ValidationResult validate_matmul(const OperationSpec& operation, const Execution
         candidate_profile.samples};
 }
 
-ValidationResult validate_convolution(const OperationSpec& operation, const ExecutionConfig& config) {
+ValidationResult validate_convolution(
+    const OperationSpec& operation,
+    const ExecutionConfig& config,
+    const std::uint32_t rounds) {
     const auto height = static_cast<std::size_t>(operation.extents.at(0));
     const auto width = static_cast<std::size_t>(operation.extents.at(1));
     const auto input = make_pattern(height * width, 6.0f);
@@ -3338,7 +3973,7 @@ ValidationResult validate_convolution(const OperationSpec& operation, const Exec
     std::vector<float> reference((height - 2) * (width - 2), 0.0f);
     std::vector<float> candidate((height - 2) * (width - 2), 0.0f);
 
-    const auto reference_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto reference_profile = profile_measurements(rounds, [&]() {
         for (std::size_t y = 1; y + 1 < height; ++y) {
             for (std::size_t x = 1; x + 1 < width; ++x) {
                 float acc = 0.0f;
@@ -3354,7 +3989,7 @@ ValidationResult validate_convolution(const OperationSpec& operation, const Exec
 
     const std::size_t tile_y = std::max<std::size_t>(config.tile_y, 8u);
     const std::size_t tile_x = std::max<std::size_t>(config.tile_x, 8u);
-    const auto candidate_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto candidate_profile = profile_measurements(rounds, [&]() {
         for (std::size_t y_base = 1; y_base + 1 < height; y_base += tile_y) {
             for (std::size_t x_base = 1; x_base + 1 < width; x_base += tile_x) {
                 const auto y_end = std::min(y_base + tile_y, height - 1);
@@ -3386,7 +4021,10 @@ ValidationResult validate_convolution(const OperationSpec& operation, const Exec
         candidate_profile.samples};
 }
 
-ValidationResult validate_resample(const OperationSpec& operation, const ExecutionConfig& config) {
+ValidationResult validate_resample(
+    const OperationSpec& operation,
+    const ExecutionConfig& config,
+    const std::uint32_t rounds) {
     const auto src_h = static_cast<std::size_t>(operation.extents.at(0));
     const auto src_w = static_cast<std::size_t>(operation.extents.at(1));
     const auto dst_h = static_cast<std::size_t>(operation.extents.at(2));
@@ -3419,10 +4057,10 @@ ValidationResult validate_resample(const OperationSpec& operation, const Executi
         }
     };
 
-    const auto reference_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto reference_profile = profile_measurements(rounds, [&]() {
         bilinear(reference, false);
     });
-    const auto candidate_profile = profile_measurements(kValidationMeasurementRounds, [&]() {
+    const auto candidate_profile = profile_measurements(rounds, [&]() {
         bilinear(candidate, config.use_low_precision);
     });
 
@@ -3442,24 +4080,49 @@ BenchmarkRecord benchmark_operation(
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     const std::string& shape_bucket,
     const double surrogate_latency_us,
-    const double system_penalty_us) {
+    const double system_penalty_us,
+    const std::uint32_t validation_rounds) {
+    if (validation_rounds == 0u) {
+        BenchmarkRecord record;
+        record.operation_name = operation.name;
+        record.config_signature = config.signature;
+        record.shape_bucket = shape_bucket;
+        record.reference_latency_us = 0.0;
+        record.validation_latency_us = 0.0;
+        record.predicted_latency_us = graph.predicted_latency_us;
+        record.surrogate_latency_us = surrogate_latency_us;
+        record.calibrated_prediction_us = std::max(0.01, surrogate_latency_us + system_penalty_us);
+        record.calibration_ratio = 1.0;
+        record.calibration_confidence = 0.0;
+        record.reference_spread_us = 0.0;
+        record.candidate_spread_us = 0.0;
+        record.validation_samples = 0u;
+        record.system_penalty_us = system_penalty_us;
+        record.effective_latency_us = std::max(0.01, surrogate_latency_us + system_penalty_us);
+        record.speedup_vs_reference = 1.0;
+        record.relative_error = graph.expected_relative_error;
+        record.accuracy_within_tolerance = graph.expected_relative_error <= (config.target_error_tolerance + 1.0e-12);
+        record.simulated = true;
+        return record;
+    }
+
     ValidationResult validation;
     switch (operation.op_class) {
     case OperationClass::elementwise_map:
-        validation = validate_elementwise(operation, config);
+        validation = validate_elementwise(operation, config, validation_rounds);
         break;
     case OperationClass::reduction:
-        validation = validate_reduction(operation, config);
+        validation = validate_reduction(operation, config, validation_rounds);
         break;
     case OperationClass::matmul:
-        validation = validate_matmul(operation, config);
+        validation = validate_matmul(operation, config, validation_rounds);
         break;
     case OperationClass::convolution_2d:
-        validation = validate_convolution(operation, config);
+        validation = validate_convolution(operation, config, validation_rounds);
         break;
     case OperationClass::resample_2d:
     default:
-        validation = validate_resample(operation, config);
+        validation = validate_resample(operation, config, validation_rounds);
         break;
     }
 
@@ -3477,7 +4140,7 @@ BenchmarkRecord benchmark_operation(
         std::max(validation.reference_latency_us + validation.candidate_latency_us, 1.0);
     const double calibration_confidence = std::clamp(
         (static_cast<double>(std::max(validation.samples, 1u)) /
-         static_cast<double>(kValidationMeasurementRounds)) *
+         static_cast<double>(std::max(validation_rounds, 1u))) *
             (1.0 / (1.0 + (spread_ratio * 6.0))),
         0.0,
         1.0);
@@ -3527,6 +4190,7 @@ struct CandidateEvaluation {
 OperationOptimizationResult optimize_operation(
     const std::string& report_signature,
     const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled_workload,
     const OperationSpec& operation,
     const WorkloadSpec& workload,
     const ExecutionPlan& placement,
@@ -3534,17 +4198,21 @@ OperationOptimizationResult optimize_operation(
     const std::unordered_map<std::string, ExecutionConfig>& selected_configs,
     const SystemProfile& system,
     const std::unordered_map<std::string, PerformanceSummary>& performance_cache,
+    const std::unordered_map<std::string, PerformanceSummary>& graph_family_performance_cache,
     const std::unordered_map<std::string, double>& backend_penalty_cache,
     const std::unordered_map<std::string, bool>& warmed_devices,
     const std::string& graph_set_signature,
     const ExecutionConfig* cached_config,
     const ContinuousExecutionState* continuous_state,
-    const bool allow_validation);
+    const bool allow_validation,
+    const ValidationTier validation_tier,
+    const OptimizationDeadline& deadline);
 
 std::optional<ExecutionConfig> make_spsa_candidate(
     const ExecutionConfig& seed,
     const std::string& report_signature,
     const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled_workload,
     const OperationSpec& operation,
     const ExecutionPlan& placement,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
@@ -3555,6 +4223,7 @@ std::optional<ExecutionConfig> make_spsa_candidate(
         auto graph = build_execution_graph(
             report_signature,
             workload_graph,
+            compiled_workload,
             operation,
             candidate,
             placement,
@@ -3691,11 +4360,21 @@ void refresh_candidate_objectives(
 }
 
 std::size_t choose_validation_shortlist_size(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const SystemProfile& system,
     const std::vector<CandidateEvaluation>& evaluations,
     const OptimizationPolicy policy) {
     if (evaluations.size() <= 1u) {
         return evaluations.size();
     }
+
+    const auto policy_limits = candidate_policy_for_workload(
+        workload,
+        operation,
+        system,
+        true,
+        structural_placement_affinity(workload, operation));
 
     std::vector<double> objectives;
     objectives.reserve(evaluations.size());
@@ -3713,9 +4392,9 @@ std::size_t choose_validation_shortlist_size(
             return left.observations < right.observations;
         })->observations;
     if (gap_ratio > 0.20 && max_observations >= kLearningWarmupSamples) {
-        return 1u;
+        return std::min<std::size_t>(1u, policy_limits.validation_shortlist);
     }
-    return std::min<std::size_t>(2u, evaluations.size());
+    return std::min<std::size_t>(policy_limits.validation_shortlist, evaluations.size());
 }
 
 struct GraphStateEvaluation {
@@ -3755,16 +4434,20 @@ GraphStateEvaluation evaluate_global_state(
     const std::string& report_signature,
     const WorkloadSpec& workload,
     const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled_workload,
     const ExecutionPlan& placement,
     const std::vector<OperationSpec>& operations,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     const SystemProfile& system,
     const std::unordered_map<std::string, PerformanceSummary>& performance_cache,
+    const std::unordered_map<std::string, PerformanceSummary>& graph_family_performance_cache,
     const std::unordered_map<std::string, double>& backend_penalty_cache,
     const std::unordered_map<std::string, bool>& warmed_devices,
     const std::string& graph_set_signature,
     const std::unordered_map<std::string, ExecutionConfig>* cached_configs,
-    const bool keep_operations) {
+    const bool keep_operations,
+    const ValidationTier validation_tier,
+    const OptimizationDeadline& deadline) {
     GraphStateEvaluation evaluation;
     evaluation.state = clamp_state(state);
     if (keep_operations) {
@@ -3773,6 +4456,9 @@ GraphStateEvaluation evaluate_global_state(
     std::unordered_map<std::string, ExecutionConfig> selected_configs;
 
     for (const auto& operation : operations) {
+        if (deadline_reached(deadline)) {
+            break;
+        }
         const ExecutionConfig* cached_config = nullptr;
         if (cached_configs != nullptr) {
             if (const auto it = cached_configs->find(operation.name); it != cached_configs->end()) {
@@ -3782,6 +4468,7 @@ GraphStateEvaluation evaluate_global_state(
         auto optimized = optimize_operation(
             report_signature,
             workload_graph,
+            compiled_workload,
             operation,
             workload,
             placement,
@@ -3789,12 +4476,15 @@ GraphStateEvaluation evaluate_global_state(
             selected_configs,
             system,
             performance_cache,
+            graph_family_performance_cache,
             backend_penalty_cache,
             warmed_devices,
             graph_set_signature,
             cached_config,
             &evaluation.state,
-            false);
+            false,
+            validation_tier,
+            deadline);
         if (optimized.config.signature.empty()) {
             continue;
         }
@@ -3813,17 +4503,21 @@ GraphOptimizationSummary optimize_graph_continuous_state(
     const std::string& report_signature,
     const WorkloadSpec& workload,
     const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled_workload,
     const ExecutionPlan& placement,
     const std::vector<OperationSpec>& operations,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     const SystemProfile& system,
     const std::unordered_map<std::string, PerformanceSummary>& performance_cache,
+    const std::unordered_map<std::string, PerformanceSummary>& graph_family_performance_cache,
     const std::unordered_map<std::string, double>& backend_penalty_cache,
     const std::unordered_map<std::string, bool>& warmed_devices,
     const std::string& graph_set_signature,
     const std::unordered_map<std::string, ExecutionConfig>* cached_configs,
     const bool lightweight_path,
-    const ExecutionTuningOverrides* tuning_overrides) {
+    const ExecutionTuningOverrides* tuning_overrides,
+    const ValidationTier validation_tier,
+    const OptimizationDeadline& deadline) {
     constexpr std::array<double, 10> kDeltas{0.35, 0.35, 0.30, 0.25, 0.25, 0.25, 0.30, 0.30, 0.30, 0.30};
     constexpr double kBeta1 = 0.9;
     constexpr double kBeta2 = 0.999;
@@ -3831,6 +4525,10 @@ GraphOptimizationSummary optimize_graph_continuous_state(
 
     GraphOptimizationSummary summary;
     summary.optimizer_name = "adam_surrogate";
+    summary.time_budget_ms =
+        tuning_overrides != nullptr && tuning_overrides->optimizer_wall_time_budget_ms.has_value()
+            ? *tuning_overrides->optimizer_wall_time_budget_ms
+            : 0u;
     auto state = tuning_overrides != nullptr && tuning_overrides->initial_state_override.has_value()
                      ? clamp_state(*tuning_overrides->initial_state_override)
                      : default_continuous_state(workload, system);
@@ -3848,16 +4546,20 @@ GraphOptimizationSummary optimize_graph_continuous_state(
         report_signature,
         workload,
         workload_graph,
+        compiled_workload,
         placement,
         operations,
         graph_lookup,
         system,
         performance_cache,
+        graph_family_performance_cache,
         backend_penalty_cache,
         warmed_devices,
         graph_set_signature,
         cached_configs,
-        false);
+        false,
+        validation_tier,
+        deadline);
     summary.initial_objective_us = initial.total_objective_us;
 
     std::array<double, 10> m{};
@@ -3868,14 +4570,24 @@ GraphOptimizationSummary optimize_graph_continuous_state(
     if (active_dims.empty() || graph_passes == 0u) {
         summary.final_state = best_state;
         summary.final_objective_us = best_objective;
+        summary.budget_exhausted = deadline_reached(deadline);
         summary.converged = true;
         return summary;
     }
 
     for (std::uint32_t pass_index = 1; pass_index <= graph_passes; ++pass_index) {
+        if (deadline_reached(deadline)) {
+            summary.budget_exhausted = true;
+            break;
+        }
         std::array<double, 10> gradient{};
+        bool pass_budget_exhausted = false;
 
         for (const std::size_t dim : active_dims) {
+            if (deadline_reached(deadline)) {
+                pass_budget_exhausted = true;
+                break;
+            }
             auto plus = state;
             auto minus = state;
             switch (dim) {
@@ -3927,32 +4639,52 @@ GraphOptimizationSummary optimize_graph_continuous_state(
                 report_signature,
                 workload,
                 workload_graph,
+                compiled_workload,
                 placement,
                 operations,
                 graph_lookup,
                 system,
                 performance_cache,
+                graph_family_performance_cache,
                 backend_penalty_cache,
                 warmed_devices,
                 graph_set_signature,
                 cached_configs,
-                false);
+                false,
+                validation_tier,
+                deadline);
+            if (deadline_reached(deadline)) {
+                pass_budget_exhausted = true;
+                break;
+            }
             const auto minus_eval = evaluate_global_state(
                 clamp_state(minus),
                 report_signature,
                 workload,
                 workload_graph,
+                compiled_workload,
                 placement,
                 operations,
                 graph_lookup,
                 system,
                 performance_cache,
+                graph_family_performance_cache,
                 backend_penalty_cache,
                 warmed_devices,
                 graph_set_signature,
                 cached_configs,
-                false);
+                false,
+                validation_tier,
+                deadline);
+            if (deadline_reached(deadline)) {
+                pass_budget_exhausted = true;
+                break;
+            }
             gradient[dim] = (plus_eval.total_objective_us - minus_eval.total_objective_us) / (2.0 * kDeltas[dim]);
+        }
+        if (pass_budget_exhausted) {
+            summary.budget_exhausted = true;
+            break;
         }
 
         double gradient_norm = 0.0;
@@ -4014,16 +4746,24 @@ GraphOptimizationSummary optimize_graph_continuous_state(
             report_signature,
             workload,
             workload_graph,
+            compiled_workload,
             placement,
             operations,
             graph_lookup,
             system,
             performance_cache,
+            graph_family_performance_cache,
             backend_penalty_cache,
             warmed_devices,
             graph_set_signature,
             cached_configs,
-            false);
+            false,
+            validation_tier,
+            deadline);
+        if (deadline_reached(deadline)) {
+            summary.budget_exhausted = true;
+            break;
+        }
         if (proposed_eval.total_objective_us < best_objective) {
             best_objective = proposed_eval.total_objective_us;
             best_state = proposed;
@@ -4043,7 +4783,7 @@ GraphOptimizationSummary optimize_graph_continuous_state(
 
     summary.final_state = best_state;
     summary.final_objective_us = best_objective;
-    summary.converged = best_objective <= (summary.initial_objective_us * 0.995);
+    summary.converged = !summary.budget_exhausted && best_objective <= (summary.initial_objective_us * 0.995);
     return summary;
 }
 
@@ -4063,6 +4803,7 @@ ExecutionStrategy parse_strategy(const std::string_view value) {
 OperationOptimizationResult optimize_operation(
     const std::string& report_signature,
     const WorkloadGraph& workload_graph,
+    const CompiledWorkloadGraph& compiled_workload,
     const OperationSpec& operation,
     const WorkloadSpec& workload,
     const ExecutionPlan& placement,
@@ -4070,12 +4811,15 @@ OperationOptimizationResult optimize_operation(
     const std::unordered_map<std::string, ExecutionConfig>& selected_configs,
     const SystemProfile& system,
     const std::unordered_map<std::string, PerformanceSummary>& performance_cache,
+    const std::unordered_map<std::string, PerformanceSummary>& graph_family_performance_cache,
     const std::unordered_map<std::string, double>& backend_penalty_cache,
     const std::unordered_map<std::string, bool>& warmed_devices,
     const std::string& graph_set_signature,
     const ExecutionConfig* cached_config,
     const ContinuousExecutionState* continuous_state,
-    const bool allow_validation) {
+    const bool allow_validation,
+    const ValidationTier validation_tier,
+    const OptimizationDeadline& deadline) {
     std::vector<ExecutionConfig> candidates;
     if (cached_config != nullptr) {
         candidates.push_back(*cached_config);
@@ -4098,12 +4842,43 @@ OperationOptimizationResult optimize_operation(
         return {};
     }
 
+    if (should_auto_accelerator_data_parallel(workload, operation, placement, graph_lookup) &&
+        operation.op_class == OperationClass::matmul) {
+        const auto accelerators = accelerator_device_uids(placement, graph_lookup);
+        const auto existing_ddp = std::find_if(
+            candidates.begin(),
+            candidates.end(),
+            [&](const ExecutionConfig& candidate) {
+                return candidate.strategy == ExecutionStrategy::sharded &&
+                       candidate.participating_devices.size() == accelerators.size() &&
+                       std::is_permutation(
+                           candidate.participating_devices.begin(),
+                           candidate.participating_devices.end(),
+                        accelerators.begin(),
+                        accelerators.end());
+            });
+        if (existing_ddp == candidates.end() && !accelerators.empty()) {
+            auto ddp = candidates.front();
+            ddp.variant_id = "auto-accelerator-ddp";
+            ddp.strategy = ExecutionStrategy::sharded;
+            ddp.primary_device_uid = accelerators.front();
+            ddp.participating_devices = accelerators;
+            ddp.logical_partitions = 1u;
+            ddp.overlap_transfers = true;
+            ddp.queue_depth = std::max(ddp.queue_depth, 2u);
+            ddp.stages = std::max(ddp.stages, 2u);
+            ddp.signature = build_config_signature(report_signature, ddp);
+            candidates.push_back(std::move(ddp));
+        }
+    }
+
     std::string spsa_signature;
     if (allow_validation || continuous_state == nullptr) {
-        if (const auto spsa_candidate = make_spsa_candidate(
+            if (const auto spsa_candidate = make_spsa_candidate(
                 candidates.front(),
                 report_signature,
                 workload_graph,
+                compiled_workload,
                 operation,
                 placement,
                 graph_lookup,
@@ -4125,7 +4900,47 @@ OperationOptimizationResult optimize_operation(
     }
 
     if (continuous_state != nullptr && !allow_validation && candidates.size() > 4u) {
-        candidates.resize(4u);
+        const auto ddp_policy = candidate_policy_for_workload(
+            workload,
+            operation,
+            system,
+            true,
+            structural_placement_affinity(workload, operation));
+        const auto accelerators = accelerator_device_uids(placement, graph_lookup);
+        const auto ddp_candidate = std::find_if(
+            candidates.begin(),
+            candidates.end(),
+            [&](const ExecutionConfig& candidate) {
+                return ddp_policy.max_devices > 1u &&
+                       should_auto_accelerator_data_parallel(workload, operation, placement, graph_lookup) &&
+                       candidate.strategy == ExecutionStrategy::sharded &&
+                       candidate.participating_devices.size() == accelerators.size() &&
+                       std::is_permutation(
+                           candidate.participating_devices.begin(),
+                           candidate.participating_devices.end(),
+                           accelerators.begin(),
+                           accelerators.end());
+            });
+        std::vector<ExecutionConfig> limited;
+        limited.reserve(4u);
+        for (const auto& candidate : candidates) {
+            if (limited.size() >= 4u) {
+                break;
+            }
+            limited.push_back(candidate);
+        }
+        if (ddp_candidate != candidates.end()) {
+            const auto present = std::find_if(
+                limited.begin(),
+                limited.end(),
+                [&](const ExecutionConfig& candidate) {
+                    return candidate.signature == ddp_candidate->signature;
+                });
+            if (present == limited.end()) {
+                limited.back() = *ddp_candidate;
+            }
+        }
+        candidates = std::move(limited);
     }
 
     const auto shape_bucket = shape_bucket_for(operation);
@@ -4134,9 +4949,13 @@ OperationOptimizationResult optimize_operation(
     evaluations.reserve(candidates.size());
     double log_observation_budget = 1.0;
     for (auto candidate : candidates) {
+        if (deadline_reached(deadline) && !evaluations.empty()) {
+            break;
+        }
         auto graph = build_execution_graph(
             report_signature,
             workload_graph,
+            compiled_workload,
             operation,
             candidate,
             placement,
@@ -4147,15 +4966,17 @@ OperationOptimizationResult optimize_operation(
         std::uint32_t observations = 0;
         double historical_latency_us = 0.0;
         double average_reward = 0.0;
+        double average_relative_error = graph.expected_relative_error;
         double backend_penalty_us = 0.0;
         double calibration_ratio = 1.0;
         double validation_spread_us = 0.0;
-        if (const auto it =
-                performance_cache.find(performance_key(graph_set_signature, workload, system, shape_bucket, candidate));
-            it != performance_cache.end()) {
+        const auto candidate_performance_key =
+            performance_key(report_signature, graph_set_signature, workload, system, shape_bucket, candidate);
+        if (const auto it = performance_cache.find(candidate_performance_key); it != performance_cache.end()) {
             observations = it->second.observations;
             historical_latency_us = it->second.average_effective_latency_us;
             average_reward = it->second.average_reward;
+            average_relative_error = it->second.average_relative_error;
             learning_scale = std::clamp(it->second.average_prediction_scale, 0.50, 2.50);
             calibration_ratio = std::clamp(it->second.average_calibration_ratio, 0.50, 2.50);
             validation_spread_us = it->second.average_validation_spread_us;
@@ -4165,9 +4986,35 @@ OperationOptimizationResult optimize_operation(
             if (it->second.average_relative_error > candidate.target_error_tolerance) {
                 learning_scale *= 1.5;
             }
+        } else if (const auto family_it =
+                       graph_family_performance_cache.find(
+                           performance_family_key(report_signature, shape_bucket, candidate));
+                   family_it != graph_family_performance_cache.end()) {
+            observations = std::max<std::uint32_t>(1u, family_it->second.observations / 2u);
+            historical_latency_us = family_it->second.average_effective_latency_us;
+            average_reward = family_it->second.average_reward * 0.85;
+            average_relative_error = family_it->second.average_relative_error;
+            learning_scale = std::clamp(family_it->second.average_prediction_scale, 0.60, 2.25);
+            calibration_ratio = std::clamp(family_it->second.average_calibration_ratio, 0.60, 2.25);
+            validation_spread_us = family_it->second.average_validation_spread_us;
+        } else if (const auto* family_summary = best_graph_family_summary(
+                       graph_family_performance_cache,
+                       report_signature,
+                       shape_bucket,
+                       candidate,
+                       graph_lookup);
+                   family_summary != nullptr) {
+            observations = std::max<std::uint32_t>(1u, family_summary->observations / 2u);
+            historical_latency_us = family_summary->average_effective_latency_us;
+            average_reward = family_summary->average_reward * 0.82;
+            average_relative_error = family_summary->average_relative_error;
+            learning_scale = std::clamp(family_summary->average_prediction_scale, 0.65, 2.10);
+            calibration_ratio = std::clamp(family_summary->average_calibration_ratio, 0.65, 2.10);
+            validation_spread_us = family_summary->average_validation_spread_us;
         }
         if (const auto penalty_it =
-                backend_penalty_cache.find(backend_penalty_key(graph_set_signature, workload, operation.name, candidate));
+                backend_penalty_cache.find(
+                    backend_penalty_key(report_signature, graph_set_signature, workload, operation.name, candidate));
             penalty_it != backend_penalty_cache.end()) {
             backend_penalty_us = penalty_it->second;
         }
@@ -4179,6 +5026,14 @@ OperationOptimizationResult optimize_operation(
             device_agnostic_execution_bias_us(workload, operation, candidate, graph_lookup) +
             auto_accelerator_data_parallel_bias_us(workload, operation, placement, candidate, graph_lookup);
         BenchmarkRecord benchmark;
+        const auto validation_rounds =
+            choose_validation_rounds(
+                observations,
+                average_relative_error,
+                validation_spread_us,
+                calibration_ratio,
+                cached_config != nullptr,
+                validation_tier);
         benchmark.operation_name = operation.name;
         benchmark.config_signature = candidate.signature;
         benchmark.shape_bucket = shape_bucket;
@@ -4189,7 +5044,7 @@ OperationOptimizationResult optimize_operation(
         benchmark.calibration_confidence = observations == 0 ? 0.15 : 0.35;
         benchmark.candidate_spread_us = validation_spread_us;
         benchmark.reference_spread_us = validation_spread_us * 0.5;
-        benchmark.validation_samples = observations == 0 ? 1u : std::min(5u, observations + 1u);
+        benchmark.validation_samples = validation_rounds;
         benchmark.effective_latency_us = std::max(0.01, surrogate_latency_us);
         benchmark.system_penalty_us = system_penalty_us;
         benchmark.relative_error = graph.expected_relative_error;
@@ -4220,6 +5075,9 @@ OperationOptimizationResult optimize_operation(
             evaluations.back().historical_latency_us,
             evaluations.back().average_reward,
             log_observation_budget);
+        if (deadline_reached(deadline) && !evaluations.empty()) {
+            break;
+        }
     }
 
     if (evaluations.empty()) {
@@ -4242,7 +5100,7 @@ OperationOptimizationResult optimize_operation(
                            accelerators.end());
             });
         if (forced != evaluations.end()) {
-            if (allow_validation) {
+            if (allow_validation && validation_tier != ValidationTier::disabled && !deadline_reached(deadline)) {
                 forced->benchmark = benchmark_operation(
                     operation,
                     forced->config,
@@ -4250,7 +5108,14 @@ OperationOptimizationResult optimize_operation(
                     graph_lookup,
                     shape_bucket,
                     forced->benchmark.surrogate_latency_us,
-                    forced->benchmark.system_penalty_us);
+                    forced->benchmark.system_penalty_us,
+                    choose_validation_rounds(
+                        forced->observations,
+                        forced->benchmark.relative_error,
+                        forced->benchmark.candidate_spread_us,
+                        forced->benchmark.calibration_ratio,
+                        cached_config != nullptr,
+                        validation_tier));
                 refresh_candidate_objectives(
                     *forced,
                     trace_weight,
@@ -4270,7 +5135,7 @@ OperationOptimizationResult optimize_operation(
     }
 
     const auto selected_policy = select_policy_for_workload(workload, evaluations);
-    if (allow_validation) {
+    if (allow_validation && validation_tier != ValidationTier::disabled) {
         std::vector<std::size_t> ranked_indices(evaluations.size());
         for (std::size_t index = 0; index < ranked_indices.size(); ++index) {
             ranked_indices[index] = index;
@@ -4282,8 +5147,12 @@ OperationOptimizationResult optimize_operation(
                 return objective_for_policy(evaluations[left], selected_policy) <
                        objective_for_policy(evaluations[right], selected_policy);
             });
-        const auto shortlist = choose_validation_shortlist_size(evaluations, selected_policy);
+        const auto shortlist =
+            choose_validation_shortlist_size(workload, operation, system, evaluations, selected_policy);
         for (std::size_t rank = 0; rank < shortlist; ++rank) {
+            if (deadline_reached(deadline)) {
+                break;
+            }
             auto& candidate = evaluations[ranked_indices[rank]];
             candidate.benchmark = benchmark_operation(
                 operation,
@@ -4292,7 +5161,14 @@ OperationOptimizationResult optimize_operation(
                 graph_lookup,
                 shape_bucket,
                 candidate.benchmark.surrogate_latency_us,
-                candidate.benchmark.system_penalty_us);
+                candidate.benchmark.system_penalty_us,
+                choose_validation_rounds(
+                    candidate.observations,
+                    candidate.benchmark.relative_error,
+                    candidate.benchmark.candidate_spread_us,
+                    candidate.benchmark.calibration_ratio,
+                    cached_config != nullptr,
+                    validation_tier));
             refresh_candidate_objectives(
                 candidate,
                 trace_weight,
@@ -4325,6 +5201,7 @@ void update_performance_summary(
     std::unordered_map<std::string, PerformanceSummary>& performance_cache,
     const std::string& key,
     const std::string& shape_bucket,
+    const std::string& device_family_signature,
     const ExecutionConfig& config,
     const double effective_latency_us,
     const double relative_error,
@@ -4335,6 +5212,7 @@ void update_performance_summary(
     const double reward) {
     auto& summary = performance_cache[key];
     summary.shape_bucket = shape_bucket;
+    summary.device_family_signature = device_family_signature;
     summary.config = config;
     ++summary.observations;
     const double sample_count = static_cast<double>(summary.observations);
@@ -4458,6 +5336,20 @@ std::string to_string(const OptimizationPolicy policy) {
         return "adam_surrogate";
     default:
         return "heuristic_greedy";
+    }
+}
+
+std::string to_string(const ValidationTier tier) {
+    switch (tier) {
+    case ValidationTier::full:
+        return "full";
+    case ValidationTier::adaptive:
+        return "adaptive";
+    case ValidationTier::minimal:
+        return "minimal";
+    case ValidationTier::disabled:
+    default:
+        return "disabled";
     }
 }
 
@@ -4730,7 +5622,8 @@ BootstrapExecutionOptimizer::BootstrapExecutionOptimizer(std::filesystem::path c
     : cache_path_(std::move(cache_path)) {}
 
 AdaptiveExecutionOptimizer::AdaptiveExecutionOptimizer(std::filesystem::path cache_path)
-    : performance_cache_path_(performance_cache_path_for(cache_path)) {}
+    : performance_cache_path_(performance_cache_path_for(cache_path)),
+      graph_family_cache_path_(graph_family_cache_path_for(cache_path)) {}
 
 ExecutionOptimizer::ExecutionOptimizer(std::filesystem::path cache_path)
     : bootstrap_optimizer_(cache_path),
@@ -4780,8 +5673,10 @@ OptimizationReport ExecutionOptimizer::optimize(
         graph_lookup,
         report.workload_graph,
         tuning_overrides);
+    const auto compiled_workload = compile_workload_graph(report.workload_graph);
     const auto& operations = report.workload_graph.operations;
-    report.signature = build_report_signature(effective_workload, placement, operations, tuning_overrides);
+    report.signature =
+        build_report_signature(effective_workload, placement, compiled_workload.signature, operations, tuning_overrides);
     const auto graph_set_signature = summarize_graph_set(graphs);
 
     std::unordered_map<std::string, ExecutionConfig> cached_by_operation;
@@ -4790,6 +5685,9 @@ OptimizationReport ExecutionOptimizer::optimize(
     const bool runtime_sensitive_path = adaptive_optimizer_.should_reoptimize(report.signature);
     const bool lightweight_path =
         adaptive_optimizer_.should_use_lightweight_path(report.signature, fully_cached);
+    const auto validation_tier =
+        tuning_overrides == nullptr ? ValidationTier::adaptive : tuning_overrides->validation_tier;
+    const auto optimization_deadline = make_optimizer_deadline(tuning_overrides);
     const std::string optimizer_route =
         (lightweight_path || runtime_sensitive_path) ? "runtime_sensitive_optimizer" : "bootstrap_general_optimizer";
 
@@ -4801,17 +5699,21 @@ OptimizationReport ExecutionOptimizer::optimize(
         report.signature,
         effective_workload,
         report.workload_graph,
+        compiled_workload,
         placement,
         operations,
         graph_lookup,
         report.system_profile,
         adaptive_optimizer_.performance_cache(),
+        adaptive_optimizer_.graph_family_performance_cache(),
         adaptive_optimizer_.backend_penalty_cache(),
         adaptive_optimizer_.warmed_devices(),
         graph_set_signature,
         (fully_cached && !runtime_sensitive_path) ? &cache_input : nullptr,
         lightweight_path || runtime_sensitive_path,
-        tuning_overrides);
+        tuning_overrides,
+        validation_tier,
+        optimization_deadline);
     report.graph_optimization.optimizer_name = optimizer_route + ":" + report.graph_optimization.optimizer_name;
 
     std::unordered_map<std::string, ExecutionConfig> selected_configs;
@@ -4824,6 +5726,7 @@ OptimizationReport ExecutionOptimizer::optimize(
         auto result = optimize_operation(
             report.signature,
             report.workload_graph,
+            compiled_workload,
             operation,
             effective_workload,
             placement,
@@ -4831,12 +5734,15 @@ OptimizationReport ExecutionOptimizer::optimize(
             selected_configs,
             report.system_profile,
             adaptive_optimizer_.performance_cache(),
+            adaptive_optimizer_.graph_family_performance_cache(),
             adaptive_optimizer_.backend_penalty_cache(),
             adaptive_optimizer_.warmed_devices(),
             graph_set_signature,
             cached_config,
             &report.graph_optimization.final_state,
-            !lightweight_path || operation_needs_fast_recovery);
+            !lightweight_path || operation_needs_fast_recovery,
+            validation_tier,
+            optimization_deadline);
         if (result.config.signature.empty()) {
             continue;
         }
@@ -4853,6 +5759,18 @@ OptimizationReport ExecutionOptimizer::optimize(
     bootstrap_optimizer_.store_configs(report.signature, std::move(persisted_configs));
     report.loaded_from_cache = fully_cached && !runtime_sensitive_path;
     return report;
+}
+
+CandidatePolicySummary describe_candidate_policy(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const SystemProfile& system,
+    const bool continuous_state_active,
+    const double placement_affinity) {
+    StructuralPlacementAffinity affinity;
+    affinity.bias_scale = placement_affinity;
+    return summarize_candidate_policy(
+        candidate_policy_for_workload(workload, operation, system, continuous_state_active, affinity));
 }
 
 void ExecutionOptimizer::ingest_execution_feedback(
@@ -4971,69 +5889,82 @@ void AdaptiveExecutionOptimizer::load_cache() {
     }
     cache_loaded_ = true;
 
-    std::ifstream performance_input(performance_cache_path_);
-    if (!performance_input.is_open()) {
-        return;
-    }
+    const auto load_summary_map =
+        [&](const std::filesystem::path& path, std::unordered_map<std::string, PerformanceSummary>& target) {
+            std::ifstream input(path);
+            if (!input.is_open()) {
+                return;
+            }
 
-    std::string line;
-    while (std::getline(performance_input, line)) {
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
+            std::string line;
+            while (std::getline(input, line)) {
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
 
-        const auto fields = split_tab(line);
-        if (fields.size() != 19 && fields.size() != 26 && fields.size() != 28 && fields.size() != 29) {
-            continue;
-        }
+                const auto fields = split_tab(line);
+                if (fields.size() != 19 && fields.size() != 20 && fields.size() != 26 && fields.size() != 27 &&
+                    fields.size() != 28 && fields.size() != 29 && fields.size() != 30) {
+                    continue;
+                }
 
-        try {
-            PerformanceSummary summary;
-            const bool has_variant = fields.size() == 29;
-            const bool has_extended = fields.size() == 26 || fields.size() == 28 || fields.size() == 29;
-            const bool has_calibration = fields.size() == 28 || fields.size() == 29;
-            std::size_t next = 1;
-            summary.shape_bucket = fields[next++];
-            summary.config.operation_name = fields[next++];
-            summary.config.variant_id = has_variant ? fields[next++] : "legacy";
-            summary.config.strategy = parse_strategy(fields[next++]);
-            summary.config.primary_device_uid = fields[next++];
-            summary.config.participating_devices = split_csv(fields[next++]);
-            summary.config.queue_depth = static_cast<std::uint32_t>(std::stoul(fields[next++]));
-            summary.config.stages = static_cast<std::uint32_t>(std::stoul(fields[next++]));
-            summary.config.tile_x = static_cast<std::uint32_t>(std::stoul(fields[next++]));
-            summary.config.tile_y = static_cast<std::uint32_t>(std::stoul(fields[next++]));
-            summary.config.tile_k = static_cast<std::uint32_t>(std::stoul(fields[next++]));
-            if (has_extended) {
-                summary.config.logical_partitions = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+                try {
+                    PerformanceSummary summary;
+                    const bool has_variant = fields.size() == 29 || fields.size() == 30;
+                    const bool has_extended =
+                        fields.size() == 26 || fields.size() == 27 || fields.size() == 28 ||
+                        fields.size() == 29 || fields.size() == 30;
+                    const bool has_calibration =
+                        fields.size() == 28 || fields.size() == 29 || fields.size() == 30;
+                    const bool has_family =
+                        fields.size() == 20 || fields.size() == 27 || fields.size() == 30;
+                    std::size_t next = 1;
+                    summary.shape_bucket = fields[next++];
+                    summary.device_family_signature = has_family ? fields[next++] : "";
+                    summary.config.operation_name = fields[next++];
+                    summary.config.variant_id = has_variant ? fields[next++] : "legacy";
+                    summary.config.strategy = parse_strategy(fields[next++]);
+                    summary.config.primary_device_uid = fields[next++];
+                    summary.config.participating_devices = split_csv(fields[next++]);
+                    summary.config.queue_depth = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+                    summary.config.stages = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+                    summary.config.tile_x = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+                    summary.config.tile_y = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+                    summary.config.tile_k = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+                    if (has_extended) {
+                        summary.config.logical_partitions = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+                    }
+                    summary.config.overlap_transfers = std::stoi(fields[next++]) != 0;
+                    summary.config.use_low_precision = std::stoi(fields[next++]) != 0;
+                    if (has_extended) {
+                        summary.config.queue_depth_scale = std::stod(fields[next++]);
+                        summary.config.stage_scale = std::stod(fields[next++]);
+                        summary.config.tile_scale = std::stod(fields[next++]);
+                        summary.config.overlap_ratio = std::stod(fields[next++]);
+                        summary.config.partition_intensity = std::stod(fields[next++]);
+                        summary.config.precision_mix = std::stod(fields[next++]);
+                    }
+                    summary.observations = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+                    summary.average_effective_latency_us = std::stod(fields[next++]);
+                    summary.average_relative_error = std::stod(fields[next++]);
+                    summary.average_prediction_scale = std::stod(fields[next++]);
+                    if (has_calibration) {
+                        summary.average_calibration_ratio = std::stod(fields[next++]);
+                    }
+                    summary.average_system_penalty_us = std::stod(fields[next++]);
+                    if (has_calibration) {
+                        summary.average_validation_spread_us = std::stod(fields[next++]);
+                    }
+                    summary.average_reward = std::stod(fields[next++]);
+                    target[fields[0]] = std::move(summary);
+                } catch (const std::exception&) {
+                    continue;
+                }
             }
-            summary.config.overlap_transfers = std::stoi(fields[next++]) != 0;
-            summary.config.use_low_precision = std::stoi(fields[next++]) != 0;
-            if (has_extended) {
-                summary.config.queue_depth_scale = std::stod(fields[next++]);
-                summary.config.stage_scale = std::stod(fields[next++]);
-                summary.config.tile_scale = std::stod(fields[next++]);
-                summary.config.overlap_ratio = std::stod(fields[next++]);
-                summary.config.partition_intensity = std::stod(fields[next++]);
-                summary.config.precision_mix = std::stod(fields[next++]);
-            }
-            summary.observations = static_cast<std::uint32_t>(std::stoul(fields[next++]));
-            summary.average_effective_latency_us = std::stod(fields[next++]);
-            summary.average_relative_error = std::stod(fields[next++]);
-            summary.average_prediction_scale = std::stod(fields[next++]);
-            if (has_calibration) {
-                summary.average_calibration_ratio = std::stod(fields[next++]);
-            }
-            summary.average_system_penalty_us = std::stod(fields[next++]);
-            if (has_calibration) {
-                summary.average_validation_spread_us = std::stod(fields[next++]);
-            }
-            summary.average_reward = std::stod(fields[next++]);
-            performance_cache_[fields[0]] = std::move(summary);
-        } catch (const std::exception&) {
-            continue;
-        }
-    }
+        };
+
+    load_summary_map(performance_cache_path_, performance_cache_);
+    load_summary_map(graph_family_cache_path_, graph_family_performance_cache_);
 }
 
 void AdaptiveExecutionOptimizer::apply_runtime_state(
@@ -5089,6 +6020,10 @@ const std::unordered_map<std::string, PerformanceSummary>& AdaptiveExecutionOpti
     return performance_cache_;
 }
 
+const std::unordered_map<std::string, PerformanceSummary>& AdaptiveExecutionOptimizer::graph_family_performance_cache() const {
+    return graph_family_performance_cache_;
+}
+
 const std::unordered_map<std::string, double>& AdaptiveExecutionOptimizer::backend_penalty_cache() const {
     return backend_penalty_cache_;
 }
@@ -5114,6 +6049,11 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
     }
 
     const auto graph_set_signature = summarize_graph_set(graphs);
+    std::unordered_map<std::string, const HardwareGraph*> graph_lookup;
+    graph_lookup.reserve(graphs.size());
+    for (const auto& graph : graphs) {
+        graph_lookup.emplace(graph.uid, &graph);
+    }
     const WorkloadSpec feedback_workload{
         report.signature,
         report.workload_kind,
@@ -5138,7 +6078,9 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
         const double effective_latency_us = std::max(0.01, record.runtime_us);
         const double observed_penalty_us =
             std::max(0.0, effective_latency_us - std::max(optimized.graph.predicted_latency_us, 0.0));
+        const auto family_signature = device_family_signature_for_config(optimized.config, graph_lookup);
         const auto perf_key = performance_key(
+            report.signature,
             graph_set_signature,
             feedback_workload,
             report.system_profile,
@@ -5148,6 +6090,20 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
             performance_cache_,
             perf_key,
             optimized.benchmark.shape_bucket,
+            family_signature,
+            optimized.config,
+            effective_latency_us,
+            record.relative_error,
+            optimized.graph.predicted_latency_us,
+            optimized.benchmark.calibration_ratio,
+            observed_penalty_us,
+            optimized.benchmark.candidate_spread_us,
+            std::log(std::max(record.reference_runtime_us / effective_latency_us, 1.0e-6)));
+        update_performance_summary(
+            graph_family_performance_cache_,
+            performance_family_key(report.signature, optimized.benchmark.shape_bucket, optimized.config),
+            optimized.benchmark.shape_bucket,
+            family_signature,
             optimized.config,
             effective_latency_us,
             record.relative_error,
@@ -5166,7 +6122,12 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
         const double slowdown_vs_reference =
             record.reference_runtime_us > 0.0 ? (effective_latency_us / record.reference_runtime_us) : 1.0;
         const auto penalty_key =
-            backend_penalty_key(graph_set_signature, feedback_workload, optimized.operation.name, optimized.config);
+            backend_penalty_key(
+                report.signature,
+                graph_set_signature,
+                feedback_workload,
+                optimized.operation.name,
+                optimized.config);
         auto& backend_penalty = backend_penalty_cache_[penalty_key];
         backend_penalty *= 0.92;
         if (record.used_host && !record.used_opencl) {
@@ -5264,44 +6225,50 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
         std::filesystem::create_directories(parent, ec);
     }
 
-    std::ofstream performance_output(performance_cache_path_, std::ios::trunc);
-    if (!performance_output.is_open()) {
-        return;
-    }
+    const auto persist_summary_map =
+        [](const std::filesystem::path& path, const std::unordered_map<std::string, PerformanceSummary>& source) {
+            std::ofstream output(path, std::ios::trunc);
+            if (!output.is_open()) {
+                return;
+            }
 
-    performance_output
-        << "# key\tshape_bucket\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_calibration_ratio\tavg_system_penalty\tavg_validation_spread\tavg_reward\n";
-    for (const auto& [key, summary] : performance_cache_) {
-        performance_output << key << '\t'
-                           << summary.shape_bucket << '\t'
-                           << summary.config.operation_name << '\t'
-                           << summary.config.variant_id << '\t'
-                           << to_string(summary.config.strategy) << '\t'
-                           << summary.config.primary_device_uid << '\t'
-                           << join_csv(summary.config.participating_devices) << '\t'
-                           << summary.config.queue_depth << '\t'
-                           << summary.config.stages << '\t'
-                           << summary.config.tile_x << '\t'
-                           << summary.config.tile_y << '\t'
-                           << summary.config.tile_k << '\t'
-                           << summary.config.logical_partitions << '\t'
-                           << (summary.config.overlap_transfers ? 1 : 0) << '\t'
-                           << (summary.config.use_low_precision ? 1 : 0) << '\t'
-                           << summary.config.queue_depth_scale << '\t'
-                           << summary.config.stage_scale << '\t'
-                           << summary.config.tile_scale << '\t'
-                           << summary.config.overlap_ratio << '\t'
-                           << summary.config.partition_intensity << '\t'
-                           << summary.config.precision_mix << '\t'
-                           << summary.observations << '\t'
-                           << summary.average_effective_latency_us << '\t'
-                           << summary.average_relative_error << '\t'
-                           << summary.average_prediction_scale << '\t'
-                           << summary.average_calibration_ratio << '\t'
-                           << summary.average_system_penalty_us << '\t'
-                           << summary.average_validation_spread_us << '\t'
-                           << summary.average_reward << '\n';
-    }
+            output
+                << "# key\tshape_bucket\tdevice_family_signature\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_calibration_ratio\tavg_system_penalty\tavg_validation_spread\tavg_reward\n";
+            for (const auto& [key, summary] : source) {
+                output << key << '\t'
+                       << summary.shape_bucket << '\t'
+                       << summary.device_family_signature << '\t'
+                       << summary.config.operation_name << '\t'
+                       << summary.config.variant_id << '\t'
+                       << to_string(summary.config.strategy) << '\t'
+                       << summary.config.primary_device_uid << '\t'
+                       << join_csv(summary.config.participating_devices) << '\t'
+                       << summary.config.queue_depth << '\t'
+                       << summary.config.stages << '\t'
+                       << summary.config.tile_x << '\t'
+                       << summary.config.tile_y << '\t'
+                       << summary.config.tile_k << '\t'
+                       << summary.config.logical_partitions << '\t'
+                       << (summary.config.overlap_transfers ? 1 : 0) << '\t'
+                       << (summary.config.use_low_precision ? 1 : 0) << '\t'
+                       << summary.config.queue_depth_scale << '\t'
+                       << summary.config.stage_scale << '\t'
+                       << summary.config.tile_scale << '\t'
+                       << summary.config.overlap_ratio << '\t'
+                       << summary.config.partition_intensity << '\t'
+                       << summary.config.precision_mix << '\t'
+                       << summary.observations << '\t'
+                       << summary.average_effective_latency_us << '\t'
+                       << summary.average_relative_error << '\t'
+                       << summary.average_prediction_scale << '\t'
+                       << summary.average_calibration_ratio << '\t'
+                       << summary.average_system_penalty_us << '\t'
+                       << summary.average_validation_spread_us << '\t'
+                       << summary.average_reward << '\n';
+            }
+        };
+    persist_summary_map(performance_cache_path_, performance_cache_);
+    persist_summary_map(graph_family_cache_path_, graph_family_performance_cache_);
 }
 
 }  // namespace jakal

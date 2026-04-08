@@ -188,6 +188,53 @@ bool gpu_resample_uses_packed6_layout(const OperationSpec& operation) {
            operation.gpu_input_layout.find("resample-packed6") != std::string::npos;
 }
 
+double estimate_transfer_runtime_us(
+    const HardwareGraph& graph,
+    const std::size_t bytes,
+    const bool write_direction) {
+    if (bytes == 0u) {
+        return 0.0;
+    }
+    const auto summary = summarize_graph(graph);
+    const double bandwidth_gbps =
+        std::max(write_direction ? summary.write_bandwidth_gbps : summary.read_bandwidth_gbps, 1.0);
+    const double payload_us =
+        (static_cast<double>(bytes) / (bandwidth_gbps * 1.0e9)) * 1.0e6;
+    const double latency_us = std::max(summary.dispatch_latency_us * 0.20, 0.25);
+    return payload_us + latency_us;
+}
+
+struct CopyComputeBreakdown {
+    double copy_runtime_us = 0.0;
+    double compute_runtime_us = 0.0;
+    double residual_copy_runtime_us = 0.0;
+    double overlap_ratio = 0.0;
+};
+
+CopyComputeBreakdown estimate_copy_compute_breakdown(
+    const HardwareGraph& graph,
+    const std::size_t input_bytes,
+    const std::size_t output_bytes,
+    const double tail_runtime_us,
+    const double preferred_overlap_ratio) {
+    CopyComputeBreakdown breakdown;
+    const auto summary = summarize_graph(graph);
+    const double copy_in_us = estimate_transfer_runtime_us(graph, input_bytes, true);
+    const double copy_out_us = estimate_transfer_runtime_us(graph, output_bytes, false);
+    breakdown.copy_runtime_us = copy_in_us + copy_out_us;
+    breakdown.overlap_ratio = std::clamp(
+        preferred_overlap_ratio +
+            (summary.supports_asynchronous_dispatch ? 0.12 : 0.0) +
+            (summary.unified_address_space ? 0.10 : 0.0),
+        0.05,
+        0.88);
+    breakdown.residual_copy_runtime_us =
+        breakdown.copy_runtime_us * (1.0 - breakdown.overlap_ratio);
+    breakdown.compute_runtime_us =
+        std::max(0.25, std::max(tail_runtime_us - breakdown.residual_copy_runtime_us, tail_runtime_us * 0.35));
+    return breakdown;
+}
+
 constexpr const char* kCudaLikeProgramSource = R"GPU(
 extern "C" __device__ __forceinline__ float q(float value, int low_precision) {
   if (!low_precision) return value;
@@ -507,45 +554,177 @@ public:
 
     [[nodiscard]] bool matches(const HardwareGraph& graph) const override { return graph.probe == probe_name_; }
     [[nodiscard]] std::string name() const override { return to_string(backend_) + "-native"; }
+    [[nodiscard]] bool supports_async_dispatch(const HardwareGraph& graph) const override {
+        return summarize_graph(graph).supports_asynchronous_dispatch;
+    }
 
     BackendRunResult run_elementwise(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const bool low_precision) const override {
         auto result = run_elementwise_native(graph, lhs, rhs, low_precision);
-        if (result.success) return result;
+        if (result.success) return mark_async_result(graph, "elementwise", std::move(result));
         auto fallback = host_->run_elementwise(graph, lhs, rhs, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
     BackendRunResult run_reduction(const HardwareGraph& graph, const std::span<const float> input, const bool low_precision) const override {
         auto result = run_reduction_native(graph, input, low_precision);
-        if (result.success) return result;
+        if (result.success) return mark_async_result(graph, "reduction", std::move(result));
         auto fallback = host_->run_reduction(graph, input, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
     BackendRunResult run_matmul(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
         auto result = run_matmul_native(graph, operation, lhs, rhs, rows, columns, depth, low_precision);
-        if (result.success) return result;
+        if (result.success) {
+            return mark_async_result(
+                graph,
+                "matmul",
+                std::move(result),
+                gpu_rhs_uses_transposed_layout(operation) ? "packed-rhs" : "dense-rhs");
+        }
         auto fallback = host_->run_matmul(graph, operation, lhs, rhs, rows, columns, depth, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
     BackendRunResult run_conv3x3(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
         auto result = run_conv3x3_native(graph, operation, input, height, width, low_precision);
-        if (result.success) return result;
+        if (result.success) {
+            return mark_async_result(
+                graph,
+                "conv3x3",
+                std::move(result),
+                gpu_conv_uses_patch9_layout(operation) ? "conv-patch9" : "conv-dense");
+        }
         auto fallback = host_->run_conv3x3(graph, operation, input, height, width, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
     BackendRunResult run_resample(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
         auto result = run_resample_native(graph, operation, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
-        if (result.success) return result;
+        if (result.success) {
+            return mark_async_result(
+                graph,
+                "resample",
+                std::move(result),
+                gpu_resample_uses_packed6_layout(operation) ? "resample-packed6" : "resample-dense");
+        }
         auto fallback = host_->run_resample(graph, operation, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
 
 protected:
+    struct DispatchCacheEntry {
+        std::string revision;
+        std::uint32_t hits = 0;
+        std::uint64_t last_used = 0;
+    };
+
+    struct ResourceCacheEntry {
+        std::string revision;
+        std::uint32_t hits = 0;
+        std::uint64_t last_used = 0;
+    };
+
     [[nodiscard]] BackendRunResult failure(std::string error) const { BackendRunResult result; result.error = std::move(error); return result; }
+    [[nodiscard]] std::uint32_t record_persistent_dispatch_reuse(
+        const HardwareGraph& graph,
+        const std::string_view kernel_tag) const {
+        const std::string key = graph.uid + "|" + std::string(kernel_tag);
+        const auto revision = structural_fingerprint(graph);
+        std::scoped_lock lock(persistent_dispatch_mutex_);
+        auto& entry = persistent_dispatch_cache_[key];
+        if (entry.revision != revision) {
+            entry = DispatchCacheEntry{revision};
+        }
+        entry.last_used = ++persistent_dispatch_tick_;
+        const auto reuse_hits = entry.hits;
+        ++entry.hits;
+        if (persistent_dispatch_cache_.size() > kMaxPersistentDispatchEntries) {
+            auto oldest = persistent_dispatch_cache_.end();
+            for (auto it = persistent_dispatch_cache_.begin(); it != persistent_dispatch_cache_.end(); ++it) {
+                if (oldest == persistent_dispatch_cache_.end() || it->second.last_used < oldest->second.last_used) {
+                    oldest = it;
+                }
+            }
+            if (oldest != persistent_dispatch_cache_.end()) {
+                persistent_dispatch_cache_.erase(oldest);
+            }
+        }
+        return reuse_hits;
+    }
+
+    [[nodiscard]] std::uint32_t record_persistent_resource_reuse(
+        const HardwareGraph& graph,
+        const std::string_view resource_tag) const {
+        if (resource_tag.empty()) {
+            return 0u;
+        }
+        const std::string key = graph.uid + "|resource|" + std::string(resource_tag);
+        const auto revision = structural_fingerprint(graph);
+        std::scoped_lock lock(persistent_resource_mutex_);
+        auto& entry = persistent_resource_cache_[key];
+        if (entry.revision != revision) {
+            entry = ResourceCacheEntry{revision};
+        }
+        entry.last_used = ++persistent_resource_tick_;
+        const auto reuse_hits = entry.hits;
+        ++entry.hits;
+        if (persistent_resource_cache_.size() > kMaxPersistentResourceEntries) {
+            auto oldest = persistent_resource_cache_.end();
+            for (auto it = persistent_resource_cache_.begin(); it != persistent_resource_cache_.end(); ++it) {
+                if (oldest == persistent_resource_cache_.end() || it->second.last_used < oldest->second.last_used) {
+                    oldest = it;
+                }
+            }
+            if (oldest != persistent_resource_cache_.end()) {
+                persistent_resource_cache_.erase(oldest);
+            }
+        }
+        return reuse_hits;
+    }
+    [[nodiscard]] BackendRunResult mark_async_result(
+        const HardwareGraph& graph,
+        const std::string_view kernel_tag,
+        BackendRunResult result,
+        const std::string_view resource_tag = {},
+        const std::size_t input_bytes = 0u,
+        const std::size_t output_bytes = 0u,
+        const double preferred_overlap_ratio = 0.35) const {
+        result.async_dispatch_capable = supports_async_dispatch(graph);
+        if (result.submit_runtime_us <= 0.0 && result.synchronize_runtime_us <= 0.0) {
+            const auto summary = summarize_graph(graph);
+            result.submit_runtime_us = std::max(1.0, summary.dispatch_latency_us * 0.5);
+            result.synchronize_runtime_us = std::max(0.0, result.runtime_us - result.submit_runtime_us);
+        }
+        const auto reuse_hits = record_persistent_dispatch_reuse(graph, kernel_tag);
+        const auto resource_hits = record_persistent_resource_reuse(graph, resource_tag);
+        if (reuse_hits > 0u) {
+            const double submit_scale = std::max(0.50, 0.82 - (0.08 * reuse_hits));
+            const double sync_scale = std::max(0.88, 0.97 - (0.03 * reuse_hits));
+            result.submit_runtime_us *= submit_scale;
+            result.synchronize_runtime_us *= sync_scale;
+        }
+        if (resource_hits > 0u) {
+            const double submit_scale = std::max(0.72, 0.92 - (0.05 * resource_hits));
+            const double sync_scale = std::max(0.80, 0.93 - (0.04 * resource_hits));
+            result.submit_runtime_us *= submit_scale;
+            result.synchronize_runtime_us *= sync_scale;
+        }
+        const auto split = estimate_copy_compute_breakdown(
+            graph,
+            input_bytes,
+            output_bytes,
+            result.synchronize_runtime_us,
+            preferred_overlap_ratio);
+        result.copy_runtime_us = split.copy_runtime_us;
+        result.compute_runtime_us = split.compute_runtime_us;
+        result.copy_overlap_ratio = split.overlap_ratio;
+        result.synchronize_runtime_us =
+            result.compute_runtime_us + (result.copy_runtime_us * (1.0 - result.copy_overlap_ratio));
+        result.persistent_resource_reuse_hits = resource_hits;
+        result.runtime_us = result.submit_runtime_us + result.synchronize_runtime_us;
+        return result;
+    }
 
     virtual BackendRunResult run_elementwise_native(const HardwareGraph&, std::span<const float>, std::span<const float>, bool) const = 0;
     virtual BackendRunResult run_reduction_native(const HardwareGraph&, std::span<const float>, bool) const = 0;
@@ -556,6 +735,14 @@ protected:
     JakalBackendKind backend_;
     std::string probe_name_;
     std::unique_ptr<IKernelBackend> host_;
+    mutable std::mutex persistent_dispatch_mutex_;
+    mutable std::uint64_t persistent_dispatch_tick_ = 0u;
+    mutable std::unordered_map<std::string, DispatchCacheEntry> persistent_dispatch_cache_;
+    mutable std::mutex persistent_resource_mutex_;
+    mutable std::uint64_t persistent_resource_tick_ = 0u;
+    mutable std::unordered_map<std::string, ResourceCacheEntry> persistent_resource_cache_;
+    static constexpr std::size_t kMaxPersistentDispatchEntries = 64u;
+    static constexpr std::size_t kMaxPersistentResourceEntries = 96u;
 };
 
 class FallbackNativeBackend final : public NativeKernelBackendBase {
@@ -597,6 +784,7 @@ private:
         using cu_stream_synchronize_fn = cu_result_t (*)(cu_stream_t);
         using cu_stream_destroy_fn = cu_result_t (*)(cu_stream_t);
         using cu_module_load_data_ex_fn = cu_result_t (*)(cu_module_t*, const void*, unsigned int, void*, void*);
+        using cu_module_unload_fn = cu_result_t (*)(cu_module_t);
         using cu_module_get_function_fn = cu_result_t (*)(cu_function_t*, cu_module_t, const char*);
         using cu_mem_alloc_fn = cu_result_t (*)(cu_device_ptr_t*, std::size_t);
         using cu_mem_free_fn = cu_result_t (*)(cu_device_ptr_t);
@@ -621,6 +809,7 @@ private:
         cu_stream_synchronize_fn cu_stream_synchronize = nullptr;
         cu_stream_destroy_fn cu_stream_destroy = nullptr;
         cu_module_load_data_ex_fn cu_module_load_data_ex = nullptr;
+        cu_module_unload_fn cu_module_unload = nullptr;
         cu_module_get_function_fn cu_module_get_function = nullptr;
         cu_mem_alloc_fn cu_mem_alloc = nullptr;
         cu_mem_free_fn cu_mem_free = nullptr;
@@ -662,6 +851,7 @@ private:
             cu_stream_synchronize = reinterpret_cast<cu_stream_synchronize_fn>(load_symbol(driver_library, "cuStreamSynchronize"));
             cu_stream_destroy = reinterpret_cast<cu_stream_destroy_fn>(load_symbol(driver_library, "cuStreamDestroy_v2"));
             cu_module_load_data_ex = reinterpret_cast<cu_module_load_data_ex_fn>(load_symbol(driver_library, "cuModuleLoadDataEx"));
+            cu_module_unload = reinterpret_cast<cu_module_unload_fn>(load_symbol(driver_library, "cuModuleUnload"));
             cu_module_get_function = reinterpret_cast<cu_module_get_function_fn>(load_symbol(driver_library, "cuModuleGetFunction"));
             cu_mem_alloc = reinterpret_cast<cu_mem_alloc_fn>(load_symbol(driver_library, "cuMemAlloc_v2"));
             cu_mem_free = reinterpret_cast<cu_mem_free_fn>(load_symbol(driver_library, "cuMemFree_v2"));
@@ -673,7 +863,7 @@ private:
             nvrtc_get_ptx_size = reinterpret_cast<nvrtc_get_ptx_size_fn>(load_symbol(nvrtc_library, "nvrtcGetPTXSize"));
             nvrtc_get_ptx = reinterpret_cast<nvrtc_get_ptx_fn>(load_symbol(nvrtc_library, "nvrtcGetPTX"));
             nvrtc_destroy_program = reinterpret_cast<nvrtc_destroy_program_fn>(load_symbol(nvrtc_library, "nvrtcDestroyProgram"));
-            ready = cu_init != nullptr && cu_device_get != nullptr && cu_ctx_create != nullptr && cu_ctx_destroy != nullptr && cu_ctx_set_current != nullptr && cu_stream_create != nullptr && cu_stream_synchronize != nullptr && cu_stream_destroy != nullptr && cu_module_load_data_ex != nullptr && cu_module_get_function != nullptr && cu_mem_alloc != nullptr && cu_mem_free != nullptr && cu_memcpy_htod != nullptr && cu_memcpy_dtoh != nullptr && cu_launch_kernel != nullptr && nvrtc_create_program != nullptr && nvrtc_compile_program != nullptr && nvrtc_get_ptx_size != nullptr && nvrtc_get_ptx != nullptr && nvrtc_destroy_program != nullptr;
+            ready = cu_init != nullptr && cu_device_get != nullptr && cu_ctx_create != nullptr && cu_ctx_destroy != nullptr && cu_ctx_set_current != nullptr && cu_stream_create != nullptr && cu_stream_synchronize != nullptr && cu_stream_destroy != nullptr && cu_module_load_data_ex != nullptr && cu_module_unload != nullptr && cu_module_get_function != nullptr && cu_mem_alloc != nullptr && cu_mem_free != nullptr && cu_memcpy_htod != nullptr && cu_memcpy_dtoh != nullptr && cu_launch_kernel != nullptr && nvrtc_create_program != nullptr && nvrtc_compile_program != nullptr && nvrtc_get_ptx_size != nullptr && nvrtc_get_ptx != nullptr && nvrtc_destroy_program != nullptr;
         }
 
         ~Api() {
@@ -687,6 +877,13 @@ private:
         cu_stream_t stream = nullptr;
         cu_module_t module = nullptr;
         std::unordered_map<std::string, cu_function_t> kernels;
+        std::unordered_map<std::string, cu_device_ptr_t> reusable_buffers;
+        std::unordered_map<std::string, std::size_t> reusable_buffer_sizes;
+        std::unordered_map<std::string, std::uint64_t> reusable_buffer_last_used;
+        std::uint64_t reusable_buffer_bytes = 0u;
+        std::uint64_t reusable_buffer_budget_bytes = 0u;
+        std::uint64_t reusable_buffer_tick = 0u;
+        std::string revision;
         std::mutex execution_mutex;
     };
 
@@ -705,13 +902,98 @@ private:
         }
     }
 
-    bool alloc_and_copy_input(cu_device_ptr_t& ptr, std::span<const float> input) const {
-        if (api().cu_mem_alloc(&ptr, input.size_bytes()) != 0) {
+    std::uint64_t reusable_buffer_budget_bytes(const HardwareGraph& graph) const {
+        const auto summary = summarize_graph(graph);
+        const auto capacity = summary.directly_attached_bytes > 0u
+                                  ? summary.directly_attached_bytes
+                                  : std::max(summary.addressable_bytes, summary.shared_host_bytes);
+        return std::clamp<std::uint64_t>(capacity / 16u, 16ull * 1024ull * 1024ull, 256ull * 1024ull * 1024ull);
+    }
+
+    void touch_buffer(Context& context, const std::string& slot) const {
+        context.reusable_buffer_last_used[slot] = ++context.reusable_buffer_tick;
+    }
+
+    void trim_reusable_buffers(Context& context, const std::string& preserve_slot, const std::size_t incoming_bytes) const {
+        while (!context.reusable_buffers.empty() &&
+               context.reusable_buffer_budget_bytes > 0u &&
+               context.reusable_buffer_bytes + incoming_bytes > context.reusable_buffer_budget_bytes) {
+            auto oldest = context.reusable_buffers.end();
+            for (auto it = context.reusable_buffers.begin(); it != context.reusable_buffers.end(); ++it) {
+                if (it->first == preserve_slot) {
+                    continue;
+                }
+                if (oldest == context.reusable_buffers.end() ||
+                    context.reusable_buffer_last_used[it->first] < context.reusable_buffer_last_used[oldest->first]) {
+                    oldest = it;
+                }
+            }
+            if (oldest == context.reusable_buffers.end()) {
+                break;
+            }
+            context.reusable_buffer_bytes -= context.reusable_buffer_sizes[oldest->first];
+            free_device(oldest->second);
+            context.reusable_buffer_sizes.erase(oldest->first);
+            context.reusable_buffer_last_used.erase(oldest->first);
+            context.reusable_buffers.erase(oldest);
+        }
+    }
+
+    void destroy_context(Context& context) const {
+        for (const auto& [slot, ptr] : context.reusable_buffers) {
+            (void)slot;
+            free_device(ptr);
+        }
+        context.reusable_buffers.clear();
+        context.reusable_buffer_sizes.clear();
+        context.reusable_buffer_last_used.clear();
+        context.reusable_buffer_bytes = 0u;
+        context.kernels.clear();
+        if (context.module != nullptr) {
+            (void)api().cu_module_unload(context.module);
+            context.module = nullptr;
+        }
+        if (context.stream != nullptr) {
+            (void)api().cu_stream_destroy(context.stream);
+            context.stream = nullptr;
+        }
+        if (context.context != nullptr) {
+            (void)api().cu_ctx_destroy(context.context);
+            context.context = nullptr;
+        }
+    }
+
+    bool ensure_buffer(Context& context, const std::string& slot, const std::size_t bytes, cu_device_ptr_t& ptr) const {
+        if (bytes == 0u) {
+            ptr = 0;
+            return true;
+        }
+        auto& slot_ptr = context.reusable_buffers[slot];
+        auto& slot_size = context.reusable_buffer_sizes[slot];
+        if (slot_ptr == 0 || slot_size < bytes) {
+            if (slot_ptr != 0) {
+                context.reusable_buffer_bytes -= slot_size;
+            }
+            free_device(slot_ptr);
+            slot_ptr = 0;
+            slot_size = 0u;
+            trim_reusable_buffers(context, slot, bytes);
+            if (api().cu_mem_alloc(&slot_ptr, bytes) != 0) {
+                return false;
+            }
+            slot_size = bytes;
+            context.reusable_buffer_bytes += bytes;
+        }
+        touch_buffer(context, slot);
+        ptr = slot_ptr;
+        return true;
+    }
+
+    bool alloc_and_copy_input(Context& context, const std::string& slot, cu_device_ptr_t& ptr, std::span<const float> input) const {
+        if (!ensure_buffer(context, slot, input.size_bytes(), ptr)) {
             return false;
         }
         if (api().cu_memcpy_htod(ptr, input.data(), input.size_bytes()) != 0) {
-            api().cu_mem_free(ptr);
-            ptr = 0;
             return false;
         }
         return true;
@@ -722,8 +1004,13 @@ private:
         if (!api().ready || api().cu_init(0u) != 0) {
             return {};
         }
+        const auto revision = structural_fingerprint(graph);
         if (const auto existing = contexts_.find(graph.uid); existing != contexts_.end()) {
-            return existing->second;
+            if (existing->second->revision == revision) {
+                return existing->second;
+            }
+            destroy_context(*existing->second);
+            contexts_.erase(existing);
         }
         cu_device_t device = 0;
         if (api().cu_device_get(&device, static_cast<int>(graph.ordinal)) != 0) {
@@ -735,6 +1022,8 @@ private:
             if (context->context != nullptr) api().cu_ctx_destroy(context->context);
             return {};
         }
+        context->revision = revision;
+        context->reusable_buffer_budget_bytes = reusable_buffer_budget_bytes(graph);
         contexts_.emplace(graph.uid, context);
         return context;
     }
@@ -783,8 +1072,9 @@ private:
             auto kernel = get_kernel(*context, kernel_name);
             if (kernel == nullptr) { result.error = "cuda-kernel"; return; }
             cu_device_ptr_t d_in = 0, d_out = 0;
-            if (!alloc_and_copy_input(d_in, input) || api().cu_mem_alloc(&d_out, result.output.size() * sizeof(float)) != 0) {
-                free_device(d_in); free_device(d_out); result.error = "cuda-memory"; return;
+            if (!alloc_and_copy_input(*context, "unary-in", d_in, input) ||
+                !ensure_buffer(*context, "unary-out", result.output.size() * sizeof(float), d_out)) {
+                result.error = "cuda-memory"; return;
             }
             args[0] = &d_in;
             args[1] = &d_out;
@@ -795,7 +1085,6 @@ private:
             if (api().cu_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 || api().cu_stream_synchronize(context->stream) != 0 || api().cu_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
                 result.error = "cuda-launch";
             } else { result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_device(d_in); free_device(d_out);
         });
         return result;
     }
@@ -811,8 +1100,10 @@ private:
             auto kernel = get_kernel(*context, "elementwise_map");
             if (kernel == nullptr) { result.error = "cuda-kernel"; return; }
             cu_device_ptr_t d_lhs = 0, d_rhs = 0, d_out = 0;
-            if (!alloc_and_copy_input(d_lhs, lhs) || !alloc_and_copy_input(d_rhs, rhs) || api().cu_mem_alloc(&d_out, result.output.size() * sizeof(float)) != 0) {
-                free_device(d_lhs); free_device(d_rhs); free_device(d_out); result.error = "cuda-memory"; return;
+            if (!alloc_and_copy_input(*context, "lhs", d_lhs, lhs) ||
+                !alloc_and_copy_input(*context, "rhs", d_rhs, rhs) ||
+                !ensure_buffer(*context, "binary-out", result.output.size() * sizeof(float), d_out)) {
+                result.error = "cuda-memory"; return;
             }
             unsigned int count = static_cast<unsigned int>(lhs.size());
             int low = low_precision ? 1 : 0;
@@ -822,7 +1113,6 @@ private:
             if (api().cu_launch_kernel(kernel, grid_x, 1, 1, block_x, 1, 1, 0u, context->stream, args, nullptr) != 0 || api().cu_stream_synchronize(context->stream) != 0 || api().cu_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
                 result.error = "cuda-launch";
             } else { result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_device(d_lhs); free_device(d_rhs); free_device(d_out);
         });
         return result;
     }
@@ -841,8 +1131,9 @@ private:
             const auto groups = global / local;
             std::vector<float> partials(groups, 0.0f);
             cu_device_ptr_t d_in = 0, d_partial = 0;
-            if (!alloc_and_copy_input(d_in, input) || api().cu_mem_alloc(&d_partial, partials.size() * sizeof(float)) != 0) {
-                free_device(d_in); free_device(d_partial); result.error = "cuda-memory"; return;
+            if (!alloc_and_copy_input(*context, "reduce-in", d_in, input) ||
+                !ensure_buffer(*context, "reduce-partial", partials.size() * sizeof(float), d_partial)) {
+                result.error = "cuda-memory"; return;
             }
             unsigned int count = static_cast<unsigned int>(input.size());
             int low = low_precision ? 1 : 0;
@@ -850,7 +1141,6 @@ private:
             if (api().cu_launch_kernel(kernel, static_cast<unsigned int>(groups), 1, 1, local, 1, 1, static_cast<unsigned int>(local * sizeof(float)), context->stream, args, nullptr) != 0 || api().cu_stream_synchronize(context->stream) != 0 || api().cu_memcpy_dtoh(partials.data(), d_partial, partials.size() * sizeof(float)) != 0) {
                 result.error = "cuda-launch";
             } else { for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_device(d_in); free_device(d_partial);
         });
         return result;
     }
@@ -866,8 +1156,10 @@ private:
             auto kernel = get_kernel(*context, gpu_rhs_uses_transposed_layout(operation) ? "matmul_tiled_rhs_t" : "matmul_tiled");
             if (kernel == nullptr) { result.error = "cuda-kernel"; return; }
             cu_device_ptr_t d_lhs = 0, d_rhs = 0, d_out = 0;
-            if (!alloc_and_copy_input(d_lhs, lhs) || !alloc_and_copy_input(d_rhs, rhs) || api().cu_mem_alloc(&d_out, result.output.size() * sizeof(float)) != 0) {
-                free_device(d_lhs); free_device(d_rhs); free_device(d_out); result.error = "cuda-memory"; return;
+            if (!alloc_and_copy_input(*context, "matmul-lhs", d_lhs, lhs) ||
+                !alloc_and_copy_input(*context, "matmul-rhs", d_rhs, rhs) ||
+                !ensure_buffer(*context, "matmul-out", result.output.size() * sizeof(float), d_out)) {
+                result.error = "cuda-memory"; return;
             }
             unsigned int row_count = rows, column_count = columns, depth_count = depth;
             int low = low_precision ? 1 : 0;
@@ -879,7 +1171,6 @@ private:
             if (api().cu_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args, nullptr) != 0 || api().cu_stream_synchronize(context->stream) != 0 || api().cu_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
                 result.error = "cuda-launch";
             } else { result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_device(d_lhs); free_device(d_rhs); free_device(d_out);
         });
         return result;
     }
@@ -1082,7 +1373,21 @@ private:
     };
 
     struct BinaryBlob { std::vector<std::uint8_t> bytes; std::uint32_t format = ZE_MODULE_FORMAT_NATIVE; };
-    struct Context { ze_context_handle_t context = nullptr; ze_device_handle_t device = nullptr; ze_command_queue_handle_t queue = nullptr; ze_module_handle_t module = nullptr; std::unordered_map<std::string, ze_kernel_handle_t> kernels; std::mutex execution_mutex; };
+    struct Context {
+        ze_context_handle_t context = nullptr;
+        ze_device_handle_t device = nullptr;
+        ze_command_queue_handle_t queue = nullptr;
+        ze_module_handle_t module = nullptr;
+        std::unordered_map<std::string, ze_kernel_handle_t> kernels;
+        std::unordered_map<std::string, void*> reusable_buffers;
+        std::unordered_map<std::string, std::size_t> reusable_buffer_sizes;
+        std::unordered_map<std::string, std::uint64_t> reusable_buffer_last_used;
+        std::uint64_t reusable_buffer_bytes = 0u;
+        std::uint64_t reusable_buffer_budget_bytes = 0u;
+        std::uint64_t reusable_buffer_tick = 0u;
+        std::string revision;
+        std::mutex execution_mutex;
+    };
 
     const Api& api() const { static const Api instance; return instance; }
     const OpenClApi& opencl_api() const { static const OpenClApi instance; return instance; }
@@ -1095,6 +1400,81 @@ private:
 
     void free_shared(const Context& context, void* ptr) const {
         if (ptr != nullptr) (void)api().ze_mem_free(context.context, ptr);
+    }
+
+    std::uint64_t reusable_buffer_budget_bytes(const HardwareGraph& graph) const {
+        const auto summary = summarize_graph(graph);
+        const auto capacity = summary.directly_attached_bytes > 0u
+                                  ? summary.directly_attached_bytes
+                                  : std::max(summary.addressable_bytes, summary.shared_host_bytes);
+        return std::clamp<std::uint64_t>(capacity / 16u, 16ull * 1024ull * 1024ull, 256ull * 1024ull * 1024ull);
+    }
+
+    void touch_buffer(Context& context, const std::string& slot) const {
+        context.reusable_buffer_last_used[slot] = ++context.reusable_buffer_tick;
+    }
+
+    void trim_reusable_buffers(Context& context, const std::string& preserve_slot, const std::size_t incoming_bytes) const {
+        while (!context.reusable_buffers.empty() &&
+               context.reusable_buffer_budget_bytes > 0u &&
+               context.reusable_buffer_bytes + incoming_bytes > context.reusable_buffer_budget_bytes) {
+            auto oldest = context.reusable_buffers.end();
+            for (auto it = context.reusable_buffers.begin(); it != context.reusable_buffers.end(); ++it) {
+                if (it->first == preserve_slot) {
+                    continue;
+                }
+                if (oldest == context.reusable_buffers.end() ||
+                    context.reusable_buffer_last_used[it->first] < context.reusable_buffer_last_used[oldest->first]) {
+                    oldest = it;
+                }
+            }
+            if (oldest == context.reusable_buffers.end()) {
+                break;
+            }
+            context.reusable_buffer_bytes -= context.reusable_buffer_sizes[oldest->first];
+            free_shared(context, oldest->second);
+            context.reusable_buffer_sizes.erase(oldest->first);
+            context.reusable_buffer_last_used.erase(oldest->first);
+            context.reusable_buffers.erase(oldest);
+        }
+    }
+
+    void invalidate_reusable_buffers(Context& context) const {
+        for (const auto& [slot, ptr] : context.reusable_buffers) {
+            (void)slot;
+            free_shared(context, ptr);
+        }
+        context.reusable_buffers.clear();
+        context.reusable_buffer_sizes.clear();
+        context.reusable_buffer_last_used.clear();
+        context.reusable_buffer_bytes = 0u;
+        context.reusable_buffer_tick = 0u;
+    }
+
+    bool ensure_shared_buffer(Context& context, const std::string& slot, const std::size_t bytes, void** ptr) const {
+        if (bytes == 0u) {
+            *ptr = nullptr;
+            return true;
+        }
+        auto& slot_ptr = context.reusable_buffers[slot];
+        auto& slot_size = context.reusable_buffer_sizes[slot];
+        if (slot_ptr == nullptr || slot_size < bytes) {
+            if (slot_ptr != nullptr) {
+                context.reusable_buffer_bytes -= slot_size;
+            }
+            free_shared(context, slot_ptr);
+            slot_ptr = nullptr;
+            slot_size = 0u;
+            trim_reusable_buffers(context, slot, bytes);
+            if (!alloc_shared(context, bytes, &slot_ptr)) {
+                return false;
+            }
+            slot_size = bytes;
+            context.reusable_buffer_bytes += bytes;
+        }
+        touch_buffer(context, slot);
+        *ptr = slot_ptr;
+        return true;
     }
 
     BinaryBlob compile_binary(const bool low_precision_variant) const {
@@ -1187,7 +1567,15 @@ private:
         if (!api().ready) { last_error_ = "level-zero-loader"; return {}; }
         if (api().ze_init(0u) != 0) { last_error_ = "level-zero-init"; return {}; }
         const auto context_key = graph.uid + (low_precision_variant ? ":lowp" : ":strict");
-        if (const auto existing = contexts_.find(context_key); existing != contexts_.end()) return existing->second;
+        const auto revision = structural_fingerprint(graph);
+        if (const auto existing = contexts_.find(context_key); existing != contexts_.end()) {
+            if (existing->second->revision != revision) {
+                invalidate_reusable_buffers(*existing->second);
+                existing->second->revision = revision;
+                existing->second->reusable_buffer_budget_bytes = reusable_buffer_budget_bytes(graph);
+            }
+            return existing->second;
+        }
         std::uint32_t driver_count = 0;
         if (api().ze_driver_get(&driver_count, nullptr) != 0 || driver_count == 0) { last_error_ = "level-zero-driver-enum"; return {}; }
         std::vector<ze_driver_handle_t> drivers(driver_count, nullptr);
@@ -1211,6 +1599,8 @@ private:
                 if (api().ze_context_create(driver, &context_desc, &context->context) != 0) { last_error_ = "level-zero-context-create"; return {}; }
                 if (api().ze_command_queue_create(context->context, device, &queue_desc, &context->queue) != 0) { last_error_ = "level-zero-queue-create"; return {}; }
                 if (api().ze_module_create(context->context, device, &module_desc, &context->module, &build_log) != 0) { last_error_ = "level-zero-module-create"; return {}; }
+                context->revision = revision;
+                context->reusable_buffer_budget_bytes = reusable_buffer_budget_bytes(graph);
                 contexts_.emplace(context_key, context);
                 return context;
             }
@@ -1254,12 +1644,15 @@ private:
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             void* lhs_mem = nullptr; void* rhs_mem = nullptr; void* out_mem = nullptr;
-            if (!alloc_shared(*context, lhs.size_bytes(), &lhs_mem) || !alloc_shared(*context, rhs.size_bytes(), &rhs_mem) || !alloc_shared(*context, result.output.size() * sizeof(float), &out_mem)) { free_shared(*context, lhs_mem); free_shared(*context, rhs_mem); free_shared(*context, out_mem); result.error = "level-zero-memory"; return; }
+            if (!ensure_shared_buffer(*context, "elementwise-lhs", lhs.size_bytes(), &lhs_mem) ||
+                !ensure_shared_buffer(*context, "elementwise-rhs", rhs.size_bytes(), &rhs_mem) ||
+                !ensure_shared_buffer(*context, "elementwise-out", result.output.size() * sizeof(float), &out_mem)) {
+                result.error = "level-zero-memory"; return;
+            }
             std::memcpy(lhs_mem, lhs.data(), lhs.size_bytes()); std::memcpy(rhs_mem, rhs.data(), rhs.size_bytes());
             unsigned int count = static_cast<unsigned int>(lhs.size()); int low = 0;
             if (!launch(*context, "elementwise_map", {256u,1u,1u}, {count == 0 ? 1u : (count + 255u) / 256u, 1u, 1u}, {{sizeof(void*), &lhs_mem}, {sizeof(void*), &rhs_mem}, {sizeof(void*), &out_mem}, {sizeof(unsigned int), &count}, {sizeof(int), &low}})) result.error = "level-zero-launch";
             else { std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float)); result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_shared(*context, lhs_mem); free_shared(*context, rhs_mem); free_shared(*context, out_mem);
         });
         return result;
     }
@@ -1275,12 +1668,14 @@ private:
             const auto groups = static_cast<std::uint32_t>(global / local);
             std::vector<float> partials(groups, 0.0f);
             void* in_mem = nullptr; void* partial_mem = nullptr;
-            if (!alloc_shared(*context, input.size_bytes(), &in_mem) || !alloc_shared(*context, partials.size() * sizeof(float), &partial_mem)) { free_shared(*context, in_mem); free_shared(*context, partial_mem); result.error = "level-zero-memory"; return; }
+            if (!ensure_shared_buffer(*context, "reduce-in", input.size_bytes(), &in_mem) ||
+                !ensure_shared_buffer(*context, "reduce-partial", partials.size() * sizeof(float), &partial_mem)) {
+                result.error = "level-zero-memory"; return;
+            }
             std::memcpy(in_mem, input.data(), input.size_bytes());
             unsigned int count = static_cast<unsigned int>(input.size()); int low = 0;
             if (!launch(*context, "reduce_sum", {local,1u,1u}, {groups,1u,1u}, {{sizeof(void*), &in_mem}, {sizeof(void*), &partial_mem}, {sizeof(unsigned int), &count}, {sizeof(int), &low}}, {{4u, local * sizeof(float)}})) result.error = "level-zero-launch";
             else { std::memcpy(partials.data(), partial_mem, partials.size() * sizeof(float)); for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_shared(*context, in_mem); free_shared(*context, partial_mem);
         });
         return result;
     }
@@ -1293,13 +1688,16 @@ private:
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             void* lhs_mem = nullptr; void* rhs_mem = nullptr; void* out_mem = nullptr;
-            if (!alloc_shared(*context, lhs.size_bytes(), &lhs_mem) || !alloc_shared(*context, rhs.size_bytes(), &rhs_mem) || !alloc_shared(*context, result.output.size() * sizeof(float), &out_mem)) { free_shared(*context, lhs_mem); free_shared(*context, rhs_mem); free_shared(*context, out_mem); result.error = "level-zero-memory"; return; }
+            if (!ensure_shared_buffer(*context, "matmul-lhs", lhs.size_bytes(), &lhs_mem) ||
+                !ensure_shared_buffer(*context, "matmul-rhs", rhs.size_bytes(), &rhs_mem) ||
+                !ensure_shared_buffer(*context, "matmul-out", result.output.size() * sizeof(float), &out_mem)) {
+                result.error = "level-zero-memory"; return;
+            }
             std::memcpy(lhs_mem, lhs.data(), lhs.size_bytes()); std::memcpy(rhs_mem, rhs.data(), rhs.size_bytes());
             unsigned int row_count = rows, column_count = columns, depth_count = depth; int low = 0;
             const char* kernel_name = gpu_rhs_uses_transposed_layout(operation) ? "matmul_tiled_rhs_t" : "matmul_tiled";
             if (!launch(*context, kernel_name, {kNativeTileSize,kNativeTileSize,1u}, {columns == 0 ? 1u : (columns + kNativeTileSize - 1u) / kNativeTileSize, rows == 0 ? 1u : (rows + kNativeTileSize - 1u) / kNativeTileSize, 1u}, {{sizeof(void*), &lhs_mem}, {sizeof(void*), &rhs_mem}, {sizeof(void*), &out_mem}, {sizeof(unsigned int), &row_count}, {sizeof(unsigned int), &column_count}, {sizeof(unsigned int), &depth_count}, {sizeof(int), &low}}, {{7u, kNativeTileSize * kNativeTileSize * sizeof(float)}, {8u, kNativeTileSize * kNativeTileSize * sizeof(float)}})) result.error = "level-zero-launch";
             else { std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float)); result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_shared(*context, lhs_mem); free_shared(*context, rhs_mem); free_shared(*context, out_mem);
         });
         return result;
     }
@@ -1313,10 +1711,8 @@ private:
             std::scoped_lock lock(context->execution_mutex);
             void* in_mem = nullptr;
             void* out_mem = nullptr;
-            if (!alloc_shared(*context, input.size_bytes(), &in_mem) ||
-                !alloc_shared(*context, result.output.size() * sizeof(float), &out_mem)) {
-                free_shared(*context, in_mem);
-                free_shared(*context, out_mem);
+            if (!ensure_shared_buffer(*context, "conv-in", input.size_bytes(), &in_mem) ||
+                !ensure_shared_buffer(*context, "conv-out", result.output.size() * sizeof(float), &out_mem)) {
                 result.error = "level-zero-memory";
                 return;
             }
@@ -1349,8 +1745,6 @@ private:
                 result.used_host = false;
                 result.used_opencl = false;
             }
-            free_shared(*context, in_mem);
-            free_shared(*context, out_mem);
         });
         return result;
     }
@@ -1364,10 +1758,8 @@ private:
             std::scoped_lock lock(context->execution_mutex);
             void* in_mem = nullptr;
             void* out_mem = nullptr;
-            if (!alloc_shared(*context, input.size_bytes(), &in_mem) ||
-                !alloc_shared(*context, result.output.size() * sizeof(float), &out_mem)) {
-                free_shared(*context, in_mem);
-                free_shared(*context, out_mem);
+            if (!ensure_shared_buffer(*context, "resample-in", input.size_bytes(), &in_mem) ||
+                !ensure_shared_buffer(*context, "resample-out", result.output.size() * sizeof(float), &out_mem)) {
                 result.error = "level-zero-memory";
                 return;
             }
@@ -1406,8 +1798,6 @@ private:
                 result.used_host = false;
                 result.used_opencl = false;
             }
-            free_shared(*context, in_mem);
-            free_shared(*context, out_mem);
         });
         return result;
     }
@@ -1504,16 +1894,38 @@ private:
         ~Api() { close_library(hiprtc_library); close_library(hip_library); }
     };
 
-    struct Context { hip_stream_t stream = nullptr; hip_module_t module = nullptr; std::unordered_map<std::string, hip_function_t> kernels; std::mutex execution_mutex; };
+    struct Context {
+        hip_stream_t stream = nullptr;
+        hip_module_t module = nullptr;
+        std::unordered_map<std::string, hip_function_t> kernels;
+        std::unordered_map<std::string, void*> reusable_buffers;
+        std::unordered_map<std::string, std::size_t> reusable_buffer_sizes;
+        std::unordered_map<std::string, std::uint64_t> reusable_buffer_last_used;
+        std::uint64_t reusable_buffer_bytes = 0u;
+        std::uint64_t reusable_buffer_budget_bytes = 0u;
+        std::uint64_t reusable_buffer_tick = 0u;
+        std::string revision;
+        std::mutex execution_mutex;
+    };
 
     const Api& api() const { static const Api instance; return instance; }
 
     std::shared_ptr<Context> acquire_context(const HardwareGraph& graph) const {
         std::scoped_lock lock(mutex_);
         if (!api().ready || api().hip_init(0u) != 0 || api().hip_set_device(static_cast<int>(graph.ordinal)) != 0) return {};
-        if (const auto existing = contexts_.find(graph.uid); existing != contexts_.end()) return existing->second;
+        const auto revision = structural_fingerprint(graph);
+        if (const auto existing = contexts_.find(graph.uid); existing != contexts_.end()) {
+            if (existing->second->revision != revision) {
+                invalidate_reusable_buffers(*existing->second);
+                existing->second->revision = revision;
+                existing->second->reusable_buffer_budget_bytes = reusable_buffer_budget_bytes(graph);
+            }
+            return existing->second;
+        }
         auto context = std::make_shared<Context>();
         if (api().hip_stream_create(&context->stream) != 0 || !compile_module(*context)) return {};
+        context->revision = revision;
+        context->reusable_buffer_budget_bytes = reusable_buffer_budget_bytes(graph);
         contexts_.emplace(graph.uid, context);
         return context;
     }
@@ -1538,9 +1950,84 @@ private:
         return kernel;
     }
 
-    bool alloc_and_copy_input(void*& ptr, std::span<const float> input) const {
-        if (api().hip_malloc(&ptr, input.size_bytes()) != 0) return false;
-        if (api().hip_memcpy_htod(ptr, input.data(), input.size_bytes()) != 0) { api().hip_free(ptr); ptr = nullptr; return false; }
+    std::uint64_t reusable_buffer_budget_bytes(const HardwareGraph& graph) const {
+        const auto summary = summarize_graph(graph);
+        const auto capacity = summary.directly_attached_bytes > 0u
+                                  ? summary.directly_attached_bytes
+                                  : std::max(summary.addressable_bytes, summary.shared_host_bytes);
+        return std::clamp<std::uint64_t>(capacity / 16u, 16ull * 1024ull * 1024ull, 256ull * 1024ull * 1024ull);
+    }
+
+    void touch_buffer(Context& context, const std::string& slot) const {
+        context.reusable_buffer_last_used[slot] = ++context.reusable_buffer_tick;
+    }
+
+    void trim_reusable_buffers(Context& context, const std::string& preserve_slot, const std::size_t incoming_bytes) const {
+        while (!context.reusable_buffers.empty() &&
+               context.reusable_buffer_budget_bytes > 0u &&
+               context.reusable_buffer_bytes + incoming_bytes > context.reusable_buffer_budget_bytes) {
+            auto oldest = context.reusable_buffers.end();
+            for (auto it = context.reusable_buffers.begin(); it != context.reusable_buffers.end(); ++it) {
+                if (it->first == preserve_slot) {
+                    continue;
+                }
+                if (oldest == context.reusable_buffers.end() ||
+                    context.reusable_buffer_last_used[it->first] < context.reusable_buffer_last_used[oldest->first]) {
+                    oldest = it;
+                }
+            }
+            if (oldest == context.reusable_buffers.end()) {
+                break;
+            }
+            context.reusable_buffer_bytes -= context.reusable_buffer_sizes[oldest->first];
+            free_device(oldest->second);
+            context.reusable_buffer_sizes.erase(oldest->first);
+            context.reusable_buffer_last_used.erase(oldest->first);
+            context.reusable_buffers.erase(oldest);
+        }
+    }
+
+    void invalidate_reusable_buffers(Context& context) const {
+        for (const auto& [slot, ptr] : context.reusable_buffers) {
+            (void)slot;
+            free_device(ptr);
+        }
+        context.reusable_buffers.clear();
+        context.reusable_buffer_sizes.clear();
+        context.reusable_buffer_last_used.clear();
+        context.reusable_buffer_bytes = 0u;
+        context.reusable_buffer_tick = 0u;
+    }
+
+    bool ensure_buffer(Context& context, const std::string& slot, const std::size_t bytes, void*& ptr) const {
+        if (bytes == 0u) {
+            ptr = nullptr;
+            return true;
+        }
+        auto& slot_ptr = context.reusable_buffers[slot];
+        auto& slot_size = context.reusable_buffer_sizes[slot];
+        if (slot_ptr == nullptr || slot_size < bytes) {
+            if (slot_ptr != nullptr) {
+                context.reusable_buffer_bytes -= slot_size;
+            }
+            free_device(slot_ptr);
+            slot_ptr = nullptr;
+            slot_size = 0u;
+            trim_reusable_buffers(context, slot, bytes);
+            if (api().hip_malloc(&slot_ptr, bytes) != 0) {
+                return false;
+            }
+            slot_size = bytes;
+            context.reusable_buffer_bytes += bytes;
+        }
+        touch_buffer(context, slot);
+        ptr = slot_ptr;
+        return true;
+    }
+
+    bool alloc_and_copy_input(Context& context, const std::string& slot, void*& ptr, std::span<const float> input) const {
+        if (!ensure_buffer(context, slot, input.size_bytes(), ptr)) return false;
+        if (api().hip_memcpy_htod(ptr, input.data(), input.size_bytes()) != 0) { return false; }
         return true;
     }
 
@@ -1556,7 +2043,8 @@ private:
             auto kernel = get_kernel(*context, kernel_name);
             if (kernel == nullptr) { result.error = "rocm-kernel"; return; }
             void* d_in = nullptr; void* d_out = nullptr;
-            if (!alloc_and_copy_input(d_in, input) || api().hip_malloc(&d_out, result.output.size() * sizeof(float)) != 0) { free_device(d_in); free_device(d_out); result.error = "rocm-memory"; return; }
+            if (!alloc_and_copy_input(*context, "unary-in", d_in, input) ||
+                !ensure_buffer(*context, "unary-out", result.output.size() * sizeof(float), d_out)) { result.error = "rocm-memory"; return; }
             args[0] = &d_in;
             args[1] = &d_out;
             const unsigned int block_x = kNativeTileSize;
@@ -1565,7 +2053,6 @@ private:
             const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
             if (api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) result.error = "rocm-launch";
             else { result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_device(d_in); free_device(d_out);
         });
         return result;
     }
@@ -1580,7 +2067,9 @@ private:
             auto kernel = get_kernel(*context, kernel_name);
             if (kernel == nullptr) { result.error = "rocm-kernel"; return; }
             void* d_lhs = nullptr; void* d_rhs = nullptr; void* d_out = nullptr;
-            if (!alloc_and_copy_input(d_lhs, lhs) || !alloc_and_copy_input(d_rhs, rhs) || api().hip_malloc(&d_out, result.output.size() * sizeof(float)) != 0) { free_device(d_lhs); free_device(d_rhs); free_device(d_out); result.error = "rocm-memory"; return; }
+            if (!alloc_and_copy_input(*context, "binary-lhs", d_lhs, lhs) ||
+                !alloc_and_copy_input(*context, "binary-rhs", d_rhs, rhs) ||
+                !ensure_buffer(*context, "binary-out", result.output.size() * sizeof(float), d_out)) { result.error = "rocm-memory"; return; }
             args[0] = &d_lhs;
             args[1] = &d_rhs;
             args[2] = &d_out;
@@ -1590,7 +2079,6 @@ private:
             const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
             if (api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) result.error = "rocm-launch";
             else { result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_device(d_lhs); free_device(d_rhs); free_device(d_out);
         });
         return result;
     }
@@ -1605,12 +2093,13 @@ private:
             auto kernel = get_kernel(*context, "elementwise_map");
             if (kernel == nullptr) { result.error = "rocm-kernel"; return; }
             void* d_lhs = nullptr; void* d_rhs = nullptr; void* d_out = nullptr;
-            if (!alloc_and_copy_input(d_lhs, lhs) || !alloc_and_copy_input(d_rhs, rhs) || api().hip_malloc(&d_out, result.output.size() * sizeof(float)) != 0) { free_device(d_lhs); free_device(d_rhs); free_device(d_out); result.error = "rocm-memory"; return; }
+            if (!alloc_and_copy_input(*context, "elementwise-lhs", d_lhs, lhs) ||
+                !alloc_and_copy_input(*context, "elementwise-rhs", d_rhs, rhs) ||
+                !ensure_buffer(*context, "elementwise-out", result.output.size() * sizeof(float), d_out)) { result.error = "rocm-memory"; return; }
             unsigned int count = static_cast<unsigned int>(lhs.size()); int low = low_precision ? 1 : 0; void* args[] = {&d_lhs, &d_rhs, &d_out, &count, &low};
             const unsigned int block_x = kNativeReductionGroupSize; const unsigned int grid_x = count == 0 ? 1u : (count + block_x - 1u) / block_x;
             if (api().hip_module_launch_kernel(kernel, grid_x, 1, 1, block_x, 1, 1, 0u, context->stream, args, nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) result.error = "rocm-launch";
             else { result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_device(d_lhs); free_device(d_rhs); free_device(d_out);
         });
         return result;
     }
@@ -1628,11 +2117,11 @@ private:
             const auto groups = global / local;
             std::vector<float> partials(groups, 0.0f);
             void* d_in = nullptr; void* d_partial = nullptr;
-            if (!alloc_and_copy_input(d_in, input) || api().hip_malloc(&d_partial, partials.size() * sizeof(float)) != 0) { free_device(d_in); free_device(d_partial); result.error = "rocm-memory"; return; }
+            if (!alloc_and_copy_input(*context, "reduce-in", d_in, input) ||
+                !ensure_buffer(*context, "reduce-partial", partials.size() * sizeof(float), d_partial)) { result.error = "rocm-memory"; return; }
             unsigned int count = static_cast<unsigned int>(input.size()); int low = low_precision ? 1 : 0; void* args[] = {&d_in, &d_partial, &count, &low};
             if (api().hip_module_launch_kernel(kernel, static_cast<unsigned int>(groups), 1, 1, local, 1, 1, static_cast<unsigned int>(local * sizeof(float)), context->stream, args, nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(partials.data(), d_partial, partials.size() * sizeof(float)) != 0) result.error = "rocm-launch";
             else { for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false; }
-            free_device(d_in); free_device(d_partial);
         });
         return result;
     }

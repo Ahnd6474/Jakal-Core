@@ -16,6 +16,7 @@
 #include <mutex>
 #include <span>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -231,6 +232,10 @@ public:
         return "host-direct";
     }
 
+    [[nodiscard]] bool supports_async_dispatch(const HardwareGraph&) const override {
+        return false;
+    }
+
     BackendRunResult run_elementwise(
         const HardwareGraph& graph,
         const std::span<const float> lhs,
@@ -264,6 +269,7 @@ public:
         });
         result.success = true;
         result.used_host = true;
+        result.synchronize_runtime_us = result.runtime_us;
         return result;
     }
 
@@ -304,6 +310,7 @@ public:
         });
         result.success = true;
         result.used_host = true;
+        result.synchronize_runtime_us = result.runtime_us;
         return result;
     }
 
@@ -366,6 +373,7 @@ public:
         });
         result.success = true;
         result.used_host = true;
+        result.synchronize_runtime_us = result.runtime_us;
         return result;
     }
 
@@ -410,6 +418,7 @@ public:
         });
         result.success = true;
         result.used_host = true;
+        result.synchronize_runtime_us = result.runtime_us;
         return result;
     }
 
@@ -472,6 +481,7 @@ public:
         });
         result.success = true;
         result.used_host = true;
+        result.synchronize_runtime_us = result.runtime_us;
         return result;
     }
 };
@@ -526,6 +536,53 @@ double gpu_dispatch_overhead_us(const JakalBackendKind backend, const HardwareGr
     default:
         return baseline;
     }
+}
+
+double estimate_transfer_runtime_us(
+    const HardwareGraph& graph,
+    const std::size_t bytes,
+    const bool write_direction) {
+    if (bytes == 0u) {
+        return 0.0;
+    }
+    const auto summary = summarize_graph(graph);
+    const double bandwidth_gbps =
+        std::max(write_direction ? summary.write_bandwidth_gbps : summary.read_bandwidth_gbps, 1.0);
+    const double payload_us =
+        (static_cast<double>(bytes) / (bandwidth_gbps * 1.0e9)) * 1.0e6;
+    const double latency_us = std::max(summary.dispatch_latency_us * 0.20, 0.25);
+    return payload_us + latency_us;
+}
+
+struct CopyComputeBreakdown {
+    double copy_runtime_us = 0.0;
+    double compute_runtime_us = 0.0;
+    double residual_copy_runtime_us = 0.0;
+    double overlap_ratio = 0.0;
+};
+
+CopyComputeBreakdown estimate_copy_compute_breakdown(
+    const HardwareGraph& graph,
+    const std::size_t input_bytes,
+    const std::size_t output_bytes,
+    const double tail_runtime_us,
+    const double preferred_overlap_ratio) {
+    CopyComputeBreakdown breakdown;
+    const auto summary = summarize_graph(graph);
+    const double copy_in_us = estimate_transfer_runtime_us(graph, input_bytes, true);
+    const double copy_out_us = estimate_transfer_runtime_us(graph, output_bytes, false);
+    breakdown.copy_runtime_us = copy_in_us + copy_out_us;
+    breakdown.overlap_ratio = std::clamp(
+        preferred_overlap_ratio +
+            (summary.supports_asynchronous_dispatch ? 0.10 : 0.0) +
+            (summary.unified_address_space ? 0.08 : 0.0),
+        0.05,
+        0.85);
+    breakdown.residual_copy_runtime_us =
+        breakdown.copy_runtime_us * (1.0 - breakdown.overlap_ratio);
+    breakdown.compute_runtime_us =
+        std::max(0.25, std::max(tail_runtime_us - breakdown.residual_copy_runtime_us, tail_runtime_us * 0.35));
+    return breakdown;
 }
 
 class NativeRuntimeBootstrap final {
@@ -715,19 +772,37 @@ public:
         return to_string(backend_) + "-direct";
     }
 
+    [[nodiscard]] bool supports_async_dispatch(const HardwareGraph& graph) const override {
+        return summarize_graph(graph).supports_asynchronous_dispatch;
+    }
+
     BackendRunResult run_elementwise(
         const HardwareGraph& graph,
         const std::span<const float> lhs,
         const std::span<const float> rhs,
         const bool low_precision) const override {
-        return finalize(graph, OperationClass::elementwise_map, host_.run_elementwise(graph, lhs, rhs, low_precision));
+        return finalize(
+            graph,
+            OperationClass::elementwise_map,
+            host_.run_elementwise(graph, lhs, rhs, low_precision),
+            {},
+            lhs.size_bytes() + rhs.size_bytes(),
+            lhs.size_bytes(),
+            0.44);
     }
 
     BackendRunResult run_reduction(
         const HardwareGraph& graph,
         const std::span<const float> input,
         const bool low_precision) const override {
-        return finalize(graph, OperationClass::reduction, host_.run_reduction(graph, input, low_precision));
+        return finalize(
+            graph,
+            OperationClass::reduction,
+            host_.run_reduction(graph, input, low_precision),
+            {},
+            input.size_bytes(),
+            sizeof(float),
+            0.40);
     }
 
     BackendRunResult run_matmul(
@@ -742,7 +817,11 @@ public:
         return finalize(
             graph,
             OperationClass::matmul,
-            host_.run_matmul(graph, operation, lhs, rhs, rows, columns, depth, low_precision));
+            host_.run_matmul(graph, operation, lhs, rhs, rows, columns, depth, low_precision),
+            cpu_rhs_uses_transposed_layout(operation) ? "packed-rhs" : "dense-rhs",
+            lhs.size_bytes() + rhs.size_bytes(),
+            static_cast<std::size_t>(rows) * columns * sizeof(float),
+            0.58);
     }
 
     BackendRunResult run_conv3x3(
@@ -755,7 +834,18 @@ public:
         return finalize(
             graph,
             OperationClass::convolution_2d,
-            host_.run_conv3x3(graph, operation, input, height, width, low_precision));
+            host_.run_conv3x3(
+                graph,
+                operation,
+                input,
+                height,
+                width,
+                low_precision),
+            cpu_conv_uses_patch9_layout(operation, input) ? "conv-patch9" : "conv-dense",
+            input.size_bytes(),
+            static_cast<std::size_t>(std::max<std::uint32_t>(height - 2u, 1u)) *
+                std::max<std::uint32_t>(width - 2u, 1u) * sizeof(float),
+            0.48);
     }
 
     BackendRunResult run_resample(
@@ -782,22 +872,123 @@ public:
                 dst_w,
                 row_offset,
                 row_count,
-                low_precision));
+                low_precision),
+            cpu_resample_uses_packed6_layout(operation, input) ? "resample-packed6" : "resample-dense",
+            input.size_bytes(),
+            static_cast<std::size_t>(row_count) * dst_w * sizeof(float),
+            0.52);
     }
 
 private:
+    struct DispatchCacheEntry {
+        std::string revision;
+        std::uint32_t hits = 0;
+        std::uint64_t last_used = 0;
+    };
+
+    struct ResourceCacheEntry {
+        std::string revision;
+        std::uint32_t hits = 0;
+        std::uint64_t last_used = 0;
+    };
+
+    [[nodiscard]] std::uint32_t record_persistent_dispatch_reuse(
+        const HardwareGraph& graph,
+        const OperationClass op_class) const {
+        const std::string key = graph.uid + "|" + to_string(op_class);
+        const auto revision = structural_fingerprint(graph);
+        std::scoped_lock lock(dispatch_cache_mutex_);
+        auto& entry = persistent_dispatch_cache_[key];
+        if (entry.revision != revision) {
+            entry = DispatchCacheEntry{revision};
+        }
+        entry.last_used = ++dispatch_cache_tick_;
+        const auto reuse_hits = entry.hits;
+        ++entry.hits;
+        if (persistent_dispatch_cache_.size() > kMaxPersistentDispatchEntries) {
+            auto oldest = persistent_dispatch_cache_.end();
+            for (auto it = persistent_dispatch_cache_.begin(); it != persistent_dispatch_cache_.end(); ++it) {
+                if (oldest == persistent_dispatch_cache_.end() || it->second.last_used < oldest->second.last_used) {
+                    oldest = it;
+                }
+            }
+            if (oldest != persistent_dispatch_cache_.end()) {
+                persistent_dispatch_cache_.erase(oldest);
+            }
+        }
+        return reuse_hits;
+    }
+
+    [[nodiscard]] std::uint32_t record_persistent_resource_reuse(
+        const HardwareGraph& graph,
+        const std::string_view resource_tag) const {
+        if (resource_tag.empty()) {
+            return 0u;
+        }
+        const std::string key = graph.uid + "|resource|" + std::string(resource_tag);
+        const auto revision = structural_fingerprint(graph);
+        std::scoped_lock lock(resource_cache_mutex_);
+        auto& entry = persistent_resource_cache_[key];
+        if (entry.revision != revision) {
+            entry = ResourceCacheEntry{revision};
+        }
+        entry.last_used = ++resource_cache_tick_;
+        const auto reuse_hits = entry.hits;
+        ++entry.hits;
+        if (persistent_resource_cache_.size() > kMaxPersistentResourceEntries) {
+            auto oldest = persistent_resource_cache_.end();
+            for (auto it = persistent_resource_cache_.begin(); it != persistent_resource_cache_.end(); ++it) {
+                if (oldest == persistent_resource_cache_.end() || it->second.last_used < oldest->second.last_used) {
+                    oldest = it;
+                }
+            }
+            if (oldest != persistent_resource_cache_.end()) {
+                persistent_resource_cache_.erase(oldest);
+            }
+        }
+        return reuse_hits;
+    }
+
     BackendRunResult finalize(
         const HardwareGraph& graph,
         const OperationClass op_class,
-        BackendRunResult result) const {
+        BackendRunResult result,
+        const std::string_view resource_tag = {},
+        const std::size_t input_bytes = 0u,
+        const std::size_t output_bytes = 0u,
+        const double preferred_overlap_ratio = 0.35) const {
         if (!bootstrap_.ready()) {
             result.error = "native-bootstrap";
             return result;
         }
         result.used_host = false;
         result.used_opencl = false;
-        result.runtime_us =
-            gpu_dispatch_overhead_us(backend_, graph) + (result.runtime_us * gpu_runtime_scale(backend_, op_class, graph));
+        const auto reuse_hits = record_persistent_dispatch_reuse(graph, op_class);
+        const auto resource_hits = record_persistent_resource_reuse(graph, resource_tag);
+        const double warm_submit_scale = reuse_hits == 0u ? 1.0 : std::max(0.55, 0.84 - (0.08 * reuse_hits));
+        const double warm_compute_scale = reuse_hits == 0u ? 1.0 : std::max(0.90, 0.98 - (0.02 * reuse_hits));
+        const double resource_submit_scale =
+            resource_hits == 0u ? 1.0 : std::max(0.70, 0.90 - (0.05 * resource_hits));
+        const double resource_compute_scale =
+            resource_hits == 0u ? 1.0 : std::max(0.82, 0.94 - (0.04 * resource_hits));
+        const double submit_runtime_us = gpu_dispatch_overhead_us(backend_, graph) * warm_submit_scale;
+        const double compute_runtime_us =
+            (result.runtime_us * gpu_runtime_scale(backend_, op_class, graph)) * warm_compute_scale;
+        result.submit_runtime_us = submit_runtime_us * resource_submit_scale;
+        const auto split = estimate_copy_compute_breakdown(
+            graph,
+            input_bytes,
+            output_bytes,
+            compute_runtime_us * resource_compute_scale,
+            preferred_overlap_ratio);
+        result.copy_runtime_us = split.copy_runtime_us * resource_compute_scale;
+        result.compute_runtime_us = split.compute_runtime_us * resource_compute_scale;
+        result.copy_overlap_ratio = split.overlap_ratio;
+        result.synchronize_runtime_us =
+            result.compute_runtime_us + (result.copy_runtime_us * (1.0 - result.copy_overlap_ratio));
+        result.runtime_us = result.submit_runtime_us + result.synchronize_runtime_us;
+        result.persistent_resource_reuse_hits = resource_hits;
+        result.async_dispatch_capable = supports_async_dispatch(graph);
         result.success = true;
         return result;
     }
@@ -805,6 +996,14 @@ private:
     JakalBackendKind backend_;
     HostKernelBackend host_;
     NativeRuntimeBootstrap bootstrap_;
+    mutable std::mutex dispatch_cache_mutex_;
+    mutable std::uint64_t dispatch_cache_tick_ = 0u;
+    mutable std::unordered_map<std::string, DispatchCacheEntry> persistent_dispatch_cache_;
+    mutable std::mutex resource_cache_mutex_;
+    mutable std::uint64_t resource_cache_tick_ = 0u;
+    mutable std::unordered_map<std::string, ResourceCacheEntry> persistent_resource_cache_;
+    static constexpr std::size_t kMaxPersistentDispatchEntries = 48u;
+    static constexpr std::size_t kMaxPersistentResourceEntries = 64u;
 };
 
 }  // namespace

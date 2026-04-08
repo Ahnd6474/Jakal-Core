@@ -11,6 +11,8 @@
 
 namespace jakal {
 
+constexpr std::uint32_t kInvalidExecutionIndex = 0xffffffffu;
+
 enum class OperationClass {
     elementwise_map,
     reduction,
@@ -42,6 +44,13 @@ enum class ExecutionStrategy {
     overlapped
 };
 
+enum class ValidationTier {
+    full,
+    adaptive,
+    minimal,
+    disabled
+};
+
 enum class OptimizationPolicy {
     heuristic_greedy,
     learned_greedy,
@@ -68,7 +77,9 @@ struct ContinuousExecutionState {
 struct ExecutionTuningOverrides {
     std::optional<ContinuousExecutionState> initial_state_override;
     std::optional<std::uint32_t> graph_optimization_passes_override;
+    std::optional<std::uint32_t> optimizer_wall_time_budget_ms;
     std::uint32_t graph_rewrite_level = 1u;
+    ValidationTier validation_tier = ValidationTier::adaptive;
 };
 
 struct GraphOptimizationPass {
@@ -87,7 +98,16 @@ struct GraphOptimizationSummary {
     double initial_objective_us = 0.0;
     double final_objective_us = 0.0;
     std::uint32_t total_logical_partitions = 0;
+    std::uint32_t time_budget_ms = 0;
+    bool budget_exhausted = false;
     bool converged = false;
+};
+
+struct CandidatePolicySummary {
+    std::uint32_t max_ranked_strategies = 0;
+    std::uint32_t max_devices = 0;
+    std::uint32_t max_candidates = 0;
+    std::uint32_t validation_shortlist = 0;
 };
 
 struct OperationSpec {
@@ -162,6 +182,9 @@ struct TensorResidencyPlanEntry {
     std::string tensor_id;
     std::string device_uid;
     std::string structural_node_id;
+    std::uint32_t tensor_index = kInvalidExecutionIndex;
+    std::uint32_t device_index = kInvalidExecutionIndex;
+    std::uint32_t structural_node_index = kInvalidExecutionIndex;
     std::uint64_t bytes = 0;
     bool persistent = false;
     bool live_in = false;
@@ -176,6 +199,11 @@ struct TransferScheduleEntry {
     std::string target_device_uid;
     std::string source_operation_name;
     std::string target_operation_name;
+    std::uint32_t tensor_index = kInvalidExecutionIndex;
+    std::uint32_t source_device_index = kInvalidExecutionIndex;
+    std::uint32_t target_device_index = kInvalidExecutionIndex;
+    std::uint32_t source_operation_index = kInvalidExecutionIndex;
+    std::uint32_t target_operation_index = kInvalidExecutionIndex;
     std::uint64_t bytes = 0;
     double predicted_latency_us = 0.0;
     double overlap_ratio = 0.0;
@@ -187,6 +215,11 @@ struct ExecutionNode {
     std::string label;
     std::string device_uid;
     std::string structural_node_id;
+    std::uint32_t node_index = kInvalidExecutionIndex;
+    std::uint32_t device_index = kInvalidExecutionIndex;
+    std::uint32_t structural_node_index = kInvalidExecutionIndex;
+    std::uint32_t operation_index = kInvalidExecutionIndex;
+    std::uint32_t tensor_index = kInvalidExecutionIndex;
     ExecutionNodeKind kind = ExecutionNodeKind::compute;
     std::uint64_t bytes = 0;
     double work_units = 0.0;
@@ -196,6 +229,8 @@ struct ExecutionNode {
 struct ExecutionEdge {
     std::string source_id;
     std::string target_id;
+    std::uint32_t source_node_index = kInvalidExecutionIndex;
+    std::uint32_t target_node_index = kInvalidExecutionIndex;
     ExecutionEdgeKind kind = ExecutionEdgeKind::dataflow;
     bool directed = true;
     std::uint64_t bytes = 0;
@@ -208,6 +243,9 @@ struct ExecutionGraph {
     std::string workload_signature;
     OperationSpec operation;
     std::vector<std::string> participating_devices;
+    std::vector<std::string> indexed_devices;
+    std::vector<std::string> indexed_operations;
+    std::vector<std::string> indexed_structural_nodes;
     std::vector<TensorResidencyPlanEntry> residency_plan;
     std::vector<TransferScheduleEntry> transfer_schedule;
     std::vector<ExecutionNode> nodes;
@@ -216,6 +254,7 @@ struct ExecutionGraph {
     double predicted_speedup_vs_reference = 1.0;
     double expected_relative_error = 0.0;
     double predicted_transfer_latency_us = 0.0;
+    double predicted_overlap_gain_us = 0.0;
     double predicted_memory_pressure = 0.0;
     std::uint64_t peak_resident_bytes = 0;
 };
@@ -287,6 +326,7 @@ struct BenchmarkRecord {
 
 struct PerformanceSummary {
     std::string shape_bucket;
+    std::string device_family_signature;
     ExecutionConfig config;
     std::uint32_t observations = 0;
     double average_effective_latency_us = 0.0;
@@ -348,6 +388,7 @@ using CachedConfig = CachedExecutionConfig;
 [[nodiscard]] std::string to_string(ExecutionEdgeKind kind);
 [[nodiscard]] std::string to_string(ExecutionStrategy strategy);
 [[nodiscard]] std::string to_string(OptimizationPolicy policy);
+[[nodiscard]] std::string to_string(ValidationTier tier);
 
 class BootstrapExecutionOptimizer {
 public:
@@ -381,6 +422,7 @@ public:
         const std::string& report_signature,
         const std::string& operation_name) const;
     [[nodiscard]] const std::unordered_map<std::string, PerformanceSummary>& performance_cache() const;
+    [[nodiscard]] const std::unordered_map<std::string, PerformanceSummary>& graph_family_performance_cache() const;
     [[nodiscard]] const std::unordered_map<std::string, double>& backend_penalty_cache() const;
     [[nodiscard]] const std::unordered_map<std::string, bool>& warmed_devices() const;
     void ingest_execution_feedback(
@@ -390,8 +432,10 @@ public:
 
 private:
     std::filesystem::path performance_cache_path_;
+    std::filesystem::path graph_family_cache_path_;
     bool cache_loaded_ = false;
     std::unordered_map<std::string, PerformanceSummary> performance_cache_;
+    std::unordered_map<std::string, PerformanceSummary> graph_family_performance_cache_;
     std::unordered_map<std::string, double> device_sustained_slowdown_;
     std::unordered_map<std::string, bool> warmed_devices_;
     std::unordered_map<std::string, double> backend_penalty_cache_;
@@ -423,6 +467,12 @@ private:
 
 [[nodiscard]] std::vector<OperationSpec> default_operation_suite(const WorkloadSpec& workload);
 [[nodiscard]] WorkloadGraph default_workload_graph(const WorkloadSpec& workload);
+[[nodiscard]] CandidatePolicySummary describe_candidate_policy(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const SystemProfile& system,
+    bool continuous_state_active,
+    double placement_affinity);
 
 }  // namespace jakal
 

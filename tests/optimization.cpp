@@ -9,15 +9,18 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <atomic>
 #include <chrono>
 #include <algorithm>
 
 namespace {
 
 std::filesystem::path unique_temp_file(const std::string& stem) {
+    static std::atomic<std::uint64_t> counter{0u};
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto ordinal = counter.fetch_add(1u, std::memory_order_relaxed);
     return std::filesystem::temp_directory_path() /
-           (stem + "-" + std::to_string(nonce) + ".tsv");
+           (stem + "-" + std::to_string(nonce) + "-" + std::to_string(ordinal) + ".tsv");
 }
 
 bool verify_cost_propagation() {
@@ -781,6 +784,683 @@ jakal::WorkloadGraph make_runtime_reduce_meta_graph() {
     return graph;
 }
 
+jakal::WorkloadGraph make_validation_policy_graph(const bool host_visible_weights) {
+    jakal::WorkloadGraph graph;
+    graph.signature = host_visible_weights ? "validation-policy-host-visible" : "validation-policy-device-resident";
+    graph.tensors = {
+        {"tokens", "tokens", "", {"projection"}, 32ull * 32ull * sizeof(float), false, false, true},
+        {"weights", "weights", "", {"projection"}, 32ull * 32ull * sizeof(float), true, false, host_visible_weights},
+        {"projection-out", "projection-out", "projection", {"normalize"}, 32ull * 32ull * sizeof(float), false, true, false},
+        {"reduced", "reduced", "normalize", {}, 32ull * sizeof(float), false, false, true}};
+
+    jakal::OperationSpec projection;
+    projection.name = "projection";
+    projection.op_class = jakal::OperationClass::matmul;
+    projection.extents = {32, 32, 32};
+    projection.input_bytes = 2ull * 32ull * 32ull * sizeof(float);
+    projection.output_bytes = 32ull * 32ull * sizeof(float);
+    projection.temporary_bytes = 8ull * 1024ull;
+    projection.estimated_flops = 2.0 * 32.0 * 32.0 * 32.0;
+    projection.matrix_friendly = true;
+    projection.input_tensor_ids = {"tokens", "weights"};
+    projection.output_tensor_ids = {"projection-out"};
+
+    jakal::OperationSpec normalize;
+    normalize.name = "normalize";
+    normalize.op_class = jakal::OperationClass::reduction;
+    normalize.extents = {32ull * 32ull};
+    normalize.input_bytes = 32ull * 32ull * sizeof(float);
+    normalize.output_bytes = 32ull * sizeof(float);
+    normalize.estimated_flops = 32.0 * 32.0;
+    normalize.reduction_like = true;
+    normalize.input_tensor_ids = {"projection-out"};
+    normalize.output_tensor_ids = {"reduced"};
+
+    graph.operations = {projection, normalize};
+    jakal::normalize_workload_graph(graph);
+    return graph;
+}
+
+jakal::WorkloadGraph make_candidate_policy_graph() {
+    jakal::WorkloadGraph graph;
+    graph.signature = "candidate-policy-graph";
+    graph.tensors = {
+        {"tokens", "tokens", "", {"projection"}, 1024ull * 1024ull * sizeof(float), false, false, true},
+        {"weights", "weights", "", {"projection"}, 1024ull * 1024ull * sizeof(float), true, false, false},
+        {"projection-out", "projection-out", "projection", {"normalize"}, 1024ull * 1024ull * sizeof(float), false, false, false},
+        {"reduced", "reduced", "normalize", {}, 1024ull * sizeof(float), false, false, true}};
+
+    jakal::OperationSpec projection;
+    projection.name = "projection";
+    projection.op_class = jakal::OperationClass::matmul;
+    projection.extents = {1024, 1024, 1024};
+    projection.input_bytes = 2ull * 1024ull * 1024ull * sizeof(float);
+    projection.output_bytes = 1024ull * 1024ull * sizeof(float);
+    projection.temporary_bytes = 2ull * 1024ull * 1024ull;
+    projection.estimated_flops = 2.0 * 1024.0 * 1024.0 * 1024.0;
+    projection.matrix_friendly = true;
+    projection.input_tensor_ids = {"tokens", "weights"};
+    projection.output_tensor_ids = {"projection-out"};
+
+    jakal::OperationSpec normalize;
+    normalize.name = "normalize";
+    normalize.op_class = jakal::OperationClass::reduction;
+    normalize.extents = {1024ull * 1024ull};
+    normalize.input_bytes = 1024ull * 1024ull * sizeof(float);
+    normalize.output_bytes = 1024ull * sizeof(float);
+    normalize.estimated_flops = 1024.0 * 1024.0;
+    normalize.reduction_like = true;
+    normalize.input_tensor_ids = {"projection-out"};
+    normalize.output_tensor_ids = {"reduced"};
+
+    graph.operations = {projection, normalize};
+    jakal::normalize_workload_graph(graph);
+    return graph;
+}
+
+jakal::WorkloadGraph make_small_fusion_graph() {
+    jakal::WorkloadGraph graph;
+    graph.signature = "small-fusion-graph";
+    graph.tensors = {
+        {"tokens", "tokens", "", {"bias"}, 4096ull * sizeof(float), false, false, true},
+        {"bias-out", "bias-out", "bias", {"sum"}, 4096ull * sizeof(float), false, true, false},
+        {"score", "score", "sum", {}, sizeof(float), false, false, true}};
+
+    jakal::OperationSpec bias;
+    bias.name = "bias";
+    bias.op_class = jakal::OperationClass::elementwise_map;
+    bias.extents = {4096};
+    bias.input_bytes = 4096ull * sizeof(float);
+    bias.output_bytes = 4096ull * sizeof(float);
+    bias.estimated_flops = 4096.0;
+    bias.parallelizable = true;
+    bias.streaming_friendly = true;
+    bias.input_tensor_ids = {"tokens"};
+    bias.output_tensor_ids = {"bias-out"};
+
+    jakal::OperationSpec sum;
+    sum.name = "sum";
+    sum.op_class = jakal::OperationClass::reduction;
+    sum.extents = {4096};
+    sum.input_bytes = 4096ull * sizeof(float);
+    sum.output_bytes = sizeof(float);
+    sum.estimated_flops = 4096.0;
+    sum.parallelizable = true;
+    sum.reduction_like = true;
+    sum.input_tensor_ids = {"bias-out"};
+    sum.output_tensor_ids = {"score"};
+
+    graph.operations = {bias, sum};
+    jakal::normalize_workload_graph(graph);
+    return graph;
+}
+
+bool verify_compiled_graph_signature_isolation() {
+    const auto plan_cache = unique_temp_file("compiled-graph-plan");
+    const auto exec_cache = unique_temp_file("compiled-graph-exec");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const auto host = make_manual_host_graph();
+    const auto gpu = make_manual_gpu_graph("gpu:compiled:0", "Compiled GPU", true, true, true);
+    const std::vector<jakal::HardwareGraph> graphs{host, gpu};
+
+    const jakal::WorkloadSpec workload{
+        "compiled-signature-workload",
+        jakal::WorkloadKind::inference,
+        "compiled-signature-workload",
+        64ull * 1024ull * 1024ull,
+        4ull * 1024ull * 1024ull,
+        1.2e7,
+        1,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "b1-s32"};
+    const auto plan = planner.build_plan(workload, graphs);
+
+    const auto device_resident = make_validation_policy_graph(false);
+    const auto host_visible = make_validation_policy_graph(true);
+    const auto compiled_device_resident = jakal::compile_workload_graph(device_resident);
+    const auto compiled_host_visible = jakal::compile_workload_graph(host_visible);
+    if (compiled_device_resident.signature.empty() ||
+        compiled_device_resident.signature == compiled_host_visible.signature) {
+        std::cerr << "compiled-graph: expected distinct signatures for residency change\n";
+        return false;
+    }
+    if (compiled_device_resident.operations.size() != device_resident.operations.size() ||
+        compiled_device_resident.tensors.size() != device_resident.tensors.size()) {
+        std::cerr << "compiled-graph: compiled graph lost tensor or op metadata\n";
+        return false;
+    }
+    if (!compiled_device_resident.tensors[2].has_lifetime ||
+        compiled_device_resident.operations[1].dependency_operation_indices.size() != 1u ||
+        compiled_device_resident.operations[1].dependency_operation_indices.front() != 0u) {
+        std::cerr << "compiled-graph: dependency or lifetime metadata missing\n";
+        return false;
+    }
+
+    jakal::ExecutionTuningOverrides tuning;
+    tuning.validation_tier = jakal::ValidationTier::minimal;
+    const auto first = optimizer.optimize(workload, plan, graphs, &device_resident, &tuning);
+    const auto second = optimizer.optimize(workload, plan, graphs, &host_visible, &tuning);
+    if (first.operations.empty() || second.operations.empty()) {
+        std::cerr << "compiled-graph: optimizer returned no operations\n";
+        return false;
+    }
+    if (second.loaded_from_cache) {
+        std::cerr << "compiled-graph: cache should not hit across different compiled signatures\n";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    return true;
+}
+
+bool verify_validation_tier_controls() {
+    const auto plan_cache = unique_temp_file("validation-tier-plan");
+    const auto exec_cache = unique_temp_file("validation-tier-exec");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const auto host = make_manual_host_graph();
+    const auto gpu = make_manual_gpu_graph("gpu:validation:0", "Validation GPU", true, true, true);
+    const std::vector<jakal::HardwareGraph> graphs{host, gpu};
+    const auto graph = make_validation_policy_graph(false);
+
+    const jakal::WorkloadSpec workload{
+        "validation-tier-workload",
+        jakal::WorkloadKind::inference,
+        "validation-tier-workload",
+        48ull * 1024ull * 1024ull,
+        2ull * 1024ull * 1024ull,
+        8.0e6,
+        1,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "b1-s32"};
+    const auto plan = planner.build_plan(workload, graphs);
+
+    jakal::ExecutionTuningOverrides minimal_tuning;
+    minimal_tuning.validation_tier = jakal::ValidationTier::minimal;
+    const auto minimal = optimizer.optimize(workload, plan, graphs, &graph, &minimal_tuning);
+
+    jakal::ExecutionTuningOverrides full_tuning;
+    full_tuning.validation_tier = jakal::ValidationTier::full;
+    const auto full = optimizer.optimize(workload, plan, graphs, &graph, &full_tuning);
+
+    jakal::ExecutionTuningOverrides disabled_tuning;
+    disabled_tuning.validation_tier = jakal::ValidationTier::disabled;
+    const auto disabled = optimizer.optimize(workload, plan, graphs, &graph, &disabled_tuning);
+
+    if (minimal.operations.empty() || full.operations.empty() || disabled.operations.empty()) {
+        std::cerr << "validation-tier: optimizer returned no operations\n";
+        return false;
+    }
+    for (std::size_t index = 0; index < minimal.operations.size(); ++index) {
+        if (minimal.operations[index].benchmark.validation_samples != 1u) {
+            std::cerr << "validation-tier: minimal tier should use 1 validation sample\n";
+            return false;
+        }
+        if (full.operations[index].benchmark.validation_samples < 3u) {
+            std::cerr << "validation-tier: full tier should use >=3 validation samples\n";
+            return false;
+        }
+        if (disabled.operations[index].benchmark.validation_samples != 0u) {
+            std::cerr << "validation-tier: disabled tier should skip validation\n";
+            return false;
+        }
+    }
+
+    jakal::RuntimeOptions options;
+    options.enable_host_probe = true;
+    options.enable_opencl_probe = false;
+    options.enable_level_zero_probe = false;
+    options.enable_cuda_probe = false;
+    options.enable_rocm_probe = false;
+    options.product.observability.persist_telemetry = false;
+    options.cache_path = plan_cache;
+    options.execution_cache_path = exec_cache;
+
+    options.optimization.execution.validation_tier = jakal::ValidationTier::adaptive;
+    jakal::Runtime runtime_minimal(options);
+    const auto runtime_minimal_report = runtime_minimal.optimize(workload, graph);
+    if (runtime_minimal_report.operations.empty() ||
+        runtime_minimal_report.operations.front().benchmark.validation_samples != 1u) {
+        std::cerr << "validation-tier: adaptive runtime policy should choose minimal for decode inference\n";
+        return false;
+    }
+
+    options.optimization.execution.validation_tier = jakal::ValidationTier::full;
+    jakal::Runtime runtime_full(options);
+    const auto runtime_full_report = runtime_full.optimize(workload, graph);
+    if (runtime_full_report.operations.empty() ||
+        runtime_full_report.operations.front().benchmark.validation_samples < 3u) {
+        std::cerr << "validation-tier: runtime full tier override not applied\n";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(plan_cache.string() + ".strategy", ec);
+    std::filesystem::remove(plan_cache.string() + ".strategy_family", ec);
+    std::filesystem::remove(plan_cache.string() + ".confidence", ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+    return true;
+}
+
+bool verify_execution_graph_indices_and_candidate_policy() {
+    const auto plan_cache = unique_temp_file("execution-graph-indices-plan");
+    const auto exec_cache = unique_temp_file("execution-graph-indices-exec");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const std::vector<jakal::HardwareGraph> graphs{
+        make_manual_host_graph(),
+        make_manual_gpu_graph("gpu:policy:0", "Policy GPU 0", true, true, true),
+        make_manual_gpu_graph("gpu:policy:1", "Policy GPU 1", true, true, true)};
+    const auto inference_graph = make_validation_policy_graph(true);
+
+    const jakal::WorkloadSpec inference_workload{
+        "candidate-policy-workload",
+        jakal::WorkloadKind::inference,
+        "candidate-policy-dataset",
+        512ull * 1024ull * 1024ull,
+        64ull * 1024ull * 1024ull,
+        6.0e9,
+        1,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::blind_sharded,
+        jakal::WorkloadPhase::decode,
+        "b1-s1024"};
+    const auto inference_plan = planner.build_plan(inference_workload, graphs);
+
+    jakal::ExecutionTuningOverrides tuning;
+    tuning.validation_tier = jakal::ValidationTier::minimal;
+    const auto inference_report =
+        optimizer.optimize(inference_workload, inference_plan, graphs, &inference_graph, &tuning);
+    if (inference_report.operations.empty()) {
+        std::cerr << "execution-graph: optimizer returned no operations\n";
+        return false;
+    }
+
+    const auto* inference_projection = find_operation_by_name(inference_report, "projection");
+    if (inference_projection == nullptr) {
+        std::cerr << "execution-graph: missing projection op\n";
+        return false;
+    }
+
+    const auto& execution_graph = inference_projection->graph;
+    if (execution_graph.indexed_devices.empty() || execution_graph.nodes.empty() || execution_graph.edges.empty() ||
+        execution_graph.residency_plan.empty() || execution_graph.transfer_schedule.empty()) {
+        std::cerr << "execution-graph: expected indexed graph metadata to be populated\n";
+        return false;
+    }
+
+    for (std::size_t index = 0; index < execution_graph.nodes.size(); ++index) {
+        const auto& node = execution_graph.nodes[index];
+        if (node.node_index != index) {
+            std::cerr << "execution-graph: node index mismatch\n";
+            return false;
+        }
+        if (node.device_index >= execution_graph.indexed_devices.size() ||
+            execution_graph.indexed_devices[node.device_index] != node.device_uid) {
+            std::cerr << "execution-graph: invalid node device index\n";
+            return false;
+        }
+        if (node.structural_node_id.empty()) {
+            if (node.structural_node_index != jakal::kInvalidExecutionIndex) {
+                std::cerr << "execution-graph: empty structural node should not have an index\n";
+                return false;
+            }
+        } else if (node.structural_node_index >= execution_graph.indexed_structural_nodes.size() ||
+                   execution_graph.indexed_structural_nodes[node.structural_node_index] != node.structural_node_id) {
+            std::cerr << "execution-graph: invalid structural node index\n";
+            return false;
+        }
+    }
+
+    for (const auto& edge : execution_graph.edges) {
+        if (edge.source_node_index >= execution_graph.nodes.size() ||
+            execution_graph.nodes[edge.source_node_index].id != edge.source_id ||
+            edge.target_node_index >= execution_graph.nodes.size() ||
+            execution_graph.nodes[edge.target_node_index].id != edge.target_id) {
+            std::cerr << "execution-graph: invalid edge node indices\n";
+            return false;
+        }
+    }
+
+    for (const auto& entry : execution_graph.residency_plan) {
+        if (entry.tensor_index >= inference_report.workload_graph.tensors.size() ||
+            inference_report.workload_graph.tensors[entry.tensor_index].id != entry.tensor_id) {
+            std::cerr << "execution-graph: invalid residency tensor index\n";
+            return false;
+        }
+        if (entry.device_index >= execution_graph.indexed_devices.size() ||
+            execution_graph.indexed_devices[entry.device_index] != entry.device_uid) {
+            std::cerr << "execution-graph: invalid residency device index\n";
+            return false;
+        }
+        if (entry.structural_node_id.empty()) {
+            if (entry.structural_node_index != jakal::kInvalidExecutionIndex) {
+                std::cerr << "execution-graph: empty residency structural node should not have an index\n";
+                return false;
+            }
+        } else if (entry.structural_node_index >= execution_graph.indexed_structural_nodes.size() ||
+                   execution_graph.indexed_structural_nodes[entry.structural_node_index] != entry.structural_node_id) {
+            std::cerr << "execution-graph: invalid residency structural index\n";
+            return false;
+        }
+    }
+
+    for (const auto& transfer : execution_graph.transfer_schedule) {
+        if (transfer.tensor_index >= inference_report.workload_graph.tensors.size() ||
+            inference_report.workload_graph.tensors[transfer.tensor_index].id != transfer.tensor_id) {
+            std::cerr << "execution-graph: invalid transfer tensor index\n";
+            return false;
+        }
+        if (transfer.target_device_index >= execution_graph.indexed_devices.size() ||
+            execution_graph.indexed_devices[transfer.target_device_index] != transfer.target_device_uid) {
+            std::cerr << "execution-graph: invalid transfer target device index\n";
+            return false;
+        }
+        if (transfer.source_device_uid.empty()) {
+            std::cerr << "execution-graph: transfer source device should be populated\n";
+            return false;
+        }
+        if (transfer.source_device_uid == "host") {
+            if (transfer.source_device_index >= execution_graph.indexed_devices.size() ||
+                execution_graph.indexed_devices[transfer.source_device_index] != "host") {
+                std::cerr << "execution-graph: host transfer source index missing\n";
+                return false;
+            }
+        } else if (transfer.source_device_index >= execution_graph.indexed_devices.size() ||
+                   execution_graph.indexed_devices[transfer.source_device_index] != transfer.source_device_uid) {
+            std::cerr << "execution-graph: invalid transfer source device index\n";
+            return false;
+        }
+        if (!transfer.target_operation_name.empty() &&
+            (transfer.target_operation_index >= inference_report.workload_graph.operations.size() ||
+             inference_report.workload_graph.operations[transfer.target_operation_index].name != transfer.target_operation_name)) {
+            std::cerr << "execution-graph: invalid transfer target operation index\n";
+            return false;
+        }
+        if (!transfer.source_operation_name.empty() &&
+            (transfer.source_operation_index >= inference_report.workload_graph.operations.size() ||
+             inference_report.workload_graph.operations[transfer.source_operation_index].name != transfer.source_operation_name)) {
+            std::cerr << "execution-graph: invalid transfer source operation index\n";
+            return false;
+        }
+    }
+
+    const auto inference_policy = jakal::describe_candidate_policy(
+        inference_workload,
+        inference_graph.operations.front(),
+        inference_report.system_profile,
+        false,
+        1.0);
+    const jakal::WorkloadSpec training_workload{
+        "candidate-policy-workload",
+        jakal::WorkloadKind::training,
+        "candidate-policy-dataset",
+        1024ull * 1024ull * 1024ull,
+        32ull * 1024ull * 1024ull,
+        2.0e11,
+        16,
+        false,
+        true,
+        true,
+        jakal::PartitionStrategy::blind_sharded,
+        jakal::WorkloadPhase::training_step,
+        "b16-s1024"};
+    const auto training_policy =
+        jakal::describe_candidate_policy(training_workload, make_candidate_policy_graph().operations.front(), {}, false, 1.0);
+
+    if (inference_policy.max_devices != 1u || inference_policy.validation_shortlist != 1u ||
+        training_policy.max_devices <= inference_policy.max_devices ||
+        training_policy.max_candidates <= inference_policy.max_candidates ||
+        training_policy.validation_shortlist <= inference_policy.validation_shortlist) {
+        std::cerr << "candidate-policy: workload-aware limits not applied\n";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+    return true;
+}
+
+bool verify_graph_family_feedback_sharing() {
+    const auto plan_cache = unique_temp_file("graph-family-plan");
+    const auto exec_cache = unique_temp_file("graph-family-exec");
+    std::error_code ec;
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const std::vector<jakal::HardwareGraph> graphs{
+        make_manual_host_graph(),
+        make_manual_gpu_graph("gpu:family:0", "Family GPU", true, true, true)};
+    const auto graph = make_validation_policy_graph(false);
+
+    jakal::ExecutionTuningOverrides tuning;
+    tuning.validation_tier = jakal::ValidationTier::minimal;
+
+    jakal::WorkloadSpec first_workload{
+        "graph-family-workload",
+        jakal::WorkloadKind::inference,
+        "family-dataset-a",
+        96ull * 1024ull * 1024ull,
+        4ull * 1024ull * 1024ull,
+        1.0e7,
+        1,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "b1-s32"};
+    const auto first_plan = planner.build_plan(first_workload, graphs);
+    const auto first_report = optimizer.optimize(first_workload, first_plan, graphs, &graph, &tuning);
+    if (first_report.operations.empty()) {
+        std::cerr << "graph-family: first optimization returned no operations\n";
+        return false;
+    }
+
+    std::vector<jakal::ExecutionFeedbackRecord> feedback;
+    feedback.reserve(first_report.operations.size());
+    for (const auto& result : first_report.operations) {
+        const bool used_host = result.config.primary_device_uid.find("host") != std::string::npos;
+        feedback.push_back(jakal::ExecutionFeedbackRecord{
+            result.operation.name,
+            used_host ? "host" : "opencl-direct",
+            result.config.participating_devices,
+            std::max(0.05, result.graph.predicted_latency_us * 0.92),
+            std::max(0.10, result.graph.predicted_latency_us * 1.15),
+            result.graph.expected_relative_error,
+            true,
+            used_host,
+            !used_host,
+            result.config.participating_devices.size() > 1u,
+            result.config.logical_partitions});
+    }
+    optimizer.ingest_execution_feedback(first_report, feedback, graphs);
+
+    jakal::AdaptiveExecutionOptimizer adaptive(exec_cache);
+    adaptive.load_cache();
+    if (adaptive.graph_family_performance_cache().empty()) {
+        std::cerr << "graph-family: family cache should persist feedback\n";
+        return false;
+    }
+
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+
+    const auto second_plan = planner.build_plan(first_workload, graphs);
+    const auto second_report = optimizer.optimize(first_workload, second_plan, graphs, &graph, &tuning);
+
+    bool observed_family_warm_start = false;
+    bool observed_feedback_driven_validation = false;
+    for (const auto& result : second_report.operations) {
+        if (result.benchmark.reference_latency_us > 0.0 &&
+            result.benchmark.calibration_confidence > 0.15 &&
+            result.benchmark.calibration_ratio > 0.0) {
+            observed_family_warm_start = true;
+        }
+        if (result.benchmark.validation_samples <= 1u &&
+            result.benchmark.candidate_spread_us <= 18.0 &&
+            result.benchmark.calibration_ratio > 0.0) {
+            observed_feedback_driven_validation = true;
+        }
+    }
+    if (!observed_family_warm_start) {
+        std::cerr << "graph-family: expected family cache fallback to seed calibration metadata\n";
+        return false;
+    }
+    if (!observed_feedback_driven_validation) {
+        std::cerr << "graph-family: expected feedback-driven validation fast path\n";
+        return false;
+    }
+
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+    return true;
+}
+
+bool verify_small_op_fusion_and_policy() {
+    const auto plan_cache = unique_temp_file("small-fusion-plan");
+    const auto exec_cache = unique_temp_file("small-fusion-exec");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const std::vector<jakal::HardwareGraph> graphs{
+        make_manual_host_graph(),
+        make_manual_gpu_graph("gpu:small:0", "Small GPU", true, true, true)};
+    const auto graph = make_small_fusion_graph();
+    const jakal::WorkloadSpec workload{
+        "small-fusion-workload",
+        jakal::WorkloadKind::inference,
+        "small-fusion-workload",
+        8ull * 1024ull * 1024ull,
+        512ull * 1024ull,
+        8192.0,
+        1,
+        true,
+        false,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "b1-s1"};
+    const auto plan = planner.build_plan(workload, graphs);
+
+    jakal::ExecutionTuningOverrides tuning;
+    tuning.graph_rewrite_level = 3u;
+    const auto report = optimizer.optimize(workload, plan, graphs, &graph, &tuning);
+    if (report.operations.size() != 1u) {
+        std::cerr << "small-fusion: expected rewrite pipeline to collapse small graph\n";
+        return false;
+    }
+    if (report.workload_graph.operations.size() != 1u ||
+        report.operations.front().operation.op_class != jakal::OperationClass::reduction ||
+        report.operations.front().operation.fused_operation_names.empty()) {
+        std::cerr << "small-fusion: expected fused reduction tail in optimized graph\n";
+        return false;
+    }
+    if (report.operations.front().graph.indexed_operations.size() != report.workload_graph.operations.size()) {
+        std::cerr << "small-fusion: execution graph operation indices drifted\n";
+        return false;
+    }
+
+    const auto policy = jakal::describe_candidate_policy(
+        workload,
+        report.operations.front().operation,
+        {},
+        false,
+        1.0);
+    if (policy.max_devices != 1u || policy.max_candidates > 4u || policy.validation_shortlist != 1u) {
+        std::cerr << "small-fusion: small-op candidate policy did not reduce exploration\n";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+    return true;
+}
+
+bool verify_optimizer_wall_time_budget() {
+    const auto plan_cache = unique_temp_file("optimizer-budget-plan");
+    const auto exec_cache = unique_temp_file("optimizer-budget-exec");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const std::vector<jakal::HardwareGraph> graphs{
+        make_manual_host_graph(),
+        make_manual_gpu_graph("gpu:budget:0", "Budget GPU 0", true, true, true),
+        make_manual_gpu_graph("gpu:budget:1", "Budget GPU 1", true, true, true)};
+    const auto graph = make_candidate_policy_graph();
+    const jakal::WorkloadSpec workload{
+        "optimizer-budget-workload",
+        jakal::WorkloadKind::training,
+        "optimizer-budget-workload",
+        1024ull * 1024ull * 1024ull,
+        48ull * 1024ull * 1024ull,
+        2.5e11,
+        16,
+        false,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::training_step,
+        "b16-s1024"};
+    const auto plan = planner.build_plan(workload, graphs);
+
+    jakal::ExecutionTuningOverrides tuning;
+    tuning.validation_tier = jakal::ValidationTier::full;
+    tuning.graph_optimization_passes_override = 6u;
+    tuning.optimizer_wall_time_budget_ms = 1u;
+    const auto report = optimizer.optimize(workload, plan, graphs, &graph, &tuning);
+    if (report.operations.empty()) {
+        std::cerr << "optimizer-budget: optimizer returned no operations\n";
+        return false;
+    }
+    if (report.graph_optimization.time_budget_ms != 1u) {
+        std::cerr << "optimizer-budget: expected budget metadata to round-trip\n";
+        return false;
+    }
+    if (!report.graph_optimization.budget_exhausted) {
+        std::cerr << "optimizer-budget: expected tiny wall-time budget to exhaust\n";
+        return false;
+    }
+    if (report.graph_optimization.passes.size() >= 6u) {
+        std::cerr << "optimizer-budget: expected budget to cut graph passes short\n";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+    return true;
+}
+
 bool verify_runtime_graph_aware_meta_policy() {
     const auto plan_cache = unique_temp_file("runtime-meta-plan");
     const auto exec_cache = unique_temp_file("runtime-meta-exec");
@@ -830,8 +1510,9 @@ bool verify_runtime_graph_aware_meta_policy() {
                   << jakal::to_string(projection_report.partition_strategy) << '\n';
         return false;
     }
-    if (projection_report.graph_optimization.passes.size() != 4u) {
-        std::cerr << "runtime-meta: expected 4 graph passes for projection graph, got "
+    if (projection_report.graph_optimization.passes.size() != 4u &&
+        !projection_report.graph_optimization.budget_exhausted) {
+        std::cerr << "runtime-meta: expected 4 graph passes or budget exhaustion for projection graph, got "
                   << projection_report.graph_optimization.passes.size() << '\n';
         return false;
     }
@@ -856,8 +1537,9 @@ bool verify_runtime_graph_aware_meta_policy() {
                   << jakal::to_string(signal_report.partition_strategy) << '\n';
         return false;
     }
-    if (signal_report.graph_optimization.passes.size() != 2u) {
-        std::cerr << "runtime-meta: expected 2 graph passes for signal graph, got "
+    if (signal_report.graph_optimization.passes.size() != 2u &&
+        !signal_report.graph_optimization.budget_exhausted) {
+        std::cerr << "runtime-meta: expected 2 graph passes or budget exhaustion for signal graph, got "
                   << signal_report.graph_optimization.passes.size() << '\n';
         return false;
     }
@@ -882,8 +1564,9 @@ bool verify_runtime_graph_aware_meta_policy() {
                   << jakal::to_string(reduce_report.partition_strategy) << '\n';
         return false;
     }
-    if (reduce_report.graph_optimization.passes.size() != 4u) {
-        std::cerr << "runtime-meta: expected 4 graph passes for reduction-tail graph, got "
+    if (reduce_report.graph_optimization.passes.size() != 4u &&
+        !reduce_report.graph_optimization.budget_exhausted) {
+        std::cerr << "runtime-meta: expected 4 graph passes or budget exhaustion for reduction-tail graph, got "
                   << reduce_report.graph_optimization.passes.size() << '\n';
         return false;
     }
@@ -895,6 +1578,7 @@ bool verify_runtime_graph_aware_meta_policy() {
     std::filesystem::remove(plan_cache.string() + ".confidence", ec);
     std::filesystem::remove(exec_cache, ec);
     std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
     return true;
 }
 
@@ -1464,7 +2148,17 @@ bool verify_operation_variant_registry() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool run_long_suite = true;
+    for (int index = 1; index < argc; ++index) {
+        const std::string arg = argv[index];
+        if (arg == "--fast") {
+            run_long_suite = false;
+        } else if (arg == "--long") {
+            run_long_suite = true;
+        }
+    }
+
     std::cerr << "stage: init\n";
     const auto plan_cache = unique_temp_file("gpu-runtime-plan-test");
     const auto exec_cache = unique_temp_file("gpu-runtime-exec-test");
@@ -1507,8 +2201,8 @@ int main() {
         std::cerr << "Expected workload DAG, tensors, and lifetimes.\n";
         return 1;
     }
-    if (first.graph_optimization.optimizer_name.empty() || first.graph_optimization.passes.empty()) {
-        std::cerr << "Expected graph-level optimization passes.\n";
+    if (first.graph_optimization.optimizer_name.empty()) {
+        std::cerr << "Expected graph-level optimizer metadata.\n";
         return 1;
     }
     if (first.graph_optimization.optimizer_name.find("bootstrap_general_optimizer:") != 0) {
@@ -1517,6 +2211,12 @@ int main() {
     }
     if (first.graph_optimization.final_objective_us <= 0.0) {
         std::cerr << "Expected graph-level objective.\n";
+        return 1;
+    }
+    if (first.graph_optimization.passes.empty() &&
+        !first.graph_optimization.budget_exhausted &&
+        first.graph_optimization.time_budget_ms == 0u) {
+        std::cerr << "Expected graph-level passes or explicit budget exhaustion.\n";
         return 1;
     }
 
@@ -1629,16 +2329,63 @@ int main() {
         return 1;
     }
     std::cerr << "stage: partition\n";
-    if (!verify_device_agnostic_planning_and_execution()) {
-        std::cerr << "Device-agnostic planning check failed.\n";
+    if (run_long_suite) {
+        if (!verify_device_agnostic_planning_and_execution()) {
+            std::cerr << "Device-agnostic planning check failed.\n";
+            return 1;
+        }
+        std::cerr << "stage: device-agnostic\n";
+        if (!verify_aggressive_graph_rewrites()) {
+            std::cerr << "Aggressive graph rewrite check failed.\n";
+            return 1;
+        }
+        std::cerr << "stage: rewrites\n";
+    }
+    if (!verify_compiled_graph_signature_isolation()) {
+        std::cerr << "Compiled graph signature isolation check failed.\n";
         return 1;
     }
-    std::cerr << "stage: device-agnostic\n";
-    if (!verify_aggressive_graph_rewrites()) {
-        std::cerr << "Aggressive graph rewrite check failed.\n";
+    std::cerr << "stage: compiled-graph\n";
+    if (!verify_validation_tier_controls()) {
+        std::cerr << "Validation tier control check failed.\n";
         return 1;
     }
-    std::cerr << "stage: rewrites\n";
+    std::cerr << "stage: validation-tier\n";
+    if (!verify_execution_graph_indices_and_candidate_policy()) {
+        std::cerr << "Execution graph indices or candidate policy check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: execution-graph\n";
+    if (!verify_small_op_fusion_and_policy()) {
+        std::cerr << "Small-op fusion or policy check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: small-fusion\n";
+    if (!verify_graph_family_feedback_sharing()) {
+        std::cerr << "Graph family cache sharing check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: graph-family\n";
+    if (!verify_optimizer_wall_time_budget()) {
+        std::cerr << "Optimizer wall-time budget check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: budget\n";
+    if (!run_long_suite) {
+        std::cout << "operations=" << first.operations.size()
+                  << " cached=" << (second.loaded_from_cache ? "yes" : "no")
+                  << " graphs=" << runtime.devices().size()
+                  << " graph_passes=" << first.graph_optimization.passes.size()
+                  << " suite=fast"
+                  << '\n';
+
+        std::error_code ec;
+        std::filesystem::remove(plan_cache, ec);
+        std::filesystem::remove(exec_cache, ec);
+        std::filesystem::remove(exec_cache.string() + ".perf", ec);
+        std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+        return 0;
+    }
     if (!verify_runtime_graph_aware_meta_policy()) {
         std::cerr << "Runtime graph-aware meta-policy check failed.\n";
         return 1;
@@ -1696,12 +2443,14 @@ int main() {
               << " cached=" << (second.loaded_from_cache ? "yes" : "no")
               << " graphs=" << runtime.devices().size()
               << " graph_passes=" << first.graph_optimization.passes.size()
+              << " suite=long"
               << '\n';
 
     std::error_code ec;
     std::filesystem::remove(plan_cache, ec);
     std::filesystem::remove(exec_cache, ec);
     std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
     return 0;
 }
 
