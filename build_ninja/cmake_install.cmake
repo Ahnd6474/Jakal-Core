@@ -103,6 +103,18 @@ if(CMAKE_INSTALL_COMPONENT STREQUAL "docs" OR NOT CMAKE_INSTALL_COMPONENT)
 endif()
 
 if(CMAKE_INSTALL_COMPONENT STREQUAL "maintenance" OR NOT CMAKE_INSTALL_COMPONENT)
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/jakal-core/install" TYPE FILE FILES
+    "D:/GitHub/Jakal-Core/packaging/install-jakal-core.ps1"
+    "D:/GitHub/Jakal-Core/packaging/build-nsis-package.ps1"
+    "D:/GitHub/Jakal-Core/packaging/jakal-prerequisites.json"
+    )
+endif()
+
+if(CMAKE_INSTALL_COMPONENT STREQUAL "maintenance" OR NOT CMAKE_INSTALL_COMPONENT)
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/jakal-core/install/prereqs" TYPE DIRECTORY FILES "D:/GitHub/Jakal-Core/packaging/prereqs/")
+endif()
+
+if(CMAKE_INSTALL_COMPONENT STREQUAL "maintenance" OR NOT CMAKE_INSTALL_COMPONENT)
   file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/jakal-core/update" TYPE FILE FILES "D:/GitHub/Jakal-Core/packaging/update-jakal-core.ps1")
 endif()
 
@@ -149,6 +161,10 @@ if(CMAKE_INSTALL_COMPONENT STREQUAL "development" OR NOT CMAKE_INSTALL_COMPONENT
     "D:/GitHub/Jakal-Core/build_ninja/JakalCoreConfig.cmake"
     "D:/GitHub/Jakal-Core/build_ninja/JakalCoreConfigVersion.cmake"
     )
+endif()
+
+if(CMAKE_INSTALL_COMPONENT STREQUAL "runtime" OR NOT CMAKE_INSTALL_COMPONENT)
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/bin" TYPE PROGRAM FILES "D:/GitHub/Jakal-Core/build_ninja/launch-jakal-hardware-setup.cmd")
 endif()
 
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT

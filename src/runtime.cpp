@@ -2322,6 +2322,7 @@ RuntimeInstallPaths resolve_runtime_install_paths(const std::filesystem::path& i
 RuntimeOptions make_runtime_options_for_install(const std::filesystem::path& install_root) {
     RuntimeOptions options;
     const auto paths = resolve_runtime_install_paths(install_root);
+    options.install_root = paths.install_root;
     options.cache_path = paths.planner_cache_path;
     options.execution_cache_path = paths.execution_cache_path;
     options.product.observability.telemetry_path = paths.telemetry_path;
@@ -2348,7 +2349,8 @@ bool runtime_backend_supports_operation(
 Runtime::Runtime(RuntimeOptions options)
     : options_([&options]() {
           auto normalized = std::move(options);
-          const auto paths = resolve_runtime_install_paths({});
+          const auto paths = resolve_runtime_install_paths(normalized.install_root);
+          normalized.install_root = paths.install_root;
           if (normalized.cache_path.empty()) {
               normalized.cache_path = paths.planner_cache_path;
           }
@@ -2360,7 +2362,7 @@ Runtime::Runtime(RuntimeOptions options)
           }
           return normalized;
       }()),
-      install_paths_(resolve_runtime_install_paths({})),
+      install_paths_(resolve_runtime_install_paths(options_.install_root)),
       planner_(options_.cache_path),
       execution_optimizer_(options_.execution_cache_path) {
     if (options_.enable_host_probe) {

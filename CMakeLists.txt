@@ -236,6 +236,8 @@ if(JAKAL_CORE_BUILD_TESTS)
     add_executable(jakal_runtime_install_smoke tests/runtime_install_smoke.cpp)
     target_link_libraries(jakal_runtime_install_smoke PRIVATE jakal::runtime)
     add_test(NAME jakal_runtime_install_smoke COMMAND jakal_runtime_install_smoke)
+
+    add_test(NAME jakal_core_cli_doctor_json COMMAND jakal_core_cli doctor --json --host-only)
 endif()
 
 set(jakal_installable_runtime_targets jakal_core)
@@ -267,6 +269,20 @@ install(
         docs/distribution.md
     DESTINATION ${CMAKE_INSTALL_DOCDIR}
     COMPONENT docs)
+
+install(
+    FILES
+        packaging/install-jakal-core.ps1
+        packaging/build-nsis-package.ps1
+        packaging/jakal-prerequisites.json
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/install
+    COMPONENT maintenance)
+
+install(
+    DIRECTORY
+        packaging/prereqs/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/install/prereqs
+    COMPONENT maintenance)
 
 install(
     FILES
@@ -323,6 +339,17 @@ configure_file(
     IMMEDIATE
     @ONLY)
 
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/packaging/launch-jakal-hardware-setup.cmd.in
+    ${CMAKE_CURRENT_BINARY_DIR}/launch-jakal-hardware-setup.cmd
+    @ONLY)
+
+install(
+    PROGRAMS
+        ${CMAKE_CURRENT_BINARY_DIR}/launch-jakal-hardware-setup.cmd
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+    COMPONENT runtime)
+
 add_custom_target(
     uninstall
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)
@@ -348,11 +375,22 @@ if(WIN32)
         list(APPEND _jakal_cpack_generators NSIS)
         set(CPACK_NSIS_DISPLAY_NAME "Jakal-Core")
         set(CPACK_NSIS_PACKAGE_NAME "Jakal-Core")
+        set(CPACK_NSIS_EXECUTABLE "${JAKAL_CORE_MAKENSIS_EXECUTABLE}")
         set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
         set(CPACK_NSIS_MODIFY_PATH OFF)
+        set(CPACK_NSIS_MUI_FINISHPAGE_RUN "bin\\\\launch-jakal-hardware-setup.cmd")
+        set(CPACK_NSIS_CREATE_ICONS_EXTRA
+            "CreateShortCut \\\"$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\Jakal Hardware Setup.lnk\\\" \\\"$INSTDIR\\\\bin\\\\launch-jakal-hardware-setup.cmd\\\"")
+        set(CPACK_NSIS_DELETE_ICONS_EXTRA
+            "Delete \\\"$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\Jakal Hardware Setup.lnk\\\"")
         if(TARGET jakal_bootstrap)
             set(CPACK_NSIS_MENU_LINKS
                 "bin\\\\jakal_bootstrap.exe" "Jakal Bootstrap"
+                "bin\\\\launch-jakal-hardware-setup.cmd" "Jakal Hardware Setup"
+                "share\\\\doc\\\\JakalCore\\\\README.md" "README")
+        else()
+            set(CPACK_NSIS_MENU_LINKS
+                "bin\\\\launch-jakal-hardware-setup.cmd" "Jakal Hardware Setup"
                 "share\\\\doc\\\\JakalCore\\\\README.md" "README")
         endif()
     endif()

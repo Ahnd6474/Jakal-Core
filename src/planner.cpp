@@ -321,15 +321,15 @@ std::string topology_family_token(const HardwareGraph& graph) {
 PartitionAllocationBias partition_allocation_bias(const PartitionStrategy strategy) {
     switch (strategy) {
     case PartitionStrategy::blind_sharded:
-        return {0.35, 0.65};
+        return {0.42, 0.58};
     case PartitionStrategy::role_split:
-        return {0.30, 0.70};
+        return {0.40, 0.60};
     case PartitionStrategy::reduce_on_gpu:
-        return {0.20, 0.80};
+        return {0.32, 0.68};
     case PartitionStrategy::projection_sharded:
-        return {0.25, 0.75};
+        return {0.36, 0.64};
     case PartitionStrategy::tpu_like:
-        return {0.12, 0.88};
+        return {0.24, 0.76};
     case PartitionStrategy::auto_balanced:
     default:
         return {0.0, 1.0};

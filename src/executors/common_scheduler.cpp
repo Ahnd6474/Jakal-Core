@@ -8,8 +8,50 @@ namespace jakal::executors {
 
 namespace {
 
+std::uint32_t head_group_count(const OperationOptimizationResult& operation);
+
 double log_bucket(const double value) {
     return value <= 0.0 ? 0.0 : std::log2(value + 1.0);
+}
+
+std::size_t semantic_item_quantum(
+    const OperationOptimizationResult& operation,
+    const std::size_t total_items) {
+    std::size_t quantum = 1u;
+    if (operation.operation.preferred_token_block > 0u) {
+        quantum = std::max<std::size_t>(
+            quantum,
+            static_cast<std::size_t>(operation.operation.preferred_token_block));
+    }
+    if (operation.operation.attention_head_count > 0u) {
+        const auto groups = std::max<std::uint32_t>(1u, head_group_count(operation));
+        const auto head_group_span = std::max<std::size_t>(1u, total_items / static_cast<std::size_t>(groups));
+        if (head_group_span > 1u && head_group_span < total_items) {
+            quantum = std::max(quantum, head_group_span);
+        }
+    }
+    return std::max<std::size_t>(1u, quantum);
+}
+
+std::size_t align_semantic_count(
+    const std::size_t candidate,
+    const std::size_t quantum,
+    const std::size_t remaining,
+    const bool final_device) {
+    if (final_device || quantum <= 1u || remaining <= quantum) {
+        return remaining;
+    }
+    std::size_t aligned = (candidate / quantum) * quantum;
+    if (aligned == 0u && remaining >= quantum) {
+        aligned = quantum;
+    }
+    if (aligned >= remaining) {
+        aligned = (remaining / quantum) * quantum;
+        if (aligned == 0u) {
+            aligned = std::min(remaining, quantum);
+        }
+    }
+    return std::min(aligned, remaining);
 }
 
 double inference_bias(const OperationOptimizationResult& operation, const HardwareGraph& graph) {
@@ -37,6 +79,21 @@ double inference_bias(const OperationOptimizationResult& operation, const Hardwa
     if (summary.supports_asynchronous_dispatch && operation.config.overlap_transfers) {
         bias += 0.08;
     }
+    bias += std::min(std::log2(static_cast<double>(std::max(operation.config.queue_depth, 1u))) * 0.035, 0.10);
+    bias += std::min(std::log2(static_cast<double>(std::max(operation.config.stages, 1u))) * 0.030, 0.08);
+    if (operation.config.logical_partitions > 1u && operation.operation.parallelizable) {
+        bias += std::min(
+            std::log2(static_cast<double>(operation.config.logical_partitions)) * 0.025,
+            0.08);
+    }
+    if (operation.graph.predicted_memory_pressure > 0.0) {
+        const double pressure = std::clamp(operation.graph.predicted_memory_pressure, 0.0, 2.0);
+        if (graph.probe == "host") {
+            bias += pressure < 0.85 ? 0.04 : -0.05;
+        } else {
+            bias -= std::clamp((pressure - 0.80) * 0.08, 0.0, 0.12);
+        }
+    }
     if (operation.operation.attention_head_count > 0u) {
         const double head_scale =
             std::log2(static_cast<double>(std::max(operation.operation.attention_head_count, 1u)) + 1.0);
@@ -57,6 +114,20 @@ double inference_bias(const OperationOptimizationResult& operation, const Hardwa
                 operation.operation.preferred_kv_residency == "shared") {
                 bias += 0.06;
             }
+        }
+    }
+    if (operation.operation.preferred_kv_residency == "shared") {
+        bias += summary.coherent_with_host ? 0.07 : -0.04;
+        bias += summary.unified_address_space ? 0.04 : 0.0;
+    }
+    if (operation.operation.residency_sensitive_fusion) {
+        if (graph.probe == "host" &&
+            (operation.operation.preferred_kv_residency == "host" ||
+             operation.operation.preferred_kv_residency == "shared")) {
+            bias += 0.08;
+        } else if (graph.probe != "host" &&
+                   operation.operation.preferred_kv_residency == "accelerator") {
+            bias += 0.06;
         }
     }
     if ((operation.operation.input_bytes + operation.operation.output_bytes) >= (16ull * 1024ull * 1024ull) &&
@@ -146,6 +217,7 @@ std::vector<DeviceAssignment> DefaultIntraDeviceScheduler::make_assignments(
         static_cast<std::size_t>(std::max(operation.config.logical_partitions, 1u)));
     const auto semantic_head_groups = head_group_count(operation);
     const auto semantic_token_blocks = token_block_count(operation, total_items);
+    const auto semantic_quantum = semantic_item_quantum(operation, total_items);
     std::size_t consumed = 0;
 
     for (std::size_t index = 0; index < operation.config.participating_devices.size(); ++index) {
@@ -162,6 +234,7 @@ std::vector<DeviceAssignment> DefaultIntraDeviceScheduler::make_assignments(
         } else {
             count = static_cast<std::size_t>(std::llround(static_cast<double>(total_items) * ratio));
             count = std::min(count, total_items - consumed);
+            count = align_semantic_count(count, semantic_quantum, total_items - consumed, false);
         }
 
         const auto partitions = std::max(operation.config.logical_partitions, 1u);
@@ -174,6 +247,11 @@ std::vector<DeviceAssignment> DefaultIntraDeviceScheduler::make_assignments(
                 partition_count = static_cast<std::size_t>(
                     std::llround(static_cast<double>(count) / static_cast<double>(partitions)));
                 partition_count = std::min(partition_count, count - local_consumed);
+                partition_count = align_semantic_count(
+                    partition_count,
+                    semantic_quantum,
+                    count - local_consumed,
+                    false);
             }
 
             assignments.push_back(DeviceAssignment{
@@ -182,7 +260,11 @@ std::vector<DeviceAssignment> DefaultIntraDeviceScheduler::make_assignments(
                 {consumed + local_consumed, partition_count},
                 partition,
                 partitions,
-                semantic_head_groups == 0u ? 0u : (partition % semantic_head_groups),
+                semantic_head_groups == 0u
+                    ? 0u
+                    : static_cast<std::uint32_t>(
+                          ((consumed + local_consumed) / std::max<std::size_t>(semantic_quantum, 1u)) %
+                          semantic_head_groups),
                 semantic_head_groups,
                 operation.operation.preferred_token_block == 0u
                     ? 0u

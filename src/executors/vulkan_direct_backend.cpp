@@ -179,6 +179,51 @@ struct CompilerCommand {
     bool uses_glslc = false;
 };
 
+std::filesystem::path current_module_directory() {
+#if defined(_WIN32)
+    std::array<char, MAX_PATH> buffer{};
+    const auto length = GetModuleFileNameA(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0u || length >= buffer.size()) {
+        return std::filesystem::current_path();
+    }
+    return std::filesystem::path(std::string(buffer.data(), length)).parent_path();
+#else
+    std::error_code ec;
+    return std::filesystem::current_path(ec);
+#endif
+}
+
+std::vector<std::filesystem::path> shader_compiler_roots() {
+    std::vector<std::filesystem::path> roots;
+    const auto push_root = [&](const std::filesystem::path& candidate) {
+        if (candidate.empty()) {
+            return;
+        }
+        const auto normalized = candidate.lexically_normal();
+        if (std::find(roots.begin(), roots.end(), normalized) == roots.end()) {
+            roots.push_back(normalized);
+        }
+    };
+
+    if (const char* runtime_home = std::getenv("JAKAL_RUNTIME_HOME")) {
+        push_root(std::filesystem::path(runtime_home));
+    }
+    if (const char* sdk = std::getenv("VULKAN_SDK")) {
+        push_root(std::filesystem::path(sdk));
+    }
+
+    const auto module_dir = current_module_directory();
+    push_root(module_dir);
+    push_root(module_dir.parent_path());
+    push_root(module_dir / ".." / "share" / "jakal-core");
+    push_root(module_dir.parent_path() / "share" / "jakal-core");
+    push_root(module_dir.parent_path() / "share" / "jakal-core" / "install");
+    push_root(module_dir.parent_path() / "share" / "jakal-core" / "tools");
+    push_root(module_dir.parent_path() / "tools");
+    push_root(std::filesystem::current_path());
+    return roots;
+}
+
 std::string command_probe(const std::string& command) {
 #if defined(_WIN32)
     return "where \"" + command + "\" >nul 2>nul";
@@ -189,14 +234,30 @@ std::string command_probe(const std::string& command) {
 
 std::optional<CompilerCommand> locate_shader_compiler() {
     std::vector<std::string> candidates;
-    if (const char* sdk = std::getenv("VULKAN_SDK")) {
-        const auto root = std::filesystem::path(sdk);
+    if (const char* explicit_compiler = std::getenv("JAKAL_VULKAN_SHADER_COMPILER")) {
+        candidates.push_back(explicit_compiler);
+    }
+    for (const auto& root : shader_compiler_roots()) {
 #if defined(_WIN32)
         candidates.push_back((root / "Bin" / "glslc.exe").string());
         candidates.push_back((root / "Bin" / "glslangValidator.exe").string());
+        candidates.push_back((root / "bin" / "glslc.exe").string());
+        candidates.push_back((root / "bin" / "glslangValidator.exe").string());
+        candidates.push_back((root / "tools" / "vulkan" / "bin" / "glslc.exe").string());
+        candidates.push_back((root / "tools" / "vulkan" / "bin" / "glslangValidator.exe").string());
+        candidates.push_back((root / "install" / "prereqs" / "vulkan-support" / "bin" / "glslc.exe").string());
+        candidates.push_back((root / "install" / "prereqs" / "vulkan-support" / "bin" / "glslangValidator.exe").string());
+        candidates.push_back((root / "prereqs" / "vulkan-support" / "bin" / "glslc.exe").string());
+        candidates.push_back((root / "prereqs" / "vulkan-support" / "bin" / "glslangValidator.exe").string());
 #else
         candidates.push_back((root / "bin" / "glslc").string());
         candidates.push_back((root / "bin" / "glslangValidator").string());
+        candidates.push_back((root / "tools" / "vulkan" / "bin" / "glslc").string());
+        candidates.push_back((root / "tools" / "vulkan" / "bin" / "glslangValidator").string());
+        candidates.push_back((root / "install" / "prereqs" / "vulkan-support" / "bin" / "glslc").string());
+        candidates.push_back((root / "install" / "prereqs" / "vulkan-support" / "bin" / "glslangValidator").string());
+        candidates.push_back((root / "prereqs" / "vulkan-support" / "bin" / "glslc").string());
+        candidates.push_back((root / "prereqs" / "vulkan-support" / "bin" / "glslangValidator").string());
 #endif
     }
     candidates.push_back("glslc");
@@ -215,6 +276,14 @@ std::optional<CompilerCommand> locate_shader_compiler() {
     }
 
     return std::nullopt;
+}
+
+std::string shader_compiler_description() {
+    const auto compiler = locate_shader_compiler();
+    if (!compiler.has_value()) {
+        return "compiler-missing";
+    }
+    return std::string("compiler-found:") + compiler->command;
 }
 
 std::filesystem::path temp_shader_path(const std::string& key, const char* extension) {
@@ -426,18 +495,26 @@ std::optional<std::vector<std::uint32_t>> load_or_compile_glsl(
     const std::string& source,
     std::string* error_detail = nullptr) {
     if (const auto cached = load_cached_spirv(key)) {
+        if (error_detail != nullptr) {
+            *error_detail = "cache-hit";
+        }
         return cached;
     }
     const auto compiler = locate_shader_compiler();
     if (!compiler.has_value()) {
         if (error_detail != nullptr) {
-            *error_detail = "no shader compiler found";
+            *error_detail = "cache-miss; no shader compiler found";
         }
         return std::nullopt;
     }
     const auto words = compile_glsl(*compiler, key, source, error_detail);
     if (words.has_value()) {
+        if (error_detail != nullptr) {
+            *error_detail = "compiled:" + compiler->command;
+        }
         store_cached_spirv(key, *words);
+    } else if (error_detail != nullptr && !error_detail->empty()) {
+        *error_detail = "compile-failed:" + compiler->command + ": " + *error_detail;
     }
     return words;
 }
@@ -1401,14 +1478,24 @@ VulkanDirectProbeState probe_vulkan_direct_backend() {
         ShaderKind::conv3x3,
         ShaderKind::resample,
     };
+    bool cache_only_ready = true;
+    bool compiled_any_shader = false;
+    const auto compiler_detail = shader_compiler_description();
     for (const auto shader_kind : kAllShaderKinds) {
         std::string compile_error;
         if (!load_or_compile_glsl(shader_key(shader_kind), shader_source(shader_kind), &compile_error).has_value()) {
-            state.detail = "shader compile/cache failed for " + shader_key(shader_kind);
+            state.detail = "shader compile/cache failed for " + shader_key(shader_kind) +
+                           " (" + compiler_detail + ")";
             if (!compile_error.empty()) {
                 state.detail += ": " + compile_error;
             }
             return state;
+        }
+        if (compile_error.rfind("compiled:", 0u) == 0u) {
+            compiled_any_shader = true;
+            cache_only_ready = false;
+        } else if (compile_error != "cache-hit") {
+            cache_only_ready = false;
         }
     }
     auto context = create_vulkan_context();
@@ -1424,7 +1511,13 @@ VulkanDirectProbeState probe_vulkan_direct_backend() {
         }
     }
     state.available = true;
-    state.detail = "ready";
+    if (compiled_any_shader) {
+        state.detail = "ready-direct (" + compiler_detail + ")";
+    } else if (cache_only_ready) {
+        state.detail = "ready-direct (cached-shaders)";
+    } else {
+        state.detail = "ready-direct";
+    }
     return state;
 }
 

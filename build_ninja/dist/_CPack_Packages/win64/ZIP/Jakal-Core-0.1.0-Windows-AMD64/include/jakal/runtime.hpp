@@ -58,11 +58,13 @@ struct RuntimeOptions {
     bool enable_host_probe = true;
     bool enable_opencl_probe = true;
     bool enable_level_zero_probe = true;
+    bool enable_vulkan_probe = true;
     bool enable_vulkan_status = true;
     bool enable_cuda_probe = true;
     bool enable_rocm_probe = true;
     bool prefer_level_zero_over_opencl = true;
     bool eager_hardware_refresh = true;
+    std::filesystem::path install_root;
     std::filesystem::path cache_path;
     std::filesystem::path execution_cache_path;
     RuntimeProductPolicy product;

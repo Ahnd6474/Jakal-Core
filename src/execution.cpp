@@ -206,7 +206,9 @@ std::string shape_bucket_for(const OperationSpec& operation) {
 bool supports_feedback_tuned_cpu_chunk(const OperationSpec& operation) {
     return operation.op_class == OperationClass::elementwise_map ||
            operation.op_class == OperationClass::matmul ||
-           operation.op_class == OperationClass::reduction;
+           operation.op_class == OperationClass::reduction ||
+           operation.op_class == OperationClass::convolution_2d ||
+           operation.op_class == OperationClass::resample_2d;
 }
 
 std::string cpu_runtime_hint_bucket_for(const OperationSpec& operation) {
@@ -1919,7 +1921,10 @@ WorkloadSpec effective_workload_for_placement(const WorkloadSpec& workload, cons
         return effective;
     }
     effective.partition_strategy = PartitionStrategy::auto_balanced;
-    if (placement.resolved_partition_strategy != PartitionStrategy::auto_balanced) {
+    const bool accept_runtime_hint =
+        placement.resolved_partition_strategy != PartitionStrategy::auto_balanced &&
+        placement.strategy_confidence >= 0.30;
+    if (accept_runtime_hint) {
         effective.heuristic_partition_hint = placement.resolved_partition_strategy;
         effective.heuristic_partition_hint_confidence =
             std::max(effective.heuristic_partition_hint_confidence, placement.strategy_confidence);
@@ -3834,7 +3839,10 @@ bool apply_partition_strategy_execution_policy(
     const auto requested_strategy =
         placement.strategy_source == PlanStrategySource::explicit_request
             ? placement.resolved_partition_strategy
-            : workload.heuristic_partition_hint.value_or(PartitionStrategy::auto_balanced);
+            : ((workload.heuristic_partition_hint_confidence >= 0.35 &&
+                workload.heuristic_partition_hint.has_value())
+                   ? *workload.heuristic_partition_hint
+                   : PartitionStrategy::auto_balanced);
     const auto* strategy = runtime_partition_strategy(requested_strategy);
     if (strategy == nullptr) {
         return false;

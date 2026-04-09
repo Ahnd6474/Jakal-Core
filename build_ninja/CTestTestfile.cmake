@@ -26,4 +26,6 @@ add_test([=[jakal_live_backend_smoke]=] "D:/GitHub/Jakal-Core/build_ninja/jakal_
 set_tests_properties([=[jakal_live_backend_smoke]=] PROPERTIES  _BACKTRACE_TRIPLES "D:/GitHub/Jakal-Core/CMakeLists.txt;231;add_test;D:/GitHub/Jakal-Core/CMakeLists.txt;0;")
 add_test([=[jakal_runtime_install_smoke]=] "D:/GitHub/Jakal-Core/build_ninja/jakal_runtime_install_smoke.exe")
 set_tests_properties([=[jakal_runtime_install_smoke]=] PROPERTIES  _BACKTRACE_TRIPLES "D:/GitHub/Jakal-Core/CMakeLists.txt;238;add_test;D:/GitHub/Jakal-Core/CMakeLists.txt;0;")
+add_test([=[jakal_core_cli_doctor_json]=] "D:/GitHub/Jakal-Core/build_ninja/jakal_core_cli.exe" "doctor" "--json" "--host-only")
+set_tests_properties([=[jakal_core_cli_doctor_json]=] PROPERTIES  _BACKTRACE_TRIPLES "D:/GitHub/Jakal-Core/CMakeLists.txt;240;add_test;D:/GitHub/Jakal-Core/CMakeLists.txt;0;")
 subdirs("_deps/vulkan_headers-build")

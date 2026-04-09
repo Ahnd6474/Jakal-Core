@@ -362,12 +362,34 @@ const JakalToolkitVariant* find_preferred_gpu_variant(
                 variant.binding.capabilities.subgroup_matrix) {
                 score += 0.08;
             }
-            if (gpu_materialized_lowering_active(operation) &&
-                variant.binding.backend != JakalBackendKind::opencl) {
-                score += 0.03;
+            if (gpu_materialized_lowering_active(operation)) {
+                if (variant.binding.backend == JakalBackendKind::opencl) {
+                    score += operation.op_class == OperationClass::matmul ? 0.01 : 0.04;
+                } else {
+                    score += 0.03;
+                }
             }
             if (traits.streaming_friendly && variant.binding.capabilities.unified_memory) {
                 score += 0.03;
+            }
+            if (variant.binding.backend == JakalBackendKind::opencl) {
+                if (traits.op_class == OperationClass::reduction ||
+                    traits.op_class == OperationClass::elementwise_map ||
+                    traits.op_class == OperationClass::resample_2d) {
+                    score += 0.05;
+                }
+                if (traits.op_class == OperationClass::matmul &&
+                    operation.preferred_token_block > 0u &&
+                    operation.preferred_token_block <= 64u) {
+                    score += 0.03;
+                }
+                if (operation.preferred_kv_residency == "shared" ||
+                    operation.preferred_kv_residency == "host") {
+                    score += variant.binding.capabilities.unified_memory ? 0.05 : 0.02;
+                }
+                if (variant.binding.capabilities.unified_memory) {
+                    score += 0.02;
+                }
             }
             if (traits.op_class == OperationClass::resample_2d &&
                 variant.binding.backend == JakalBackendKind::vulkan_compute) {
