@@ -11,6 +11,9 @@ struct OperationSpec;
 
 namespace jakal::executors {
 
+bool host_native_kernels_compiled_with_avx512();
+bool host_native_avx512_available();
+
 bool try_run_host_native_elementwise(
     const HardwareGraph& graph,
     const OperationSpec& operation,
@@ -30,6 +33,21 @@ bool try_run_host_native_reduction(
 
 bool try_run_host_native_matmul(
     const HardwareGraph& graph,
+    const OperationSpec& operation,
+    std::span<const float> lhs,
+    std::span<const float> rhs,
+    std::uint32_t rows,
+    std::uint32_t columns,
+    std::uint32_t depth,
+    bool rhs_transposed,
+    std::uint32_t tile_m,
+    std::uint32_t tile_n,
+    std::uint32_t tile_k,
+    std::uint32_t parallel_chunk_rows,
+    std::span<float> output);
+
+bool try_run_host_native_matmul_avx512(
+    const HardwareGraph& graph,
     std::span<const float> lhs,
     std::span<const float> rhs,
     std::uint32_t rows,
@@ -44,6 +62,7 @@ bool try_run_host_native_matmul(
 
 bool try_run_host_native_low_precision_matmul(
     const HardwareGraph& graph,
+    const OperationSpec& operation,
     std::span<const float> lhs,
     std::span<const float> rhs,
     std::uint32_t rows,
@@ -57,6 +76,7 @@ bool try_run_host_native_low_precision_matmul(
 
 bool try_run_host_native_bf16_matmul(
     const HardwareGraph& graph,
+    const OperationSpec& operation,
     std::span<const float> lhs,
     std::span<const float> rhs,
     std::uint32_t rows,

@@ -1,6 +1,7 @@
 #include "jakal/execution.hpp"
 
 #include "jakal/device.hpp"
+#include "jakal/executors/host_native_kernels.hpp"
 #include "jakal/operation_variant_registry.hpp"
 #include "jakal/workloads.hpp"
 
@@ -39,7 +40,8 @@ constexpr std::uint32_t kLearningWarmupSamples = 3u;
 constexpr std::uint32_t kValidationMeasurementRounds = 2u;
 constexpr std::uint32_t kMinimumValidationMeasurementRounds = 1u;
 constexpr std::uint32_t kGraphOptimizationPasses = 4u;
-constexpr std::string_view kExecutionHeuristicRevision = "exec-r2-device-agnostic";
+constexpr std::string_view kExecutionHeuristicRevision = "exec-r3-residency-pipeline";
+constexpr std::uint64_t kDefaultCpuPackBudgetBytes = 256ull * 1024ull;
 
 struct ValidationResult {
     double reference_latency_us = 0.0;
@@ -82,6 +84,37 @@ bool gpu_materialized_lowering_active(const OperationSpec& operation) {
     }
 }
 
+bool string_contains_any(const std::string& value, std::initializer_list<const char*> needles) {
+    return std::any_of(needles.begin(), needles.end(), [&](const char* needle) {
+        return value.find(needle) != std::string::npos;
+    });
+}
+
+bool operation_is_attention_like(const OperationSpec& operation) {
+    return operation.op_class == OperationClass::matmul &&
+           string_contains_any(operation.name, {"qkv", "attn", "attention", "context", "head", "logits"});
+}
+
+bool operation_mentions_kv_cache(const OperationSpec& operation) {
+    if (string_contains_any(operation.name, {"kv", "cache"})) {
+        return true;
+    }
+    const auto tensor_mentions_kv = [](const std::vector<std::string>& tensor_ids) {
+        return std::any_of(tensor_ids.begin(), tensor_ids.end(), [](const std::string& tensor_id) {
+            return string_contains_any(tensor_id, {"kv", "cache"});
+        });
+    };
+    return tensor_mentions_kv(operation.input_tensor_ids) ||
+           tensor_mentions_kv(operation.output_tensor_ids) ||
+           tensor_mentions_kv(operation.temporary_tensor_ids);
+}
+
+bool tensor_mentions_kv_cache(const WorkloadTensor& tensor) {
+    return string_contains_any(tensor.id, {"kv", "cache"}) ||
+           string_contains_any(tensor.alias_group, {"kv", "cache"}) ||
+           string_contains_any(tensor.producer_operation, {"kv", "cache"});
+}
+
 std::string join_csv(const std::vector<std::string>& values);
 const WorkloadTensor* find_workload_tensor(const WorkloadGraph& workload_graph, std::string_view tensor_id);
 const WorkloadTensor* find_workload_tensor(const WorkloadGraph& workload_graph, const CompiledWorkloadGraph& compiled, std::string_view tensor_id);
@@ -90,6 +123,7 @@ const HardwareGraph* find_graph(
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     const std::string& uid);
 bool is_host_graph(const HardwareGraph* graph);
+bool is_host_device_uid(std::string_view uid);
 std::string tuning_signature_suffix(const ExecutionTuningOverrides* tuning_overrides);
 std::uint32_t clamp_cpu_tile_hint(
     std::uint32_t value,
@@ -153,6 +187,15 @@ std::string shape_bucket_for(const OperationSpec& operation) {
            << "|cpu.tn" << std::max(operation.cpu_tile_n, 1u)
            << "|cpu.tk" << std::max(operation.cpu_tile_k, 1u)
            << "|cpu.chunk" << std::max(operation.cpu_parallel_chunk, 1u)
+           << "|cpu.avx512:" << operation.cpu_use_avx512
+           << "|cpu.packb:" << std::max<std::uint64_t>(operation.cpu_pack_budget_bytes, 1ull)
+           << "|cpu.st:" << std::max(operation.cpu_single_thread_cutoff, 1u)
+           << "|cpu.lowp:" << operation.cpu_low_precision_kernel_family
+           << "|heads:" << std::max(operation.attention_head_count, 1u)
+           << "|headg:" << std::max(operation.attention_head_group_size, 1u)
+           << "|tokb:" << std::max(operation.preferred_token_block, 1u)
+           << "|kvres:" << operation.preferred_kv_residency
+           << "|resfuse:" << operation.residency_sensitive_fusion
            << "|gpu.u" << std::max(operation.gpu_micro_kernel_unroll, 1u);
     for (const auto& fused : operation.fused_operation_names) {
         stream << "|f:" << fused;
@@ -188,6 +231,10 @@ std::string cpu_runtime_hint_bucket_for(const OperationSpec& operation) {
 }
 
 bool supports_feedback_tuned_cpu_tiles(const OperationSpec& operation) {
+    return operation.op_class == OperationClass::matmul;
+}
+
+bool supports_feedback_tuned_cpu_avx512(const OperationSpec& operation) {
     return operation.op_class == OperationClass::matmul;
 }
 
@@ -275,6 +322,48 @@ std::uint32_t clamp_tile_feedback_hint(
     return clamp_cpu_tile_hint(std::max(value, minimum), extent, multiple, minimum);
 }
 
+std::uint64_t matmul_tile_working_set_bytes(
+    const std::uint32_t tile_m,
+    const std::uint32_t tile_n,
+    const std::uint32_t tile_k) {
+    const std::uint64_t lhs_bytes = static_cast<std::uint64_t>(tile_m) * tile_k * sizeof(float);
+    const std::uint64_t rhs_bytes = static_cast<std::uint64_t>(tile_k) * tile_n * sizeof(float);
+    const std::uint64_t out_bytes = static_cast<std::uint64_t>(tile_m) * tile_n * sizeof(float);
+    return lhs_bytes + rhs_bytes + out_bytes;
+}
+
+void fit_tiles_to_cache_budget(
+    const std::uint64_t cache_budget_bytes,
+    const std::uint32_t rows,
+    const std::uint32_t columns,
+    const std::uint32_t depth,
+    std::uint32_t& tile_m,
+    std::uint32_t& tile_n,
+    std::uint32_t& tile_k) {
+    if (cache_budget_bytes == 0u) {
+        tile_m = clamp_cpu_tile_hint(tile_m, rows, 4u, 4u);
+        tile_n = clamp_cpu_tile_hint(tile_n, columns, 8u, 8u);
+        tile_k = clamp_cpu_tile_hint(tile_k, depth, 8u, 8u);
+        return;
+    }
+
+    tile_m = clamp_cpu_tile_hint(tile_m, rows, 4u, 4u);
+    tile_n = clamp_cpu_tile_hint(tile_n, columns, 8u, 8u);
+    tile_k = clamp_cpu_tile_hint(tile_k, depth, 8u, 8u);
+
+    while (matmul_tile_working_set_bytes(tile_m, tile_n, tile_k) > cache_budget_bytes) {
+        if (tile_k >= tile_n && tile_k > 16u) {
+            tile_k = std::max<std::uint32_t>(16u, tile_k - 8u);
+        } else if (tile_n >= tile_m && tile_n > 16u) {
+            tile_n = std::max<std::uint32_t>(16u, tile_n - 8u);
+        } else if (tile_m > 4u) {
+            tile_m = std::max<std::uint32_t>(4u, tile_m - 4u);
+        } else {
+            break;
+        }
+    }
+}
+
 void feedback_adjusted_cpu_tiles(
     const OperationSpec& operation,
     const std::vector<HardwareGraph>& graphs,
@@ -287,6 +376,7 @@ void feedback_adjusted_cpu_tiles(
     const bool wide_vectors = summary.native_vector_bits >= 512u;
     const bool large_cache = summary.cache_bytes >= (2ull * kMiB);
     const bool tight_cache = summary.cache_bytes > 0u && summary.cache_bytes < (512ull * kKiB);
+    const auto parallelism = std::max(host_parallelism_hint(graphs), 1u);
     const bool latency_regressed =
         predicted_latency_us > 0.0 && effective_latency_us > (predicted_latency_us * 1.08);
     const bool latency_improved =
@@ -295,25 +385,28 @@ void feedback_adjusted_cpu_tiles(
     const auto rows = static_cast<std::uint32_t>(operation.extents.size() > 0u ? operation.extents[0] : 1u);
     const auto columns = static_cast<std::uint32_t>(operation.extents.size() > 1u ? operation.extents[1] : 1u);
     const auto depth = static_cast<std::uint32_t>(operation.extents.size() > 2u ? operation.extents[2] : 1u);
+    const bool column_heavy = columns >= (rows * 2u);
+    const bool row_heavy = rows >= (columns * 2u);
+    const bool depth_heavy = depth >= (std::max(rows, columns) * 2u);
 
     tile_m = std::max(tile_m, 4u);
     tile_n = std::max(tile_n, 8u);
     tile_k = std::max(tile_k, 8u);
 
     if (latency_regressed) {
-        if (rows >= 192u && (large_cache || wide_vectors)) {
+        if ((rows >= 192u || row_heavy) && (large_cache || wide_vectors)) {
             tile_m += wide_vectors ? 8u : 4u;
-        } else if (rows <= 32u) {
+        } else if (rows <= 32u || column_heavy) {
             tile_m = std::max<std::uint32_t>(4u, tile_m - 4u);
         }
 
-        if (columns >= 192u && large_cache) {
+        if ((columns >= 192u || column_heavy) && large_cache) {
             tile_n += wide_vectors ? 16u : 8u;
-        } else if (columns <= 64u) {
+        } else if (columns <= 64u || row_heavy) {
             tile_n = std::max<std::uint32_t>(16u, tile_n - 8u);
         }
 
-        if (depth >= 192u && (large_cache || operation.cpu_micro_kernel_unroll >= 4u)) {
+        if ((depth >= 192u || depth_heavy) && (large_cache || operation.cpu_micro_kernel_unroll >= 4u)) {
             tile_k += wide_vectors ? 32u : 16u;
         } else if (depth <= 64u || tight_cache) {
             tile_k = std::max<std::uint32_t>(16u, tile_k - 8u);
@@ -330,9 +423,49 @@ void feedback_adjusted_cpu_tiles(
         }
     }
 
+    if (parallelism >= 12u && rows >= 256u && tile_m < 64u) {
+        tile_m += 8u;
+    }
+    const auto cache_budget = summary.cache_bytes == 0u
+        ? 256ull * kKiB
+        : std::max<std::uint64_t>(128ull * kKiB, summary.cache_bytes / (large_cache ? 2ull : 3ull));
+    fit_tiles_to_cache_budget(cache_budget, rows, columns, depth, tile_m, tile_n, tile_k);
     tile_m = clamp_tile_feedback_hint(tile_m, rows, 4u, 4u);
     tile_n = clamp_tile_feedback_hint(tile_n, columns, 8u, 8u);
     tile_k = clamp_tile_feedback_hint(tile_k, depth, 8u, 8u);
+}
+
+bool feedback_adjusted_cpu_avx512_choice(
+    const OperationSpec& operation,
+    const std::vector<HardwareGraph>& graphs,
+    const double effective_latency_us,
+    const double predicted_latency_us) {
+    const auto summary = strongest_host_summary(graphs);
+    if (summary.native_vector_bits < 512u || !executors::host_native_kernels_compiled_with_avx512()) {
+        return false;
+    }
+    const auto rows = static_cast<std::uint32_t>(operation.extents.size() > 0u ? operation.extents[0] : 1u);
+    const auto columns = static_cast<std::uint32_t>(operation.extents.size() > 1u ? operation.extents[1] : 1u);
+    const auto depth = static_cast<std::uint32_t>(operation.extents.size() > 2u ? operation.extents[2] : 1u);
+    const std::uint64_t work_items =
+        static_cast<std::uint64_t>(rows) * columns * depth;
+    const bool small_problem =
+        rows < 64u || columns < 64u || depth < 64u || work_items < (1ull << 20u);
+    const bool medium_problem =
+        rows >= 128u && columns >= 128u && depth >= 128u && work_items >= (1ull << 22u);
+    const bool latency_regressed =
+        predicted_latency_us > 0.0 && effective_latency_us > (predicted_latency_us * 1.08);
+
+    if (operation.cpu_use_avx512) {
+        if ((small_problem || work_items < (1ull << 22u)) && latency_regressed) {
+            return false;
+        }
+        return true;
+    }
+    if (medium_problem && latency_regressed) {
+        return true;
+    }
+    return operation.cpu_use_avx512;
 }
 
 template <typename T>
@@ -412,6 +545,104 @@ OperationSpec* find_workload_operation_mutable(WorkloadGraph& workload_graph, co
 std::uint64_t tensor_bytes_of(const WorkloadGraph& graph, const std::string& tensor_id) {
     const auto* tensor = find_workload_tensor(graph, tensor_id);
     return tensor == nullptr ? 0ull : tensor->bytes;
+}
+
+double operation_working_set_bytes(const OperationSpec& operation);
+bool should_prefer_host_for_llm_operation(const WorkloadSpec& workload, const OperationSpec& operation);
+bool should_prefer_accelerator_for_llm_operation(const WorkloadSpec& workload, const OperationSpec& operation);
+bool should_prefer_host_for_phase_operation(const WorkloadSpec& workload, const OperationSpec& operation);
+bool should_prefer_accelerator_for_phase_operation(const WorkloadSpec& workload, const OperationSpec& operation);
+std::uint32_t choose_attention_head_count_hint(const WorkloadSpec& workload, const OperationSpec& operation);
+std::uint32_t choose_attention_head_group_size_hint(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const HardwareGraphSummary& host_summary);
+std::uint32_t choose_token_block_hint(const WorkloadSpec& workload, const OperationSpec& operation);
+std::string choose_kv_residency_hint(const WorkloadSpec& workload, const OperationSpec& operation);
+std::uint32_t desired_semantic_partition_count(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const ExecutionConfig& config);
+
+bool placement_has_host_and_accelerator(
+    const ExecutionPlan& placement,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup) {
+    bool has_host = false;
+    bool has_accelerator = false;
+    for (const auto& allocation : placement.allocations) {
+        const auto it = graph_lookup.find(allocation.device.uid);
+        if (it == graph_lookup.end() || it->second == nullptr) {
+            continue;
+        }
+        has_host = has_host || it->second->probe == "host";
+        has_accelerator = has_accelerator || it->second->probe != "host";
+        if (has_host && has_accelerator) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool should_preserve_host_preferred_tail_boundary(
+    const WorkloadSpec& workload,
+    const ExecutionPlan& placement,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    const OperationSpec& producer,
+    const OperationSpec& consumer) {
+    if (!placement_has_host_and_accelerator(placement, graph_lookup)) {
+        return false;
+    }
+
+    const auto phase = canonical_workload_phase(workload);
+    if (phase != WorkloadPhase::decode && phase != WorkloadPhase::prefill) {
+        return false;
+    }
+
+    const bool producer_accelerator_preferred =
+        should_prefer_accelerator_for_llm_operation(workload, producer) ||
+        should_prefer_accelerator_for_phase_operation(workload, producer);
+    const bool consumer_host_preferred =
+        should_prefer_host_for_llm_operation(workload, consumer) ||
+        should_prefer_host_for_phase_operation(workload, consumer);
+    if (!producer_accelerator_preferred || !consumer_host_preferred) {
+        return false;
+    }
+
+    const bool producer_is_compute_bulk =
+        producer.op_class == OperationClass::matmul ||
+        producer.op_class == OperationClass::convolution_2d ||
+        producer.op_class == OperationClass::resample_2d;
+    const bool consumer_is_tail =
+        consumer.op_class == OperationClass::elementwise_map ||
+        consumer.op_class == OperationClass::reduction ||
+        consumer.name.find("sample") != std::string::npos ||
+        consumer.name.find("kv") != std::string::npos ||
+        consumer.name.find("cache") != std::string::npos;
+    return producer_is_compute_bulk && consumer_is_tail;
+}
+
+bool should_block_residency_sensitive_fusion(
+    const WorkloadGraph& graph,
+    const OperationSpec& producer,
+    const OperationSpec& consumer) {
+    if (!producer.residency_sensitive_fusion && !consumer.residency_sensitive_fusion) {
+        return false;
+    }
+    if (producer.output_tensor_ids.empty()) {
+        return false;
+    }
+    const auto* intermediate = find_workload_tensor(graph, producer.output_tensor_ids.front());
+    if (intermediate == nullptr) {
+        return false;
+    }
+
+    const bool kv_intermediate = tensor_mentions_kv_cache(*intermediate);
+    const bool residency_boundary =
+        producer.preferred_kv_residency != consumer.preferred_kv_residency &&
+        producer.preferred_kv_residency != "auto" &&
+        consumer.preferred_kv_residency != "auto";
+    const bool pinned_for_host = intermediate->host_visible || intermediate->persistent;
+    return kv_intermediate || residency_boundary || pinned_for_host;
 }
 
 bool can_fuse_epilogue_elementwise(
@@ -910,6 +1141,10 @@ void apply_cpu_runtime_tuning_hints(
     OperationSpec& operation,
     const HardwareGraphSummary& host_summary) {
     operation.cpu_parallel_chunk = choose_cpu_parallel_chunk_hint(operation, host_summary);
+    operation.cpu_pack_budget_bytes = 0u;
+    operation.cpu_single_thread_cutoff = 0u;
+    operation.cpu_use_avx512 = false;
+    operation.cpu_low_precision_kernel_family = "auto";
     if (operation.op_class != OperationClass::matmul) {
         return;
     }
@@ -920,6 +1155,13 @@ void apply_cpu_runtime_tuning_hints(
     const bool wide_vectors = host_summary.native_vector_bits >= 512u;
     const bool large_cache = host_summary.cache_bytes >= (2ull * kMiB);
     const bool tight_cache = host_summary.cache_bytes > 0u && host_summary.cache_bytes < (512ull * kKiB);
+    const bool column_heavy = columns >= (rows * 2u);
+    const bool row_heavy = rows >= (columns * 2u);
+    const bool depth_heavy = depth >= (std::max(rows, columns) * 2u);
+    const auto parallelism =
+        std::max<std::uint32_t>(1u, std::max(host_summary.execution_objects, 1u));
+    const std::uint64_t work_items =
+        static_cast<std::uint64_t>(rows) * columns * depth;
 
     std::uint32_t tile_m = wide_vectors ? 48u : 32u;
     std::uint32_t tile_n = wide_vectors ? 64u : 48u;
@@ -935,16 +1177,58 @@ void apply_cpu_runtime_tuning_hints(
         tile_k = std::max<std::uint32_t>(32u, tile_k - 32u);
     }
 
+    if (column_heavy) {
+        tile_m = std::max<std::uint32_t>(16u, tile_m - 8u);
+        tile_n += wide_vectors ? 16u : 8u;
+    } else if (row_heavy) {
+        tile_m += wide_vectors ? 16u : 8u;
+        tile_n = std::max<std::uint32_t>(32u, tile_n - 8u);
+    }
+    if (depth_heavy) {
+        tile_k += wide_vectors ? 32u : 16u;
+    } else if (depth <= 64u) {
+        tile_k = std::max<std::uint32_t>(32u, tile_k - 16u);
+    }
+    if (parallelism >= 12u && rows >= 128u) {
+        tile_m += 8u;
+    }
+
     if (operation.cpu_micro_kernel_unroll >= 4u) {
         tile_k += 16u;
     }
     if (!operation.fused_operation_names.empty()) {
         tile_n = std::max<std::uint32_t>(32u, tile_n - 8u);
+        tile_k = std::max<std::uint32_t>(32u, tile_k - 8u);
     }
 
+    const auto cache_budget = host_summary.cache_bytes == 0u
+        ? 256ull * kKiB
+        : std::max<std::uint64_t>(128ull * kKiB, host_summary.cache_bytes / (large_cache ? 2ull : 3ull));
+    fit_tiles_to_cache_budget(cache_budget, rows, columns, depth, tile_m, tile_n, tile_k);
     operation.cpu_tile_m = clamp_cpu_tile_hint(tile_m, rows, 4u, 4u);
     operation.cpu_tile_n = clamp_cpu_tile_hint(tile_n, columns, 8u, 8u);
     operation.cpu_tile_k = clamp_cpu_tile_hint(tile_k, depth, 8u, 8u);
+    operation.cpu_pack_budget_bytes = std::max<std::uint64_t>(
+        64ull * kKiB,
+        std::min<std::uint64_t>(cache_budget, host_summary.cache_bytes == 0u ? cache_budget : host_summary.cache_bytes / 2ull));
+    operation.cpu_single_thread_cutoff = work_items >= (1ull << 22u)
+        ? 1u << 18u
+        : (work_items >= (1ull << 18u) ? 1u << 16u : 1u << 14u);
+    operation.cpu_use_avx512 =
+        executors::host_native_kernels_compiled_with_avx512() &&
+        wide_vectors &&
+        !tight_cache &&
+        rows >= 128u &&
+        columns >= 128u &&
+        depth >= 128u &&
+        work_items >= (1ull << 23u);
+    if (host_summary.supports_bf16 && host_summary.native_vector_bits >= 512u && depth >= 128u) {
+        operation.cpu_low_precision_kernel_family = "bf16-blocked";
+    } else if (host_summary.supports_fp16 && host_summary.native_vector_bits >= 256u) {
+        operation.cpu_low_precision_kernel_family = "fp16-blocked";
+    } else {
+        operation.cpu_low_precision_kernel_family = "scalar-emulated";
+    }
 }
 
 void apply_operation_lowering_hints(
@@ -976,6 +1260,15 @@ void apply_operation_lowering_hints(
         operation.cpu_tile_n = 0u;
         operation.cpu_tile_k = 0u;
         operation.cpu_parallel_chunk = 0u;
+        operation.cpu_use_avx512 = false;
+        operation.cpu_pack_budget_bytes = 0u;
+        operation.cpu_single_thread_cutoff = 0u;
+        operation.cpu_low_precision_kernel_family = "auto";
+        operation.attention_head_count = 0u;
+        operation.attention_head_group_size = 0u;
+        operation.preferred_token_block = 0u;
+        operation.preferred_kv_residency = "auto";
+        operation.residency_sensitive_fusion = false;
 
         switch (operation.op_class) {
         case OperationClass::matmul: {
@@ -1015,6 +1308,14 @@ void apply_operation_lowering_hints(
                 operation.gpu_output_layout = "gpu-fused-epilogue";
                 operation.temporary_bytes += operation.output_bytes / 8u;
             }
+            operation.attention_head_count = choose_attention_head_count_hint(workload, operation);
+            operation.attention_head_group_size =
+                choose_attention_head_group_size_hint(workload, operation, host_summary);
+            operation.preferred_token_block = choose_token_block_hint(workload, operation);
+            operation.preferred_kv_residency = choose_kv_residency_hint(workload, operation);
+            operation.residency_sensitive_fusion =
+                operation.preferred_kv_residency != "auto" &&
+                (operation_is_attention_like(operation) || operation_mentions_kv_cache(operation));
             break;
         }
         case OperationClass::convolution_2d:
@@ -1042,6 +1343,9 @@ void apply_operation_lowering_hints(
             operation.gpu_tensorized = has_accelerator && accelerator_summary.supports_asynchronous_dispatch;
             operation.cpu_micro_kernel_unroll = operation.cpu_vectorized ? 2u : 1u;
             operation.gpu_micro_kernel_unroll = operation.gpu_tensorized ? 2u : 1u;
+            operation.preferred_kv_residency = choose_kv_residency_hint(workload, operation);
+            operation.residency_sensitive_fusion =
+                operation.preferred_kv_residency != "auto" && operation_mentions_kv_cache(operation);
             break;
         case OperationClass::reduction:
             operation.cpu_input_layout = "cpu-reduction-linear";
@@ -1059,6 +1363,9 @@ void apply_operation_lowering_hints(
             if (!operation.fused_operation_names.empty()) {
                 operation.temporary_bytes += std::max<std::uint64_t>(operation.output_bytes / 8u, 16u);
             }
+            operation.preferred_kv_residency = choose_kv_residency_hint(workload, operation);
+            operation.residency_sensitive_fusion =
+                operation.preferred_kv_residency != "auto" && operation_mentions_kv_cache(operation);
             break;
         case OperationClass::resample_2d:
         default:
@@ -1108,6 +1415,18 @@ void optimize_workload_operations_for_targets(
                                    producer.output_tensor_ids.front()) != operation.input_tensor_ids.end();
                     });
                 if (consumer_it == graph.operations.end()) {
+                    continue;
+                }
+                if (should_preserve_host_preferred_tail_boundary(
+                        workload,
+                        placement,
+                        graph_lookup,
+                        producer,
+                        *consumer_it) ||
+                    should_block_residency_sensitive_fusion(
+                        graph,
+                        producer,
+                        *consumer_it)) {
                     continue;
                 }
                 if (fuse_epilogue_elementwise_into_producer(
@@ -1168,6 +1487,9 @@ void optimize_workload_operations_for_targets(
             if (consumer_it == graph.operations.end()) {
                 continue;
             }
+            if (should_block_residency_sensitive_fusion(graph, producer, *consumer_it)) {
+                continue;
+            }
             if (fuse_elementwise_into_reduction(graph, producer.name, consumer_it->name)) {
                 changed = true;
                 break;
@@ -1193,6 +1515,9 @@ void optimize_workload_operations_for_targets(
                                producer.output_tensor_ids.front()) != operation.input_tensor_ids.end();
                 });
             if (consumer_it == graph.operations.end()) {
+                continue;
+            }
+            if (should_block_residency_sensitive_fusion(graph, producer, *consumer_it)) {
                 continue;
             }
             if (fuse_reduction_epilogue_elementwise(graph, producer.name, consumer_it->name)) {
@@ -1237,6 +1562,18 @@ void optimize_workload_operations_for_targets(
                                first_consumer_it->output_tensor_ids.front()) != operation.input_tensor_ids.end();
                 });
             if (second_consumer_it == graph.operations.end()) {
+                continue;
+            }
+            if (should_preserve_host_preferred_tail_boundary(
+                    workload,
+                    placement,
+                    graph_lookup,
+                    producer,
+                    *first_consumer_it) ||
+                should_block_residency_sensitive_fusion(
+                    graph,
+                    producer,
+                    *first_consumer_it)) {
                 continue;
             }
             if (fuse_producer_elementwise_chain(
@@ -1537,9 +1874,19 @@ const PerformanceSummary* best_graph_family_summary(
 
 WorkloadSpec effective_workload_for_placement(const WorkloadSpec& workload, const ExecutionPlan& placement) {
     auto effective = workload;
-    if (placement.resolved_partition_strategy != PartitionStrategy::auto_balanced ||
-        workload.partition_strategy == PartitionStrategy::auto_balanced) {
+    if (placement.strategy_source == PlanStrategySource::explicit_request) {
         effective.partition_strategy = placement.resolved_partition_strategy;
+        return effective;
+    }
+    effective.partition_strategy = PartitionStrategy::auto_balanced;
+    if (placement.resolved_partition_strategy != PartitionStrategy::auto_balanced) {
+        effective.heuristic_partition_hint = placement.resolved_partition_strategy;
+        effective.heuristic_partition_hint_confidence =
+            std::max(effective.heuristic_partition_hint_confidence, placement.strategy_confidence);
+        effective.heuristic_partition_hint_reason =
+            placement.strategy_reason.empty()
+                ? ("runtime-managed hint for " + to_string(placement.resolved_partition_strategy))
+                : placement.strategy_reason;
     }
     return effective;
 }
@@ -2052,29 +2399,82 @@ std::uint32_t operation_index_or_default(
 }
 
 std::vector<std::string> resident_devices_for_tensor(
+    const WorkloadSpec& workload,
     const WorkloadTensor& tensor,
+    const OperationSpec& consumer,
     const ExecutionConfig& current_config,
     const std::unordered_map<std::string, ExecutionConfig>& selected_configs) {
-    if (tensor.producer_operation.empty()) {
+    std::vector<std::string> devices;
+    auto append_devices = [&](const std::vector<std::string>& source) {
+        for (const auto& device_uid : source) {
+            append_unique(devices, device_uid);
+        }
+    };
+
+    if (!tensor.producer_operation.empty()) {
+        if (const auto config_it = selected_configs.find(tensor.producer_operation); config_it != selected_configs.end()) {
+            if (!config_it->second.participating_devices.empty()) {
+                append_devices(config_it->second.participating_devices);
+            } else if (!config_it->second.primary_device_uid.empty()) {
+                append_unique(devices, config_it->second.primary_device_uid);
+            }
+        }
+    }
+
+    if (devices.empty() && tensor.producer_operation.empty()) {
+        append_unique(devices, std::string("host"));
+    }
+    if (devices.empty()) {
+        if (!current_config.participating_devices.empty()) {
+            append_devices(current_config.participating_devices);
+        } else if (!current_config.primary_device_uid.empty()) {
+            append_unique(devices, current_config.primary_device_uid);
+        }
+    }
+
+    const bool kv_tensor = tensor_mentions_kv_cache(tensor);
+    const bool decode_like =
+        canonical_workload_phase(workload) == WorkloadPhase::decode ||
+        canonical_workload_phase(workload) == WorkloadPhase::cache_update;
+
+    if ((kv_tensor || tensor.host_visible) && consumer.preferred_kv_residency == "shared") {
+        if (!current_config.participating_devices.empty()) {
+            append_devices(current_config.participating_devices);
+        } else if (!current_config.primary_device_uid.empty()) {
+            append_unique(devices, current_config.primary_device_uid);
+        }
+        if (tensor.host_visible || decode_like) {
+            append_unique(devices, std::string("host"));
+        }
+    } else if (kv_tensor && consumer.preferred_kv_residency == "host") {
+        devices.erase(
+            std::remove_if(devices.begin(), devices.end(), [](const std::string& uid) { return !is_host_device_uid(uid); }),
+            devices.end());
+        if (devices.empty()) {
+            append_unique(devices, std::string("host"));
+        }
+    } else if (kv_tensor && consumer.preferred_kv_residency == "accelerator") {
+        std::vector<std::string> accelerator_devices;
+        if (!current_config.participating_devices.empty()) {
+            for (const auto& uid : current_config.participating_devices) {
+                if (!is_host_device_uid(uid)) {
+                    append_unique(accelerator_devices, uid);
+                }
+            }
+        } else if (!current_config.primary_device_uid.empty() && !is_host_device_uid(current_config.primary_device_uid)) {
+            append_unique(accelerator_devices, current_config.primary_device_uid);
+        }
+        if (!accelerator_devices.empty()) {
+            return accelerator_devices;
+        }
+    } else if (tensor.host_visible && decode_like) {
+        append_unique(devices, std::string("host"));
+    }
+
+    if (devices.empty()) {
         return {"host"};
     }
-
-    if (const auto config_it = selected_configs.find(tensor.producer_operation); config_it != selected_configs.end()) {
-        if (!config_it->second.participating_devices.empty()) {
-            return config_it->second.participating_devices;
-        }
-        if (!config_it->second.primary_device_uid.empty()) {
-            return {config_it->second.primary_device_uid};
-        }
-    }
-
-    if (!current_config.participating_devices.empty()) {
-        return current_config.participating_devices;
-    }
-    if (!current_config.primary_device_uid.empty()) {
-        return {current_config.primary_device_uid};
-    }
-    return {"host"};
+    return devices;
 }
 
 std::uint64_t bytes_for_tensor_mapping(
@@ -2162,6 +2562,15 @@ std::string build_report_signature(
                << ':' << std::max(operation.cpu_tile_n, 1u)
                << ':' << std::max(operation.cpu_tile_k, 1u)
                << ':' << std::max(operation.cpu_parallel_chunk, 1u)
+               << ':' << operation.cpu_use_avx512
+               << ':' << std::max<std::uint64_t>(operation.cpu_pack_budget_bytes, 1ull)
+               << ':' << std::max(operation.cpu_single_thread_cutoff, 1u)
+               << ':' << operation.cpu_low_precision_kernel_family
+               << ':' << std::max(operation.attention_head_count, 1u)
+               << ':' << std::max(operation.attention_head_group_size, 1u)
+               << ':' << std::max(operation.preferred_token_block, 1u)
+               << ':' << operation.preferred_kv_residency
+               << ':' << operation.residency_sensitive_fusion
                << ':' << std::max(operation.gpu_micro_kernel_unroll, 1u);
         for (const auto& fused : operation.fused_operation_names) {
             stream << ":fused=" << fused;
@@ -2191,6 +2600,145 @@ double operation_compute_intensity(const OperationSpec& operation) {
         return operation.matrix_friendly ? 32.0 : 8.0;
     }
     return operation.estimated_flops / operation_working_set_bytes(operation);
+}
+
+std::uint32_t round_down_to_power_of_two(std::uint32_t value) {
+    if (value <= 1u) {
+        return 1u;
+    }
+    std::uint32_t result = 1u;
+    while ((result << 1u) <= value) {
+        result <<= 1u;
+    }
+    return result;
+}
+
+std::uint32_t choose_attention_head_count_hint(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation) {
+    if (!operation_is_attention_like(operation)) {
+        return 0u;
+    }
+    if (operation.extents.size() > 1u) {
+        const auto width = static_cast<std::uint32_t>(std::max<std::uint64_t>(operation.extents[1], 1ull));
+        if (width >= 2048u) {
+            return 64u;
+        }
+        if (width >= 1024u) {
+            return 32u;
+        }
+        if (width >= 512u) {
+            return 16u;
+        }
+    }
+    switch (canonical_workload_phase(workload)) {
+    case WorkloadPhase::prefill:
+        return 32u;
+    case WorkloadPhase::decode:
+        return 16u;
+    default:
+        return 8u;
+    }
+}
+
+std::uint32_t choose_attention_head_group_size_hint(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const HardwareGraphSummary& host_summary) {
+    if (operation.attention_head_count == 0u) {
+        return 0u;
+    }
+    std::uint32_t group_size = canonical_workload_phase(workload) == WorkloadPhase::decode ? 4u : 8u;
+    if (host_summary.native_vector_bits >= 512u) {
+        group_size *= 2u;
+    }
+    if (operation.attention_head_count <= 8u) {
+        group_size = std::max<std::uint32_t>(1u, operation.attention_head_count);
+    }
+    return round_down_to_power_of_two(std::min(group_size, std::max(operation.attention_head_count, 1u)));
+}
+
+std::uint32_t choose_token_block_hint(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation) {
+    if (!operation_is_attention_like(operation)) {
+        return 0u;
+    }
+    const auto rows = static_cast<std::uint32_t>(operation.extents.empty() ? 1ull : std::max<std::uint64_t>(operation.extents[0], 1ull));
+    if (canonical_workload_phase(workload) == WorkloadPhase::prefill) {
+        if (rows >= 1024u) {
+            return 128u;
+        }
+        if (rows >= 256u) {
+            return 64u;
+        }
+        return 32u;
+    }
+    if (rows >= 256u) {
+        return 32u;
+    }
+    if (rows >= 64u) {
+        return 16u;
+    }
+    return 8u;
+}
+
+std::string choose_kv_residency_hint(const WorkloadSpec& workload, const OperationSpec& operation) {
+    const auto phase = canonical_workload_phase(workload);
+    if (operation_mentions_kv_cache(operation)) {
+        if (phase == WorkloadPhase::decode || phase == WorkloadPhase::cache_update) {
+            return "host";
+        }
+        if (phase == WorkloadPhase::prefill) {
+            return "shared";
+        }
+    }
+    if (operation_is_attention_like(operation)) {
+        if (phase == WorkloadPhase::decode) {
+            return "shared";
+        }
+        if (phase == WorkloadPhase::prefill) {
+            return "accelerator";
+        }
+    }
+    return "auto";
+}
+
+std::uint32_t attention_head_group_count(const OperationSpec& operation) {
+    if (operation.attention_head_count == 0u) {
+        return 1u;
+    }
+    const auto group_size = std::max(operation.attention_head_group_size, 1u);
+    return std::max<std::uint32_t>(1u, (operation.attention_head_count + group_size - 1u) / group_size);
+}
+
+std::uint32_t attention_token_block_count(const OperationSpec& operation) {
+    if (operation.preferred_token_block == 0u || operation.extents.empty()) {
+        return 1u;
+    }
+    const auto rows = static_cast<std::uint32_t>(std::max<std::uint64_t>(operation.extents[0], 1ull));
+    return std::max<std::uint32_t>(1u, (rows + operation.preferred_token_block - 1u) / operation.preferred_token_block);
+}
+
+std::uint32_t desired_semantic_partition_count(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const ExecutionConfig& config) {
+    if (!operation.parallelizable) {
+        return 1u;
+    }
+    std::uint32_t desired = 1u;
+    const auto head_groups = attention_head_group_count(operation);
+    const auto token_blocks = attention_token_block_count(operation);
+    if (canonical_workload_phase(workload) == WorkloadPhase::decode) {
+        desired = std::max(desired, head_groups);
+    } else if (canonical_workload_phase(workload) == WorkloadPhase::prefill) {
+        desired = std::max(desired, std::max(head_groups, token_blocks));
+    }
+    if (config.participating_devices.size() > 1u && operation.attention_head_count > 0u) {
+        desired = std::max<std::uint32_t>(desired, static_cast<std::uint32_t>(config.participating_devices.size()));
+    }
+    return std::clamp(desired, 1u, 8u);
 }
 
 std::string tuning_signature_suffix(const ExecutionTuningOverrides* tuning_overrides) {
@@ -2497,9 +3045,15 @@ void configure_tiles(const OperationSpec& operation, const HardwareGraphSummary&
 
     switch (operation.op_class) {
     case OperationClass::matmul:
-        config.tile_x = std::clamp(round_up_to_multiple(lanes * 8u, 16u), 32u, 128u);
-        config.tile_y = config.tile_x;
-        config.tile_k = std::clamp(round_up_to_multiple(vector_width * 8u, 8u), 16u, 128u);
+        config.tile_x = accelerator_lowering
+            ? std::clamp(round_up_to_multiple(lanes * 8u, 16u), 32u, 128u)
+            : std::max(operation.cpu_tile_m, 16u);
+        config.tile_y = accelerator_lowering
+            ? config.tile_x
+            : std::max(operation.cpu_tile_n, 16u);
+        config.tile_k = accelerator_lowering
+            ? std::clamp(round_up_to_multiple(vector_width * 8u, 8u), 16u, 128u)
+            : std::max(operation.cpu_tile_k, 16u);
         if (vectorized) {
             config.tile_x = std::clamp(config.tile_x + 16u, 32u, 192u);
             config.tile_y = std::clamp(config.tile_y + 16u, 32u, 192u);
@@ -2592,6 +3146,10 @@ bool is_host_graph(const HardwareGraph* graph) {
     return graph != nullptr && graph->probe == "host";
 }
 
+bool is_host_device_uid(const std::string_view uid) {
+    return uid == "host" || uid.rfind("host:", 0) == 0;
+}
+
 bool is_llm_cpu_exploration_workload(const WorkloadSpec& workload) {
     return workload.dataset_tag.rfind("llm-", 0) == 0;
 }
@@ -2654,6 +3212,51 @@ bool should_prefer_accelerator_for_llm_operation(const WorkloadSpec& workload, c
     return false;
 }
 
+bool should_prefer_host_for_phase_operation(const WorkloadSpec& workload, const OperationSpec& operation) {
+    const std::string_view name = operation.name;
+    switch (canonical_workload_phase(workload)) {
+    case WorkloadPhase::decode:
+        return operation.op_class == OperationClass::elementwise_map ||
+               operation.op_class == OperationClass::reduction ||
+               name.find("sample") != std::string_view::npos ||
+               name.find("kv") != std::string_view::npos ||
+               name.find("cache") != std::string_view::npos ||
+               (operation.op_class == OperationClass::matmul && is_small_matmul(operation));
+    case WorkloadPhase::cache_update:
+    case WorkloadPhase::dequantize:
+        return operation.op_class != OperationClass::matmul &&
+               operation.op_class != OperationClass::convolution_2d;
+    case WorkloadPhase::prefill:
+        return (operation.op_class == OperationClass::elementwise_map ||
+                operation.op_class == OperationClass::reduction) &&
+               operation_working_set_bytes(operation) <= static_cast<double>(16ull * kMiB);
+    case WorkloadPhase::training_step:
+    case WorkloadPhase::unknown:
+    default:
+        return false;
+    }
+}
+
+bool should_prefer_accelerator_for_phase_operation(const WorkloadSpec& workload, const OperationSpec& operation) {
+    switch (canonical_workload_phase(workload)) {
+    case WorkloadPhase::prefill:
+        return operation.op_class == OperationClass::matmul ||
+               operation.op_class == OperationClass::convolution_2d ||
+               (operation.op_class == OperationClass::resample_2d &&
+                operation.output_bytes >= (4ull * kMiB));
+    case WorkloadPhase::decode:
+        return (operation.op_class == OperationClass::matmul && !is_small_matmul(operation)) ||
+               operation.op_class == OperationClass::convolution_2d;
+    case WorkloadPhase::training_step:
+        return operation.matrix_friendly || operation.op_class == OperationClass::convolution_2d;
+    case WorkloadPhase::cache_update:
+    case WorkloadPhase::dequantize:
+    case WorkloadPhase::unknown:
+    default:
+        return false;
+    }
+}
+
 enum class StructuralPlacementPreference {
     neutral,
     host,
@@ -2705,12 +3308,48 @@ StructuralPlacementAffinity structural_placement_affinity(
         return {};
     }
 
+    if (workload.kind == WorkloadKind::tensor &&
+        operation.op_class == OperationClass::matmul &&
+        !workload.latency_sensitive &&
+        workload.batch_size <= 4u &&
+        workload_host_exchange_ratio(workload) >= 0.20) {
+        return {
+            StructuralPlacementPreference::host,
+            true,
+            true,
+            0.90};
+    }
+
+    const bool phase_host_preferred = should_prefer_host_for_phase_operation(workload, operation);
+    const bool phase_accelerator_preferred =
+        should_prefer_accelerator_for_phase_operation(workload, operation);
+
     const double exchange_ratio = workload_host_exchange_ratio(workload);
     const bool dispatch_bound = is_dispatch_bound_operation(operation);
     const bool large_accelerator_op = is_large_accelerator_operation(operation);
     const double latency_pressure =
         (workload.latency_sensitive ? (workload.batch_size <= 1u ? 0.55 : 0.25) : 0.0) +
         std::clamp(exchange_ratio * 0.40, 0.0, 0.30);
+
+    if (phase_host_preferred && !phase_accelerator_preferred) {
+        return {
+            StructuralPlacementPreference::host,
+            true,
+            true,
+            std::clamp(0.55 + latency_pressure + (dispatch_bound ? 0.15 : 0.0), 0.0, 1.0)};
+    }
+
+    if (phase_accelerator_preferred && !phase_host_preferred) {
+        return {
+            StructuralPlacementPreference::accelerator,
+            canonical_workload_phase(workload) == WorkloadPhase::decode,
+            workload.latency_sensitive,
+            std::clamp(
+                0.60 + (operation.matrix_friendly ? 0.15 : 0.0) +
+                    (canonical_workload_phase(workload) == WorkloadPhase::prefill ? 0.10 : 0.0),
+                0.0,
+                1.0)};
+    }
 
     if ((dispatch_bound || operation.op_class == OperationClass::reduction) &&
         (latency_pressure > 0.0 || !workload.matrix_friendly || exchange_ratio > 0.10)) {
@@ -2739,6 +3378,133 @@ StructuralPlacementAffinity structural_placement_affinity(
         dispatch_bound || latency_pressure > 0.35,
         dispatch_bound || (workload.latency_sensitive && workload.batch_size <= 1u),
         dispatch_bound ? 0.30 : 0.0};
+}
+
+struct OperationPlacementProfile {
+    double host_device_bias = 0.0;
+    double accelerator_device_bias = 0.0;
+    double host_execution_bias_us = 0.0;
+    double accelerator_execution_bias_us = 0.0;
+    double mixed_execution_bias_us = 0.0;
+    std::size_t preferred_max_devices = 2u;
+    bool avoid_mixed = false;
+};
+
+OperationPlacementProfile score_operation_placement(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const StructuralPlacementAffinity& affinity) {
+    OperationPlacementProfile profile;
+    const auto phase = canonical_workload_phase(workload);
+    const bool host_phase_preferred =
+        should_prefer_host_for_llm_operation(workload, operation) ||
+        should_prefer_host_for_phase_operation(workload, operation);
+    const bool accelerator_phase_preferred =
+        should_prefer_accelerator_for_llm_operation(workload, operation) ||
+        should_prefer_accelerator_for_phase_operation(workload, operation);
+
+    if (host_phase_preferred && !accelerator_phase_preferred) {
+        profile.host_device_bias += phase == WorkloadPhase::decode ? 0.55 : 0.35;
+        profile.host_execution_bias_us -= operation.op_class == OperationClass::matmul ? 420.0 : 560.0;
+        profile.accelerator_execution_bias_us += operation.op_class == OperationClass::matmul ? 620.0 : 760.0;
+        profile.mixed_execution_bias_us += phase == WorkloadPhase::decode ? 420.0 : 260.0;
+        profile.preferred_max_devices = 1u;
+        profile.avoid_mixed = true;
+    } else if (accelerator_phase_preferred && !host_phase_preferred) {
+        profile.accelerator_device_bias += phase == WorkloadPhase::prefill ? 0.45 : 0.35;
+        profile.host_execution_bias_us += operation.op_class == OperationClass::matmul ? 760.0 : 320.0;
+        profile.accelerator_execution_bias_us -= operation.op_class == OperationClass::matmul ? 420.0 : 120.0;
+        profile.mixed_execution_bias_us += canonical_workload_phase(workload) == WorkloadPhase::decode ? 120.0 : 40.0;
+        profile.preferred_max_devices =
+            phase == WorkloadPhase::prefill && operation.parallelizable && operation.matrix_friendly ? 2u : 1u;
+    }
+
+    if (affinity.preferred == StructuralPlacementPreference::host) {
+        profile.host_device_bias += 0.20 * (1.0 + affinity.bias_scale);
+        profile.host_execution_bias_us -= 90.0 * (1.0 + affinity.bias_scale);
+        profile.accelerator_execution_bias_us += 120.0 * (1.0 + affinity.bias_scale);
+        if (affinity.prefer_low_overhead) {
+            profile.mixed_execution_bias_us += 80.0 * (1.0 + affinity.bias_scale);
+        }
+        if (affinity.avoid_sharding) {
+            profile.preferred_max_devices = 1u;
+            profile.avoid_mixed = true;
+        }
+    } else if (affinity.preferred == StructuralPlacementPreference::accelerator) {
+        profile.accelerator_device_bias += 0.20 * (1.0 + affinity.bias_scale);
+        profile.host_execution_bias_us += 130.0 * (1.0 + affinity.bias_scale);
+        profile.accelerator_execution_bias_us -= 55.0 * (1.0 + affinity.bias_scale);
+        if (affinity.avoid_sharding) {
+            profile.preferred_max_devices = std::min<std::size_t>(profile.preferred_max_devices, 1u);
+        }
+    }
+
+    if (phase == WorkloadPhase::decode && workload.latency_sensitive) {
+        profile.preferred_max_devices = 1u;
+        profile.avoid_mixed = true;
+        profile.mixed_execution_bias_us += 120.0;
+    } else if (phase == WorkloadPhase::prefill && operation.matrix_friendly && !is_small_matmul(operation)) {
+        profile.preferred_max_devices = std::max<std::size_t>(profile.preferred_max_devices, 2u);
+        profile.mixed_execution_bias_us -= 20.0;
+    }
+
+    if (operation.op_class == OperationClass::reduction || operation.op_class == OperationClass::elementwise_map) {
+        profile.preferred_max_devices = 1u;
+    }
+
+    if (operation.preferred_kv_residency == "host") {
+        profile.host_device_bias += 0.18;
+        profile.host_execution_bias_us -= 140.0;
+        profile.accelerator_execution_bias_us += 180.0;
+        profile.preferred_max_devices = 1u;
+    } else if (operation.preferred_kv_residency == "accelerator") {
+        profile.accelerator_device_bias += 0.12;
+        profile.host_execution_bias_us += 120.0;
+        profile.accelerator_execution_bias_us -= 60.0;
+    } else if (operation.preferred_kv_residency == "shared" && phase == WorkloadPhase::decode) {
+        profile.mixed_execution_bias_us -= 45.0;
+        profile.preferred_max_devices = std::max<std::size_t>(profile.preferred_max_devices, 2u);
+    }
+
+    if (operation.attention_head_count >= 16u) {
+        if (phase == WorkloadPhase::decode) {
+            profile.host_device_bias += operation.attention_head_group_size <= 4u ? 0.10 : 0.04;
+            profile.accelerator_device_bias += 0.08;
+        } else if (phase == WorkloadPhase::prefill) {
+            profile.accelerator_device_bias += 0.14;
+            profile.mixed_execution_bias_us -= operation.preferred_token_block >= 64u ? 30.0 : 10.0;
+        }
+    }
+
+    return profile;
+}
+
+double graph_operation_device_bias(
+    const OperationPlacementProfile& profile,
+    const HardwareGraph* graph) {
+    return is_host_graph(graph) ? profile.host_device_bias : profile.accelerator_device_bias;
+}
+
+double operation_placement_bias_us(
+    const OperationPlacementProfile& profile,
+    const ExecutionConfig& config,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup) {
+    const auto* primary_graph = find_graph(graph_lookup, config.primary_device_uid);
+    const bool host_only = config.participating_devices.size() == 1u && is_host_graph(primary_graph);
+    const bool accelerator_only =
+        config.participating_devices.size() == 1u && primary_graph != nullptr && !is_host_graph(primary_graph);
+    const bool mixed_devices = config.participating_devices.size() > 1u;
+
+    if (host_only) {
+        return profile.host_execution_bias_us;
+    }
+    if (accelerator_only) {
+        return profile.accelerator_execution_bias_us;
+    }
+    if (mixed_devices) {
+        return profile.mixed_execution_bias_us;
+    }
+    return 0.0;
 }
 
 std::vector<std::string> accelerator_device_uids(
@@ -2969,7 +3735,11 @@ bool apply_partition_strategy_execution_policy(
     const ExecutionPlan& placement,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     ExecutionConfig& config) {
-    const auto* strategy = runtime_partition_strategy(workload.partition_strategy);
+    const auto requested_strategy =
+        placement.strategy_source == PlanStrategySource::explicit_request
+            ? placement.resolved_partition_strategy
+            : workload.heuristic_partition_hint.value_or(PartitionStrategy::auto_balanced);
+    const auto* strategy = runtime_partition_strategy(requested_strategy);
     if (strategy == nullptr) {
         return false;
     }
@@ -2989,12 +3759,34 @@ bool apply_partition_strategy_execution_policy(
 
     const auto stage = classify_partition_micro_stage(operation);
     const auto& forced = placement_for_micro_stage(*strategy, stage);
+    const bool hard_force = placement.strategy_source == PlanStrategySource::explicit_request;
     const auto force_single_device = [&](const std::string& device_uid) {
         config.primary_device_uid = device_uid;
         config.participating_devices = {device_uid};
         config.strategy = forced.strategy == ExecutionStrategy::sharded ? ExecutionStrategy::single_device : forced.strategy;
         config.logical_partitions = 1u;
     };
+
+    if (!hard_force) {
+        config.queue_depth = std::max(config.queue_depth, forced.min_queue_depth);
+        config.stages = std::max(config.stages, forced.min_stages);
+        if (forced.mode == PartitionPlacementMode::sharded &&
+            operation.parallelizable &&
+            config.participating_devices.size() > 1u) {
+            config.strategy = forced.strategy;
+            config.logical_partitions = std::max(config.logical_partitions, forced.logical_partitions);
+            config.overlap_transfers = config.overlap_transfers || forced.overlap_transfers;
+        } else if (config.participating_devices.size() <= 1u) {
+            config.strategy = ExecutionStrategy::single_device;
+            config.logical_partitions = 1u;
+            if (forced.mode == PartitionPlacementMode::host_only) {
+                config.overlap_transfers = false;
+            } else if (forced.mode == PartitionPlacementMode::accelerator_only) {
+                config.overlap_transfers = config.overlap_transfers || forced.overlap_transfers;
+            }
+        }
+        return true;
+    }
 
     if (forced.mode == PartitionPlacementMode::host_only) {
         force_single_device(host_it->device.uid);
@@ -3137,6 +3929,73 @@ void apply_device_agnostic_execution_policy(
         if (workload.latency_sensitive || affinity.avoid_sharding) {
             config.logical_partitions = 1u;
         }
+    }
+}
+
+void apply_phase_aware_execution_policy(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const OperationPlacementProfile& profile,
+    const HardwareGraph* graph,
+    ExecutionConfig& config) {
+    const bool host_graph = is_host_graph(graph);
+    const auto phase = canonical_workload_phase(workload);
+    const bool host_phase_preferred =
+        should_prefer_host_for_llm_operation(workload, operation) ||
+        should_prefer_host_for_phase_operation(workload, operation);
+    const bool accelerator_phase_preferred =
+        should_prefer_accelerator_for_llm_operation(workload, operation) ||
+        should_prefer_accelerator_for_phase_operation(workload, operation);
+
+    if (profile.avoid_mixed && config.participating_devices.size() > 1u) {
+        config.participating_devices = {config.primary_device_uid};
+        config.strategy = ExecutionStrategy::single_device;
+        config.logical_partitions = 1u;
+        config.overlap_transfers = false;
+    }
+
+    if (phase == WorkloadPhase::decode) {
+        config.queue_depth = std::min(config.queue_depth, 2u);
+        config.stages = 1u;
+        if (host_graph) {
+            config.logical_partitions = 1u;
+            config.overlap_transfers =
+                host_phase_preferred &&
+                (operation.op_class == OperationClass::elementwise_map ||
+                 operation.op_class == OperationClass::reduction ||
+                 operation.name.find("sample") != std::string::npos ||
+                 operation.name.find("kv") != std::string::npos ||
+                 operation.name.find("cache") != std::string::npos);
+            if (config.overlap_transfers) {
+                config.queue_depth = std::max(config.queue_depth, 2u);
+            }
+        } else if (accelerator_phase_preferred &&
+                   (operation.op_class == OperationClass::matmul ||
+                    operation.op_class == OperationClass::convolution_2d)) {
+            config.queue_depth = std::max(config.queue_depth, 3u);
+            config.stages = std::max(config.stages, 2u);
+            config.overlap_transfers = true;
+        }
+        return;
+    }
+
+    if (phase == WorkloadPhase::prefill && !host_graph &&
+        (operation.op_class == OperationClass::matmul || operation.op_class == OperationClass::convolution_2d)) {
+        config.queue_depth = std::max(config.queue_depth, 2u);
+        config.stages = std::max(config.stages, 2u);
+        if (profile.preferred_max_devices > 1u && operation.parallelizable && config.participating_devices.size() > 1u) {
+            config.strategy = ExecutionStrategy::sharded;
+            config.overlap_transfers = true;
+            config.logical_partitions = std::max(config.logical_partitions, 1u);
+        }
+        return;
+    }
+
+    if (phase == WorkloadPhase::cache_update || phase == WorkloadPhase::dequantize) {
+        config.participating_devices = {config.primary_device_uid};
+        config.strategy = ExecutionStrategy::single_device;
+        config.logical_partitions = 1u;
+        config.overlap_transfers = false;
     }
 }
 
@@ -3284,10 +4143,10 @@ double device_agnostic_execution_bias_us(
     } else if (affinity.preferred == StructuralPlacementPreference::accelerator) {
         if (host_only) {
             bias_us +=
-                (operation.op_class == OperationClass::matmul ? 220.0 : 150.0) * (1.0 + scale);
+                (operation.op_class == OperationClass::matmul ? 420.0 : 150.0) * (1.0 + scale);
         }
         if (accelerator_only) {
-            bias_us -= operation.op_class == OperationClass::matmul ? 80.0 : 45.0;
+            bias_us -= operation.op_class == OperationClass::matmul ? 220.0 : 45.0;
         }
     }
 
@@ -3307,6 +4166,14 @@ double device_agnostic_execution_bias_us(
         if (config.logical_partitions > 1u) {
             bias_us += static_cast<double>(config.logical_partitions - 1u) * 44.0 * (1.0 + scale);
         }
+    }
+
+    if (primary_graph != nullptr &&
+        operation.op_class == OperationClass::matmul &&
+        workload.kind == WorkloadKind::tensor &&
+        !workload.latency_sensitive &&
+        primary_graph->probe == "level-zero") {
+        bias_us += 2600.0;
     }
 
     return bias_us;
@@ -3354,6 +4221,59 @@ double auto_accelerator_data_parallel_bias_us(
     return bias_us;
 }
 
+double hybrid_multi_accelerator_host_bias_us(
+    const WorkloadSpec& workload,
+    const OperationSpec& operation,
+    const ExecutionPlan& placement,
+    const ExecutionConfig& config,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup) {
+    const auto accelerators = accelerator_device_uids(placement, graph_lookup);
+    const bool has_host = std::any_of(
+        placement.allocations.begin(),
+        placement.allocations.end(),
+        [&](const PlanAllocation& allocation) {
+            return is_host_graph(find_graph(graph_lookup, allocation.device.uid));
+        });
+    if (!has_host || accelerators.size() < 2u) {
+        return 0.0;
+    }
+
+    const auto phase = canonical_workload_phase(workload);
+    const auto* primary_graph = find_graph(graph_lookup, config.primary_device_uid);
+    const bool host_only = config.participating_devices.size() == 1u && is_host_graph(primary_graph);
+    const bool accelerator_only =
+        !config.participating_devices.empty() &&
+        std::all_of(
+            config.participating_devices.begin(),
+            config.participating_devices.end(),
+            [&](const std::string& uid) {
+                const auto* graph = find_graph(graph_lookup, uid);
+                return graph != nullptr && !is_host_graph(graph);
+            });
+    const bool full_accelerator_set = accelerator_only && config.participating_devices.size() == accelerators.size();
+    const bool mixed_same_op = config.participating_devices.size() > accelerators.size();
+
+    double bias_us = 0.0;
+    if (host_only &&
+        (operation.op_class == OperationClass::elementwise_map ||
+         operation.op_class == OperationClass::reduction ||
+         operation_mentions_kv_cache(operation) ||
+         string_contains_any(operation.name, {"sample"}))) {
+        bias_us -= phase == WorkloadPhase::decode ? 220.0 : 120.0;
+    }
+    if (full_accelerator_set &&
+        (operation.op_class == OperationClass::matmul || operation.op_class == OperationClass::convolution_2d)) {
+        bias_us -= phase == WorkloadPhase::prefill ? 260.0 : 150.0;
+        if (operation.attention_head_count > 0u) {
+            bias_us -= 40.0;
+        }
+    }
+    if (mixed_same_op) {
+        bias_us += 180.0;
+    }
+    return bias_us;
+}
+
 struct WorkloadCandidatePolicy {
     std::size_t max_ranked_strategies = 2u;
     std::size_t max_devices = 2u;
@@ -3382,6 +4302,14 @@ WorkloadCandidatePolicy candidate_policy_for_workload(
         policy.max_devices = 1u;
         policy.max_candidates = operation.matrix_friendly ? 6u : 4u;
         policy.validation_shortlist = 1u;
+        return policy;
+    }
+    if (workload.kind == WorkloadKind::inference &&
+        canonical_workload_phase(workload) == WorkloadPhase::prefill) {
+        policy.max_ranked_strategies = operation.matrix_friendly ? 2u : 1u;
+        policy.max_devices = operation.matrix_friendly ? 2u : 1u;
+        policy.max_candidates = operation.matrix_friendly ? 8u : 5u;
+        policy.validation_shortlist = operation.matrix_friendly ? 2u : 1u;
         return policy;
     }
     if (workload.kind == WorkloadKind::gaming || workload.kind == WorkloadKind::image) {
@@ -3459,11 +4387,18 @@ std::vector<ExecutionConfig> build_candidate_configs(
     };
 
     const auto placement_affinity = structural_placement_affinity(workload, operation);
+    const auto placement_profile = score_operation_placement(workload, operation, placement_affinity);
     const auto candidate_policy =
         candidate_policy_for_workload(workload, operation, system, continuous_state != nullptr, placement_affinity);
     auto ordered_allocations_for_operation = [&]() {
         std::vector<std::reference_wrapper<const PlanAllocation>> ordered_allocations;
         ordered_allocations.reserve(placement.allocations.size());
+        const bool phase_host_preferred =
+            should_prefer_host_for_llm_operation(workload, operation) ||
+            should_prefer_host_for_phase_operation(workload, operation);
+        const bool phase_accelerator_preferred =
+            should_prefer_accelerator_for_llm_operation(workload, operation) ||
+            should_prefer_accelerator_for_phase_operation(workload, operation);
         for (const auto& allocation : placement.allocations) {
             ordered_allocations.emplace_back(allocation);
         }
@@ -3474,37 +4409,20 @@ std::vector<ExecutionConfig> build_candidate_configs(
                 const std::reference_wrapper<const PlanAllocation>& right) {
                 const auto* left_graph = find_graph(graph_lookup, left.get().device.uid);
                 const auto* right_graph = find_graph(graph_lookup, right.get().device.uid);
-                const bool left_host = is_host_graph(left_graph);
-                const bool right_host = is_host_graph(right_graph);
-                if (should_prefer_host_for_llm_operation(workload, operation) && left_host != right_host) {
-                    return left_host;
-                }
-                if (should_prefer_accelerator_for_llm_operation(workload, operation) && left_host != right_host) {
-                    return !left_host;
-                }
-                if (placement_affinity.preferred == StructuralPlacementPreference::host && left_host != right_host) {
-                    return left_host;
-                }
-                if (placement_affinity.preferred == StructuralPlacementPreference::accelerator &&
-                    left_host != right_host) {
-                    return !left_host;
+                if (phase_host_preferred != phase_accelerator_preferred &&
+                    left_graph != nullptr &&
+                    right_graph != nullptr) {
+                    if (phase_host_preferred && is_host_graph(left_graph) != is_host_graph(right_graph)) {
+                        return is_host_graph(left_graph);
+                    }
+                    if (phase_accelerator_preferred && is_host_graph(left_graph) != is_host_graph(right_graph)) {
+                        return !is_host_graph(left_graph);
+                    }
                 }
                 const double left_score =
-                    left.get().score *
-                    (1.0 + (placement_affinity.preferred == StructuralPlacementPreference::host && left_host
-                                ? placement_affinity.bias_scale * 0.18
-                                : placement_affinity.preferred == StructuralPlacementPreference::accelerator &&
-                                          !left_host
-                                      ? placement_affinity.bias_scale * 0.18
-                                      : 0.0));
+                    left.get().score * (1.0 + graph_operation_device_bias(placement_profile, left_graph));
                 const double right_score =
-                    right.get().score *
-                    (1.0 + (placement_affinity.preferred == StructuralPlacementPreference::host && right_host
-                                ? placement_affinity.bias_scale * 0.18
-                                : placement_affinity.preferred == StructuralPlacementPreference::accelerator &&
-                                          !right_host
-                                      ? placement_affinity.bias_scale * 0.18
-                                      : 0.0));
+                    right.get().score * (1.0 + graph_operation_device_bias(placement_profile, right_graph));
                 return left_score > right_score;
             });
         return ordered_allocations;
@@ -3513,6 +4431,13 @@ std::vector<ExecutionConfig> build_candidate_configs(
     const bool activation_driven = continuous_state != nullptr;
     const auto ordered_allocations = ordered_allocations_for_operation();
     const auto accelerators = accelerator_device_uids(placement, graph_lookup);
+    const bool placement_has_host = std::any_of(
+        placement.allocations.begin(),
+        placement.allocations.end(),
+        [&](const PlanAllocation& allocation) {
+            return is_host_graph(find_graph(graph_lookup, allocation.device.uid));
+        });
+    const bool placement_has_accelerator = !accelerators.empty();
     const bool auto_accelerator_ddp =
         should_auto_accelerator_data_parallel(workload, operation, placement, graph_lookup);
     const bool allow_placement_sharding =
@@ -3626,11 +4551,52 @@ std::vector<ExecutionConfig> build_candidate_configs(
                 apply_continuous_state(*continuous_state, operation, summary, config);
             }
             apply_device_agnostic_execution_policy(workload, operation, graph, config);
+            if (placement.strategy_source != PlanStrategySource::explicit_request) {
+                apply_phase_aware_execution_policy(workload, operation, placement_profile, graph, config);
+            }
             apply_llm_cpu_execution_policy(workload, operation, graph, config);
             apply_auto_accelerator_data_parallel_policy(workload, operation, placement, graph_lookup, config);
             apply_partition_strategy_execution_policy(workload, operation, placement, graph_lookup, config);
             stabilize_level_zero_host_mix_policy(operation, graph_lookup, config);
             const auto* resolved_primary_graph = find_graph(graph_lookup, config.primary_device_uid);
+            if (placement.strategy_source != PlanStrategySource::explicit_request &&
+                resolved_primary_graph != nullptr) {
+                const auto affinity = structural_placement_affinity(workload, operation);
+                const bool phase_host_preferred =
+                    should_prefer_host_for_llm_operation(workload, operation) ||
+                    should_prefer_host_for_phase_operation(workload, operation);
+                const bool phase_accelerator_preferred =
+                    should_prefer_accelerator_for_llm_operation(workload, operation) ||
+                    should_prefer_accelerator_for_phase_operation(workload, operation);
+                if (placement_has_host &&
+                    phase_host_preferred &&
+                    !phase_accelerator_preferred &&
+                    !is_host_graph(resolved_primary_graph)) {
+                    return;
+                }
+                if (placement_has_accelerator &&
+                    phase_accelerator_preferred &&
+                    !phase_host_preferred &&
+                    is_host_graph(resolved_primary_graph)) {
+                    return;
+                }
+                if (placement_has_accelerator &&
+                    affinity.preferred == StructuralPlacementPreference::accelerator &&
+                    (operation.op_class == OperationClass::matmul ||
+                     operation.op_class == OperationClass::convolution_2d ||
+                     operation.matrix_friendly) &&
+                    is_host_graph(resolved_primary_graph)) {
+                    return;
+                }
+                if (workload.kind == WorkloadKind::tensor &&
+                    operation.op_class == OperationClass::matmul &&
+                    !workload.latency_sensitive &&
+                    workload.batch_size <= 4u &&
+                    workload_host_exchange_ratio(workload) >= 0.20 &&
+                    !is_host_graph(resolved_primary_graph)) {
+                    return;
+                }
+            }
             if (config.participating_devices.size() <= 1u &&
                 config.strategy == ExecutionStrategy::sharded) {
                 config.strategy = ExecutionStrategy::single_device;
@@ -3644,6 +4610,18 @@ std::vector<ExecutionConfig> build_candidate_configs(
                 config.queue_depth = std::min(config.queue_depth, 2u);
                 config.stages = 1u;
             }
+            if (operation.attention_head_count > 0u) {
+                config.logical_partitions = std::max(
+                    config.logical_partitions,
+                    desired_semantic_partition_count(workload, operation, config));
+                if (operation.preferred_token_block > 0u &&
+                    canonical_workload_phase(workload) == WorkloadPhase::prefill &&
+                    config.participating_devices.size() > 1u) {
+                    config.strategy =
+                        config.strategy == ExecutionStrategy::single_device ? ExecutionStrategy::sharded : config.strategy;
+                    config.overlap_transfers = config.overlap_transfers || operation.preferred_kv_residency == "shared";
+                }
+            }
             if (is_host_graph(resolved_primary_graph) && cpu_materialized_lowering_active(operation)) {
                 append_variant_suffix(config.variant_id, "+cpu-lowered");
             } else if (!is_host_graph(resolved_primary_graph) && gpu_materialized_lowering_active(operation)) {
@@ -3652,6 +4630,14 @@ std::vector<ExecutionConfig> build_candidate_configs(
             if (!operation.fused_operation_names.empty()) {
                 append_variant_suffix(config.variant_id, "+fused");
             }
+        }
+        if (placement.strategy_source != PlanStrategySource::explicit_request &&
+            placement_profile.avoid_mixed &&
+            config.participating_devices.size() > 1u) {
+            config.participating_devices = {config.primary_device_uid};
+            config.strategy = ExecutionStrategy::single_device;
+            config.logical_partitions = 1u;
+            config.overlap_transfers = false;
         }
         config.signature = build_config_signature(report_signature, config);
         const auto duplicate = std::find_if(
@@ -3684,10 +4670,10 @@ std::vector<ExecutionConfig> build_candidate_configs(
         if (variant.scope == OperationVariantScope::per_allocation) {
             const std::size_t max_devices =
                 activation_driven
-                    ? candidate_policy.max_devices
-                    : (placement_affinity.preferred == StructuralPlacementPreference::neutral
-                           ? std::min<std::size_t>(ordered_allocations.size(), candidate_policy.max_devices)
-                           : std::min<std::size_t>(ordered_allocations.size(), candidate_policy.max_devices));
+                    ? std::min(candidate_policy.max_devices, placement_profile.preferred_max_devices)
+                    : std::min<std::size_t>(
+                          ordered_allocations.size(),
+                          std::min(candidate_policy.max_devices, placement_profile.preferred_max_devices));
             std::size_t added_devices = 0;
             for (const auto& allocation_ref : ordered_allocations) {
                 const auto& allocation = allocation_ref.get();
@@ -3737,8 +4723,12 @@ std::vector<ExecutionConfig> build_candidate_configs(
         if (participating_devices.empty()) {
             continue;
         }
-        if (participating_devices.size() > candidate_policy.max_devices) {
-            participating_devices.resize(candidate_policy.max_devices);
+        const auto max_devices = std::min(candidate_policy.max_devices, placement_profile.preferred_max_devices);
+        if (participating_devices.size() > max_devices) {
+            participating_devices.resize(max_devices);
+        }
+        if (placement_profile.avoid_mixed && participating_devices.size() > 1u) {
+            participating_devices.resize(1u);
         }
 
         const auto* primary_graph = find_graph(graph_lookup, participating_devices.front());
@@ -3875,6 +4865,7 @@ double finalize_graph_latency(ExecutionGraph& graph) {
 
 ExecutionGraph build_execution_graph(
     const std::string& report_signature,
+    const WorkloadSpec& workload,
     const WorkloadGraph& workload_graph,
     const CompiledWorkloadGraph& compiled_workload,
     const OperationSpec& operation,
@@ -3882,7 +4873,6 @@ ExecutionGraph build_execution_graph(
     const ExecutionPlan& placement,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     const std::unordered_map<std::string, ExecutionConfig>& selected_configs) {
-    (void)workload_graph;
     ExecutionGraph graph;
     graph.workload_signature = report_signature;
     graph.operation = operation;
@@ -3896,6 +4886,7 @@ ExecutionGraph build_execution_graph(
 
     const auto ratios = normalized_ratios(placement, config);
     const auto operation_index = operation_index_or_default(compiled_workload.operation_indices, operation.name, 0u);
+    const auto phase = canonical_workload_phase(workload);
     std::unordered_map<std::string, std::uint64_t> resident_bytes_by_device;
     std::unordered_map<std::string, double> resident_pressure_by_device;
     std::unordered_map<std::string, std::uint32_t> node_indices;
@@ -3950,6 +4941,9 @@ ExecutionGraph build_execution_graph(
     const bool needs_sync = config.participating_devices.size() > 1;
     const bool uses_partitioned_execution =
         config.logical_partitions > 1 || config.strategy != ExecutionStrategy::single_device;
+    const bool decode_pipeline = phase == WorkloadPhase::decode;
+    const bool shared_staging_enabled =
+        config.overlap_transfers && (decode_pipeline || needs_sync || uses_partitioned_execution);
 
     if (needs_sync) {
         add_node(ExecutionNode{
@@ -4030,6 +5024,7 @@ ExecutionGraph build_execution_graph(
                 config.logical_partitions > 1 ? (".part" + std::to_string(partition)) : std::string();
             const std::string prefix = operation.name + "." + device_uid + partition_suffix;
             const std::string source_id = prefix + ".source";
+            const std::string staging_id = prefix + ".staging";
             const std::string dispatch_id = prefix + ".dispatch";
             const std::string compute_id = prefix + ".compute";
             const std::string aggregate_id = prefix + ".aggregate";
@@ -4038,6 +5033,8 @@ ExecutionGraph build_execution_graph(
             std::uint64_t partition_temporary_bytes = 0u;
             double input_transfer_latency_us = 0.0;
             double output_transfer_latency_us = 0.0;
+            std::uint32_t cross_device_input_count = 0u;
+            bool has_cross_device_input = false;
 
             for (const auto& tensor_id : operation.input_tensor_ids) {
                 const auto* tensor = find_workload_tensor(workload_graph, compiled_workload, tensor_id);
@@ -4050,7 +5047,8 @@ ExecutionGraph build_execution_graph(
                     bytes_for_tensor_mapping(*tensor, operation, config, partition_ratio, partitions);
                 partition_input_bytes += mapped_bytes;
 
-                const auto source_devices = resident_devices_for_tensor(*tensor, config, selected_configs);
+                const auto source_devices =
+                    resident_devices_for_tensor(workload, *tensor, operation, config, selected_configs);
                 const bool resident_on_target = std::find(source_devices.begin(), source_devices.end(), device_uid) != source_devices.end();
                 const std::string source_device_uid =
                     resident_on_target ? device_uid : (source_devices.empty() ? std::string("host") : source_devices.front());
@@ -4059,12 +5057,39 @@ ExecutionGraph build_execution_graph(
                 const auto source_summary = source_graph == nullptr ? HardwareGraphSummary{} : summarize_graph(*source_graph);
                 const auto* source_summary_ptr = source_graph == nullptr ? nullptr : &source_summary;
                 const bool cross_device = source_device_uid != device_uid;
+                has_cross_device_input = has_cross_device_input || cross_device || source_device_uid == "host";
+                if (cross_device || source_device_uid == "host") {
+                    ++cross_device_input_count;
+                }
                 const double transfer_latency =
                     scheduled_transfer_latency_us(mapped_bytes, source_summary_ptr, summary, cross_device);
                 input_transfer_latency_us = std::max(input_transfer_latency_us, transfer_latency);
                 graph.predicted_transfer_latency_us += transfer_latency;
                 graph.predicted_overlap_gain_us +=
                     transfer_latency * std::max(config.overlap_ratio, config.overlap_transfers ? 0.35 : 0.0);
+
+                if ((cross_device || source_device_uid == "host") &&
+                    std::none_of(
+                        graph.residency_plan.begin(),
+                        graph.residency_plan.end(),
+                        [&](const TensorResidencyPlanEntry& entry) {
+                            return entry.tensor_id == tensor->id && entry.device_uid == source_device_uid;
+                        })) {
+                    graph.residency_plan.push_back(TensorResidencyPlanEntry{
+                        tensor->id,
+                        source_device_uid,
+                        std::string(),
+                        compiled_workload.tensor_indices.contains(tensor->id) ? compiled_workload.tensor_indices.at(tensor->id)
+                                                                             : kInvalidExecutionIndex,
+                        device_index_for(source_device_uid),
+                        kInvalidExecutionIndex,
+                        mapped_bytes,
+                        tensor->persistent,
+                        true,
+                        true,
+                        false,
+                        0.0});
+                }
 
                 graph.residency_plan.push_back(TensorResidencyPlanEntry{
                     tensor->id,
@@ -4212,6 +5237,26 @@ ExecutionGraph build_execution_graph(
                 0.0,
                 0.0});
 
+            const bool needs_input_staging =
+                shared_staging_enabled && has_cross_device_input &&
+                (cross_device_input_count > 1u || decode_pipeline || needs_sync);
+            if (needs_input_staging) {
+                add_node(ExecutionNode{
+                    staging_id,
+                    hardware->presentation_name + partition_suffix + "-staging",
+                    device_uid,
+                    storage_node == nullptr ? std::string() : storage_node->id,
+                    kInvalidExecutionIndex,
+                    kInvalidExecutionIndex,
+                    kInvalidExecutionIndex,
+                    operation_index,
+                    kInvalidExecutionIndex,
+                    ExecutionNodeKind::aggregate,
+                    partition_input_bytes == 0u ? input_share : partition_input_bytes,
+                    0.0,
+                    std::max(0.05, input_transfer_latency_us * (decode_pipeline ? 0.20 : 0.10))});
+            }
+
             add_node(ExecutionNode{
                 dispatch_id,
                 hardware->presentation_name + partition_suffix + "-dispatch",
@@ -4242,9 +5287,14 @@ ExecutionGraph build_execution_graph(
                 flops_share,
                 std::max(0.01, compute_latency_us)});
 
+            const double input_overlap_ratio = std::max(
+                config.overlap_ratio,
+                decode_pipeline && has_cross_device_input
+                    ? 0.55
+                    : (config.overlap_transfers ? 0.35 : 0.0));
             add_edge(ExecutionEdge{
                 source_id,
-                dispatch_id,
+                needs_input_staging ? staging_id : dispatch_id,
                 kInvalidExecutionIndex,
                 kInvalidExecutionIndex,
                 ExecutionEdgeKind::dataflow,
@@ -4253,7 +5303,19 @@ ExecutionGraph build_execution_graph(
                 std::max(
                     transfer_cost_us(partition_input_bytes == 0u ? input_share : partition_input_bytes, summary),
                     input_transfer_latency_us),
-                std::max(config.overlap_ratio, config.overlap_transfers ? 0.35 : 0.0)});
+                input_overlap_ratio});
+            if (needs_input_staging) {
+                add_edge(ExecutionEdge{
+                    staging_id,
+                    dispatch_id,
+                    kInvalidExecutionIndex,
+                    kInvalidExecutionIndex,
+                    ExecutionEdgeKind::dependency,
+                    true,
+                    0u,
+                    std::max(0.05, dispatch_cost_us(summary) * (decode_pipeline ? 0.50 : 0.25)),
+                    decode_pipeline ? 0.15 : 0.0});
+            }
 
             add_edge(ExecutionEdge{
                 dispatch_id,
@@ -4773,6 +5835,7 @@ OperationOptimizationResult optimize_operation(
 std::optional<ExecutionConfig> make_spsa_candidate(
     const ExecutionConfig& seed,
     const std::string& report_signature,
+    const WorkloadSpec& workload,
     const WorkloadGraph& workload_graph,
     const CompiledWorkloadGraph& compiled_workload,
     const OperationSpec& operation,
@@ -4784,6 +5847,7 @@ std::optional<ExecutionConfig> make_spsa_candidate(
     auto score_of = [&](ExecutionConfig candidate) {
         auto graph = build_execution_graph(
             report_signature,
+            workload,
             workload_graph,
             compiled_workload,
             operation,
@@ -5439,6 +6503,7 @@ OperationOptimizationResult optimize_operation(
             if (const auto spsa_candidate = make_spsa_candidate(
                 candidates.front(),
                 report_signature,
+                workload,
                 workload_graph,
                 compiled_workload,
                 operation,
@@ -5516,6 +6581,7 @@ OperationOptimizationResult optimize_operation(
         }
         auto graph = build_execution_graph(
             report_signature,
+            workload,
             workload_graph,
             compiled_workload,
             operation,
@@ -5546,7 +6612,10 @@ OperationOptimizationResult optimize_operation(
             overlap_penalty_us =
                 std::max(0.0, (it->second.average_copy_share - it->second.average_transfer_overlap_ratio) * 80.0) +
                 (it->second.average_budget_pressure * 60.0) -
-                (it->second.average_queue_separation_ratio * 35.0);
+                (it->second.average_queue_separation_ratio * 35.0) +
+                ((1.0 - it->second.average_staging_hit_rate) * 55.0) +
+                (it->second.average_cross_device_sync_cost_us * 0.12) +
+                (it->second.average_residency_pressure * 42.0);
             if (it->second.observations < kLearningWarmupSamples) {
                 learning_scale *= 0.97;
             }
@@ -5567,7 +6636,10 @@ OperationOptimizationResult optimize_operation(
             overlap_penalty_us =
                 std::max(0.0, (family_it->second.average_copy_share - family_it->second.average_transfer_overlap_ratio) * 64.0) +
                 (family_it->second.average_budget_pressure * 48.0) -
-                (family_it->second.average_queue_separation_ratio * 24.0);
+                (family_it->second.average_queue_separation_ratio * 24.0) +
+                ((1.0 - family_it->second.average_staging_hit_rate) * 42.0) +
+                (family_it->second.average_cross_device_sync_cost_us * 0.10) +
+                (family_it->second.average_residency_pressure * 32.0);
         } else if (const auto* family_summary = best_graph_family_summary(
                        graph_family_performance_cache,
                        report_signature,
@@ -5585,7 +6657,10 @@ OperationOptimizationResult optimize_operation(
             overlap_penalty_us =
                 std::max(0.0, (family_summary->average_copy_share - family_summary->average_transfer_overlap_ratio) * 56.0) +
                 (family_summary->average_budget_pressure * 42.0) -
-                (family_summary->average_queue_separation_ratio * 18.0);
+                (family_summary->average_queue_separation_ratio * 18.0) +
+                ((1.0 - family_summary->average_staging_hit_rate) * 36.0) +
+                (family_summary->average_cross_device_sync_cost_us * 0.08) +
+                (family_summary->average_residency_pressure * 24.0);
         }
         if (const auto penalty_it =
                 backend_penalty_cache.find(
@@ -5594,13 +6669,22 @@ OperationOptimizationResult optimize_operation(
             backend_penalty_us = penalty_it->second;
         }
 
+        const double placement_bias_us =
+            placement.strategy_source == PlanStrategySource::explicit_request
+                ? 0.0
+                : operation_placement_bias_us(
+                      score_operation_placement(workload, operation, structural_placement_affinity(workload, operation)),
+                      candidate,
+                      graph_lookup);
         const double surrogate_latency_us =
             (graph.predicted_latency_us * system.sustained_slowdown * learning_scale * calibration_ratio) + system_penalty_us +
             backend_penalty_us +
             overlap_penalty_us +
+            placement_bias_us +
             llm_cpu_policy_bias_us(workload, operation, candidate, graph_lookup) +
             device_agnostic_execution_bias_us(workload, operation, candidate, graph_lookup) +
-            auto_accelerator_data_parallel_bias_us(workload, operation, placement, candidate, graph_lookup);
+            auto_accelerator_data_parallel_bias_us(workload, operation, placement, candidate, graph_lookup) +
+            hybrid_multi_accelerator_host_bias_us(workload, operation, placement, candidate, graph_lookup);
         BenchmarkRecord benchmark;
         const auto validation_rounds =
             choose_validation_rounds(
@@ -5789,7 +6873,11 @@ void update_performance_summary(
     const double copy_share,
     const double transfer_overlap_ratio,
     const double budget_pressure,
-    const double queue_separation_ratio) {
+    const double queue_separation_ratio,
+    const double staging_hit_rate,
+    const double cross_device_sync_cost_us,
+    const double residency_pressure,
+    const double kv_host_residency_ratio) {
     auto& summary = performance_cache[key];
     summary.shape_bucket = shape_bucket;
     summary.device_family_signature = device_family_signature;
@@ -5820,6 +6908,14 @@ void update_performance_summary(
         (budget_pressure - summary.average_budget_pressure) / sample_count;
     summary.average_queue_separation_ratio +=
         (queue_separation_ratio - summary.average_queue_separation_ratio) / sample_count;
+    summary.average_staging_hit_rate +=
+        (staging_hit_rate - summary.average_staging_hit_rate) / sample_count;
+    summary.average_cross_device_sync_cost_us +=
+        (cross_device_sync_cost_us - summary.average_cross_device_sync_cost_us) / sample_count;
+    summary.average_residency_pressure +=
+        (residency_pressure - summary.average_residency_pressure) / sample_count;
+    summary.average_kv_host_residency_ratio +=
+        (kv_host_residency_ratio - summary.average_kv_host_residency_ratio) / sample_count;
 }
 
 void update_device_learning_state(
@@ -6495,7 +7591,7 @@ void AdaptiveExecutionOptimizer::load_cache() {
                 const auto fields = split_tab(line);
                 if (fields.size() != 19 && fields.size() != 20 && fields.size() != 26 && fields.size() != 27 &&
                     fields.size() != 28 && fields.size() != 29 && fields.size() != 30 &&
-                    fields.size() != 31 && fields.size() != 34) {
+                    fields.size() != 31 && fields.size() != 34 && fields.size() != 38) {
                     continue;
                 }
 
@@ -6509,7 +7605,8 @@ void AdaptiveExecutionOptimizer::load_cache() {
                         fields.size() == 28 || fields.size() == 29 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34;
                     const bool has_family =
                         fields.size() == 20 || fields.size() == 27 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34;
-                    const bool has_transfer_metrics = fields.size() == 31 || fields.size() == 34;
+                    const bool has_transfer_metrics = fields.size() == 31 || fields.size() == 34 || fields.size() == 38;
+                    const bool has_residency_metrics = fields.size() == 38;
                     std::size_t next = 1;
                     summary.shape_bucket = fields[next++];
                     summary.device_family_signature = has_family ? fields[next++] : "";
@@ -6554,6 +7651,12 @@ void AdaptiveExecutionOptimizer::load_cache() {
                         summary.average_budget_pressure = std::stod(fields[next++]);
                         summary.average_queue_separation_ratio = std::stod(fields[next++]);
                     }
+                    if (has_residency_metrics) {
+                        summary.average_staging_hit_rate = std::stod(fields[next++]);
+                        summary.average_cross_device_sync_cost_us = std::stod(fields[next++]);
+                        summary.average_residency_pressure = std::stod(fields[next++]);
+                        summary.average_kv_host_residency_ratio = std::stod(fields[next++]);
+                    }
                     target[fields[0]] = std::move(summary);
                 } catch (const std::exception&) {
                     continue;
@@ -6575,14 +7678,21 @@ void AdaptiveExecutionOptimizer::load_cache() {
             continue;
         }
         const auto fields = split_tab(hint_line);
-        if (fields.size() != 5u && fields.size() != 8u) {
+        if (fields.size() != 5u && fields.size() != 8u && fields.size() != 9u) {
             continue;
         }
         try {
             CpuRuntimeHintSummary summary;
             summary.shape_bucket = fields[1];
             summary.preferred_parallel_chunk = static_cast<std::uint32_t>(std::stoul(fields[2]));
-            if (fields.size() == 8u) {
+            if (fields.size() == 9u) {
+                summary.preferred_tile_m = static_cast<std::uint32_t>(std::stoul(fields[3]));
+                summary.preferred_tile_n = static_cast<std::uint32_t>(std::stoul(fields[4]));
+                summary.preferred_tile_k = static_cast<std::uint32_t>(std::stoul(fields[5]));
+                summary.preferred_use_avx512 = std::stoi(fields[6]) != 0;
+                summary.observations = static_cast<std::uint32_t>(std::stoul(fields[7]));
+                summary.average_effective_latency_us = std::stod(fields[8]);
+            } else if (fields.size() == 8u) {
                 summary.preferred_tile_m = static_cast<std::uint32_t>(std::stoul(fields[3]));
                 summary.preferred_tile_n = static_cast<std::uint32_t>(std::stoul(fields[4]));
                 summary.preferred_tile_k = static_cast<std::uint32_t>(std::stoul(fields[5]));
@@ -6696,6 +7806,10 @@ void AdaptiveExecutionOptimizer::apply_feedback_tuning_hints(WorkloadGraph& grap
                     clamp_cpu_tile_hint(it->second.preferred_tile_k, static_cast<std::uint32_t>(operation.extents[2]), 8u, 8u);
             }
         }
+        if (supports_feedback_tuned_cpu_avx512(operation) &&
+            executors::host_native_kernels_compiled_with_avx512()) {
+            operation.cpu_use_avx512 = it->second.preferred_use_avx512;
+        }
     }
 }
 
@@ -6769,7 +7883,11 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
             record.copy_share,
             record.transfer_overlap_ratio,
             record.budget_pressure,
-            record.queue_separation_ratio);
+            record.queue_separation_ratio,
+            record.staging_hit_rate,
+            record.cross_device_sync_cost_us,
+            record.residency_pressure,
+            record.kv_host_residency_ratio);
         update_performance_summary(
             graph_family_performance_cache_,
             performance_family_key(report.signature, optimized.benchmark.shape_bucket, optimized.config),
@@ -6786,7 +7904,11 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
             record.copy_share,
             record.transfer_overlap_ratio,
             record.budget_pressure,
-            record.queue_separation_ratio);
+            record.queue_separation_ratio,
+            record.staging_hit_rate,
+            record.cross_device_sync_cost_us,
+            record.residency_pressure,
+            record.kv_host_residency_ratio);
         update_device_learning_state(
             warmed_devices_,
             device_sustained_slowdown_,
@@ -6880,6 +8002,20 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
                     8u,
                     8u);
             }
+            if (supports_feedback_tuned_cpu_avx512(optimized.operation) &&
+                !optimized.config.use_low_precision) {
+                const bool tuned_use_avx512 = feedback_adjusted_cpu_avx512_choice(
+                    optimized.operation,
+                    graphs,
+                    effective_latency_us,
+                    optimized.graph.predicted_latency_us);
+                const auto prior_observations = hint_summary.observations;
+                const auto avx512_votes =
+                    (hint_summary.preferred_use_avx512 ? prior_observations : 0u) +
+                    (tuned_use_avx512 ? 1u : 0u);
+                hint_summary.preferred_use_avx512 =
+                    avx512_votes * 2u >= (prior_observations + 1u);
+            }
             ++hint_summary.observations;
             hint_summary.average_effective_latency_us +=
                 (effective_latency_us - hint_summary.average_effective_latency_us) /
@@ -6903,6 +8039,11 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
             optimized.graph.predicted_latency_us > 0.0 &&
             effective_latency_us > (optimized.graph.predicted_latency_us * 1.08)) {
             operation_pressure = std::max(operation_pressure, 1u);
+        }
+        if (record.staging_hit_rate < 0.35 ||
+            record.cross_device_sync_cost_us > 120.0 ||
+            record.residency_pressure > 0.85) {
+            operation_pressure = std::max(operation_pressure, 2u);
         }
 
         const auto operation_key = report.signature + "|" + optimized.operation.name;
@@ -6979,7 +8120,7 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
             }
 
             output
-                << "# key\tshape_bucket\tdevice_family_signature\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_calibration_ratio\tavg_system_penalty\tavg_validation_spread\tavg_reward\tavg_copy_share\tavg_transfer_overlap_ratio\tavg_budget_pressure\tavg_queue_separation_ratio\n";
+                << "# key\tshape_bucket\tdevice_family_signature\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_calibration_ratio\tavg_system_penalty\tavg_validation_spread\tavg_reward\tavg_copy_share\tavg_transfer_overlap_ratio\tavg_budget_pressure\tavg_queue_separation_ratio\tavg_staging_hit_rate\tavg_cross_device_sync_cost_us\tavg_residency_pressure\tavg_kv_host_residency_ratio\n";
             for (const auto& [key, summary] : source) {
                 output << key << '\t'
                        << summary.shape_bucket << '\t'
@@ -7014,7 +8155,11 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
                        << summary.average_copy_share << '\t'
                        << summary.average_transfer_overlap_ratio << '\t'
                        << summary.average_budget_pressure << '\t'
-                       << summary.average_queue_separation_ratio << '\n';
+                       << summary.average_queue_separation_ratio << '\t'
+                       << summary.average_staging_hit_rate << '\t'
+                       << summary.average_cross_device_sync_cost_us << '\t'
+                       << summary.average_residency_pressure << '\t'
+                       << summary.average_kv_host_residency_ratio << '\n';
             }
         };
     persist_summary_map(performance_cache_path_, performance_cache_);
@@ -7024,7 +8169,7 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
     if (!hint_output.is_open()) {
         return;
     }
-    hint_output << "# key\tshape_bucket\tpreferred_parallel_chunk\tpreferred_tile_m\tpreferred_tile_n\tpreferred_tile_k\tobservations\tavg_latency\n";
+    hint_output << "# key\tshape_bucket\tpreferred_parallel_chunk\tpreferred_tile_m\tpreferred_tile_n\tpreferred_tile_k\tpreferred_use_avx512\tobservations\tavg_latency\n";
     for (const auto& [key, summary] : cpu_runtime_hint_cache_) {
         hint_output << key << '\t'
                     << summary.shape_bucket << '\t'
@@ -7032,6 +8177,7 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
                     << summary.preferred_tile_m << '\t'
                     << summary.preferred_tile_n << '\t'
                     << summary.preferred_tile_k << '\t'
+                    << (summary.preferred_use_avx512 ? 1 : 0) << '\t'
                     << summary.observations << '\t'
                     << summary.average_effective_latency_us << '\n';
     }

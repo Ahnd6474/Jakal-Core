@@ -146,6 +146,15 @@ struct OperationSpec {
     std::uint32_t cpu_tile_n = 0;
     std::uint32_t cpu_tile_k = 0;
     std::uint32_t cpu_parallel_chunk = 0;
+    bool cpu_use_avx512 = false;
+    std::uint64_t cpu_pack_budget_bytes = 0;
+    std::uint32_t cpu_single_thread_cutoff = 0;
+    std::string cpu_low_precision_kernel_family = "auto";
+    std::uint32_t attention_head_count = 0;
+    std::uint32_t attention_head_group_size = 0;
+    std::uint32_t preferred_token_block = 0;
+    std::string preferred_kv_residency = "auto";
+    bool residency_sensitive_fusion = false;
 };
 
 struct WorkloadTensor {
@@ -344,6 +353,10 @@ struct PerformanceSummary {
     double average_transfer_overlap_ratio = 0.0;
     double average_budget_pressure = 0.0;
     double average_queue_separation_ratio = 0.0;
+    double average_staging_hit_rate = 0.0;
+    double average_cross_device_sync_cost_us = 0.0;
+    double average_residency_pressure = 0.0;
+    double average_kv_host_residency_ratio = 0.0;
 };
 
 struct CpuRuntimeHintSummary {
@@ -352,6 +365,7 @@ struct CpuRuntimeHintSummary {
     std::uint32_t preferred_tile_m = 0;
     std::uint32_t preferred_tile_n = 0;
     std::uint32_t preferred_tile_k = 0;
+    bool preferred_use_avx512 = false;
     std::uint32_t observations = 0;
     double average_effective_latency_us = 0.0;
 };
@@ -396,6 +410,10 @@ struct ExecutionFeedbackRecord {
     double transfer_overlap_ratio = 0.0;
     double budget_pressure = 0.0;
     double queue_separation_ratio = 0.0;
+    double staging_hit_rate = 0.0;
+    double cross_device_sync_cost_us = 0.0;
+    double residency_pressure = 0.0;
+    double kv_host_residency_ratio = 0.0;
     std::uint32_t dispatch_count = 0;
     std::uint32_t event_wait_count = 0;
 };

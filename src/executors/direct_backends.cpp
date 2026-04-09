@@ -178,7 +178,10 @@ float quantize_bf16(const float value) {
     return bits_to_float(rounded & 0xffff0000u);
 }
 
-HostPrecisionMode select_host_precision(const HardwareGraph& graph, const bool low_precision) {
+HostPrecisionMode select_host_precision(
+    const HardwareGraph& graph,
+    const OperationSpec& operation,
+    const bool low_precision) {
     if (!low_precision) {
         return HostPrecisionMode::fp32;
     }
@@ -186,13 +189,28 @@ HostPrecisionMode select_host_precision(const HardwareGraph& graph, const bool l
         return HostPrecisionMode::emulated_lowp;
     }
     const auto summary = summarize_graph(graph);
-    if (summary.supports_bf16 && summary.native_vector_bits >= 512u) {
+    if ((operation.cpu_low_precision_kernel_family == "bf16-blocked" ||
+         operation.cpu_low_precision_kernel_family == "auto") &&
+        summary.supports_bf16 &&
+        summary.native_vector_bits >= 512u) {
         return HostPrecisionMode::bf16;
     }
-    if (summary.supports_fp16 && summary.native_vector_bits >= 256u) {
+    if ((operation.cpu_low_precision_kernel_family == "fp16-blocked" ||
+         operation.cpu_low_precision_kernel_family == "auto") &&
+        summary.supports_fp16 &&
+        summary.native_vector_bits >= 256u) {
         return HostPrecisionMode::fp16;
     }
     return HostPrecisionMode::emulated_lowp;
+}
+
+bool should_use_host_parallelism(
+    const OperationSpec& operation,
+    const std::uint64_t work_items) {
+    if (operation.cpu_single_thread_cutoff == 0u) {
+        return true;
+    }
+    return work_items >= static_cast<std::uint64_t>(operation.cpu_single_thread_cutoff);
 }
 
 float quantize_host_value(const float value, const HostPrecisionMode mode) {
@@ -288,7 +306,7 @@ public:
         const bool low_precision) const override {
         BackendRunResult result;
         result.output.resize(lhs.size(), 0.0f);
-        const auto precision = select_host_precision(graph, low_precision);
+        const auto precision = select_host_precision(graph, operation, low_precision);
         result.runtime_us = measure_us([&]() {
             if (try_run_host_native_elementwise(
                     graph,
@@ -326,7 +344,7 @@ public:
         const std::span<const float> input,
         const bool low_precision) const override {
         BackendRunResult result;
-        const auto precision = select_host_precision(graph, low_precision);
+        const auto precision = select_host_precision(graph, operation, low_precision);
         result.runtime_us = measure_us([&]() {
             float native_output = 0.0f;
             if (try_run_host_native_reduction(
@@ -385,12 +403,13 @@ public:
         const bool low_precision) const override {
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(rows) * columns, 0.0f);
-        const auto precision = select_host_precision(graph, low_precision);
+        const auto precision = select_host_precision(graph, operation, low_precision);
         result.runtime_us = measure_us([&]() {
             const bool rhs_transposed = cpu_rhs_uses_transposed_layout(operation);
             const bool used_native = precision == HostPrecisionMode::fp32
                 ? try_run_host_native_matmul(
                       graph,
+                      operation,
                       lhs,
                       rhs,
                       rows,
@@ -404,6 +423,7 @@ public:
                       result.output)
                 : try_run_host_native_low_precision_matmul(
                       graph,
+                      operation,
                       lhs,
                       rhs,
                       rows,
@@ -422,7 +442,7 @@ public:
             }
 
             const auto row_chunk = choose_host_row_chunk(operation, 4u);
-            HostThreadPool::instance().parallel_for(rows, row_chunk, [&](const std::size_t begin, const std::size_t end) {
+            const auto fallback = [&](const std::size_t begin, const std::size_t end) {
                 for (std::size_t row = begin; row < end; ++row) {
                     for (std::uint32_t col = 0; col < columns; ++col) {
                         float acc = 0.0f;
@@ -437,7 +457,13 @@ public:
                         result.output[row * columns + col] = acc;
                     }
                 }
-            });
+            };
+            const auto work_items = static_cast<std::uint64_t>(rows) * columns * depth;
+            if (should_use_host_parallelism(operation, work_items)) {
+                HostThreadPool::instance().parallel_for(rows, row_chunk, fallback);
+            } else {
+                fallback(0u, rows);
+            }
         });
         result.success = true;
         result.used_host = true;
@@ -461,7 +487,7 @@ public:
         const std::uint32_t out_width = width - 2u;
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(out_height) * out_width, 0.0f);
-        const auto precision = select_host_precision(graph, low_precision);
+        const auto precision = select_host_precision(graph, operation, low_precision);
         result.runtime_us = measure_us([&]() {
             const bool packed_input = cpu_conv_uses_patch9_layout(operation, input);
             if (try_run_host_native_conv3x3(
@@ -520,7 +546,7 @@ public:
         const bool low_precision) const override {
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(row_count) * dst_w, 0.0f);
-        const auto precision = select_host_precision(graph, low_precision);
+        const auto precision = select_host_precision(graph, operation, low_precision);
         result.runtime_us = measure_us([&]() {
             const bool packed_input = cpu_resample_uses_packed6_layout(operation, input);
             if (try_run_host_native_resample(
@@ -1133,6 +1159,10 @@ std::unique_ptr<IKernelBackend> make_host_kernel_backend() {
     return make_host_native_kernel_backend();
 }
 
+std::unique_ptr<IKernelBackend> make_modeled_gpu_kernel_backend(const JakalBackendKind backend) {
+    return std::make_unique<GenericGpuKernelBackend>(backend);
+}
+
 std::unique_ptr<IKernelBackend> make_level_zero_kernel_backend() {
     return make_native_gpu_kernel_backend(JakalBackendKind::level_zero);
 }
@@ -1151,6 +1181,11 @@ std::unique_ptr<IKernelBackend> make_vulkan_kernel_backend() {
 
 bool vulkan_direct_backend_available() {
     return vulkan_direct_backend_available_internal();
+}
+
+std::string vulkan_direct_backend_status_detail() {
+    extern std::string vulkan_direct_backend_status_detail_internal();
+    return vulkan_direct_backend_status_detail_internal();
 }
 
 }  // namespace jakal::executors

@@ -2,6 +2,7 @@
 #include "jakal/executors/direct_backends.hpp"
 #include "jakal/executors/native_gpu_backend.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <iostream>
@@ -120,10 +121,7 @@ bool expect_vulkan_backend_contracts() {
     for (const auto op_class : kAllOperationClasses) {
         std::string reason;
         const bool supported = jakal::runtime_backend_supports_operation(vulkan, op_class, &reason);
-        const bool expected_supported =
-            direct_available &&
-            (op_class == jakal::OperationClass::elementwise_map ||
-             op_class == jakal::OperationClass::reduction);
+        const bool expected_supported = direct_available;
         if (supported != expected_supported) {
             std::cerr << "unexpected Vulkan kernel coverage for op " << static_cast<int>(op_class) << '\n';
             return false;
@@ -195,6 +193,119 @@ bool expect_vulkan_backend_contracts() {
     if (std::abs(static_cast<float>(reduction.scalar_output) - expected_sum) > 1.0e-3f) {
         std::cerr << "unexpected Vulkan reduction output\n";
         return false;
+    }
+
+    std::vector<float> matmul_lhs{
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f};
+    std::vector<float> matmul_rhs{
+        0.5f, 1.0f,
+        1.5f, 2.0f,
+        2.5f, 3.0f};
+    jakal::OperationSpec matmul_op;
+    matmul_op.name = "matmul-contract";
+    matmul_op.op_class = jakal::OperationClass::matmul;
+    matmul_op.extents = {2u, 2u, 3u};
+    matmul_op.matrix_friendly = true;
+    const auto matmul = backend->run_matmul(vulkan, matmul_op, matmul_lhs, matmul_rhs, 2u, 2u, 3u, false);
+    if (!matmul.success || matmul.used_host || matmul.output.size() != 4u) {
+        std::cerr << "Vulkan matmul dispatch failed\n";
+        return false;
+    }
+    const std::array<float, 4> expected_matmul = {11.0f, 14.0f, 24.5f, 32.0f};
+    for (std::size_t index = 0; index < expected_matmul.size(); ++index) {
+        if (std::abs(matmul.output[index] - expected_matmul[index]) > 1.0e-4f) {
+            std::cerr << "unexpected Vulkan matmul output\n";
+            return false;
+        }
+    }
+
+    std::vector<float> conv_input{
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+        9.0f, 10.0f, 11.0f, 12.0f,
+        13.0f, 14.0f, 15.0f, 16.0f};
+    jakal::OperationSpec conv_op;
+    conv_op.name = "conv-contract";
+    conv_op.op_class = jakal::OperationClass::convolution_2d;
+    conv_op.extents = {4u, 4u};
+    const auto conv = backend->run_conv3x3(vulkan, conv_op, conv_input, 4u, 4u, false);
+    if (!conv.success || conv.used_host || conv.output.size() != 4u) {
+        std::cerr << "Vulkan conv dispatch failed\n";
+        return false;
+    }
+    const auto expected_conv = [&](const std::uint32_t y, const std::uint32_t x) {
+        static constexpr std::array<float, 9> kernel = {
+            0.0625f, 0.125f, 0.0625f,
+            0.125f, 0.25f, 0.125f,
+            0.0625f, 0.125f, 0.0625f};
+        float acc = 0.0f;
+        for (std::uint32_t ky = 0; ky < 3u; ++ky) {
+            for (std::uint32_t kx = 0; kx < 3u; ++kx) {
+                acc += conv_input[static_cast<std::size_t>(y + ky) * 4u + (x + kx)] * kernel[ky * 3u + kx];
+            }
+        }
+        return acc;
+    };
+    for (std::uint32_t y = 0; y < 2u; ++y) {
+        for (std::uint32_t x = 0; x < 2u; ++x) {
+            const auto index = static_cast<std::size_t>(y) * 2u + x;
+            if (std::abs(conv.output[index] - expected_conv(y, x)) > 1.0e-4f) {
+                std::cerr << "unexpected Vulkan conv output\n";
+                return false;
+            }
+        }
+    }
+
+    std::vector<float> resample_input{1.0f, 2.0f, 3.0f, 4.0f};
+    jakal::OperationSpec resample_op;
+    resample_op.name = "resample-contract";
+    resample_op.op_class = jakal::OperationClass::resample_2d;
+    resample_op.extents = {2u, 2u, 4u, 4u};
+    const auto resample = backend->run_resample(
+        vulkan,
+        resample_op,
+        resample_input,
+        2u,
+        2u,
+        4u,
+        4u,
+        0u,
+        4u,
+        false);
+    if (!resample.success || resample.used_host || resample.output.size() != 16u) {
+        std::cerr << "Vulkan resample dispatch failed\n";
+        return false;
+    }
+    const auto expected_resample = [&](const std::uint32_t y, const std::uint32_t x) {
+        const float src_y = (static_cast<float>(y) + 0.5f) * 2.0f / 4.0f - 0.5f;
+        const float clamped_y = std::clamp(src_y, 0.0f, 1.0f);
+        const auto y0 = static_cast<std::uint32_t>(clamped_y);
+        const auto y1 = std::min(y0 + 1u, 1u);
+        const float wy = clamped_y - static_cast<float>(y0);
+
+        const float src_x = (static_cast<float>(x) + 0.5f) * 2.0f / 4.0f - 0.5f;
+        const float clamped_x = std::clamp(src_x, 0.0f, 1.0f);
+        const auto x0 = static_cast<std::uint32_t>(clamped_x);
+        const auto x1 = std::min(x0 + 1u, 1u);
+        const float wx = clamped_x - static_cast<float>(x0);
+
+        const float v00 = resample_input[y0 * 2u + x0];
+        const float v01 = resample_input[y0 * 2u + x1];
+        const float v10 = resample_input[y1 * 2u + x0];
+        const float v11 = resample_input[y1 * 2u + x1];
+        const float top = v00 + ((v01 - v00) * wx);
+        const float bottom = v10 + ((v11 - v10) * wx);
+        return top + ((bottom - top) * wy);
+    };
+    for (std::uint32_t y = 0; y < 4u; ++y) {
+        for (std::uint32_t x = 0; x < 4u; ++x) {
+            const auto index = static_cast<std::size_t>(y) * 4u + x;
+            if (std::abs(resample.output[index] - expected_resample(y, x)) > 1.0e-4f) {
+                std::cerr << "unexpected Vulkan resample output\n";
+                return false;
+            }
+        }
     }
     return true;
 }

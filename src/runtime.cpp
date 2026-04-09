@@ -1420,6 +1420,55 @@ std::vector<ExecutionFeedbackRecord> make_feedback_records(const DirectExecution
     feedback.reserve(report.operations.size());
     for (const auto& operation : report.operations) {
         const auto total_copy_compute = std::max(operation.copy_runtime_us + operation.compute_runtime_us, 1.0);
+        const auto optimized_it = std::find_if(
+            report.optimization.operations.begin(),
+            report.optimization.operations.end(),
+            [&](const OperationOptimizationResult& optimized) {
+                return optimized.operation.name == operation.operation_name;
+            });
+        double staging_hit_rate = 0.0;
+        double cross_device_sync_cost_us = operation.synchronize_runtime_us;
+        double residency_pressure = 0.0;
+        double kv_host_residency_ratio = 0.0;
+        if (optimized_it != report.optimization.operations.end()) {
+            const auto& graph = optimized_it->graph;
+            const auto staging_node_count = std::count_if(
+                graph.nodes.begin(),
+                graph.nodes.end(),
+                [](const ExecutionNode& node) {
+                    return node.label.find("staging") != std::string::npos;
+                });
+            const auto cross_device_transfer_count = std::count_if(
+                graph.transfer_schedule.begin(),
+                graph.transfer_schedule.end(),
+                [](const TransferScheduleEntry& entry) { return entry.cross_device; });
+            staging_hit_rate = std::clamp(
+                operation.transfer_overlap_ratio +
+                    (staging_node_count > 0 ? 0.20 : 0.0) +
+                    (cross_device_transfer_count > 0 ? 0.10 : 0.0),
+                0.0,
+                1.0);
+            cross_device_sync_cost_us +=
+                graph.predicted_transfer_latency_us * (1.0 - std::clamp(operation.transfer_overlap_ratio, 0.0, 0.95));
+            residency_pressure = graph.predicted_memory_pressure;
+
+            std::uint32_t kv_entries = 0u;
+            std::uint32_t kv_host_entries = 0u;
+            for (const auto& entry : graph.residency_plan) {
+                const bool kv_entry =
+                    entry.tensor_id.find("kv") != std::string::npos ||
+                    entry.tensor_id.find("cache") != std::string::npos;
+                if (!kv_entry) {
+                    continue;
+                }
+                ++kv_entries;
+                if (entry.device_uid == "host" || entry.device_uid.rfind("host:", 0) == 0) {
+                    ++kv_host_entries;
+                }
+            }
+            kv_host_residency_ratio =
+                kv_entries == 0u ? 0.0 : static_cast<double>(kv_host_entries) / static_cast<double>(kv_entries);
+        }
         feedback.push_back(ExecutionFeedbackRecord{
             operation.operation_name,
             operation.backend_name,
@@ -1436,6 +1485,10 @@ std::vector<ExecutionFeedbackRecord> make_feedback_records(const DirectExecution
             operation.transfer_overlap_ratio,
             report.optimization.graph_optimization.budget_exhausted ? 1.0 : 0.0,
             operation.queue_separation_ratio,
+            staging_hit_rate,
+            cross_device_sync_cost_us,
+            residency_pressure,
+            kv_host_residency_ratio,
             operation.dispatch_count,
             operation.event_wait_count});
     }
@@ -2050,7 +2103,7 @@ bool backend_supports_operation(
         if (reason != nullptr) {
             *reason =
                 *backend_kind == JakalBackendKind::vulkan_compute
-                    ? "vulkan direct backend supports only elementwise_map and reduction"
+                    ? "vulkan direct backend lacks kernel coverage for the requested operation"
                     : "backend lacks direct kernel coverage";
         }
         return false;
@@ -2220,12 +2273,13 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
     const auto workload_graph = default_workload_graph(workload);
     const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
     const auto placement = planner_.build_plan(context.effective_workload, devices_);
-    return execution_optimizer_.optimize(
+    auto report = execution_optimizer_.optimize(
         context.effective_workload,
         placement,
         devices_,
         &workload_graph,
         &context.execution_tuning);
+    return report;
 }
 
 OptimizationReport Runtime::optimize(const WorkloadSpec& workload, const WorkloadGraph& workload_graph) {
@@ -2233,12 +2287,13 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload, const Workloa
 
     const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
     const auto placement = planner_.build_plan(context.effective_workload, devices_);
-    return execution_optimizer_.optimize(
+    auto report = execution_optimizer_.optimize(
         context.effective_workload,
         placement,
         devices_,
         &workload_graph,
         &context.execution_tuning);
+    return report;
 }
 
 DirectExecutionReport Runtime::execute_with_feedback(
@@ -2938,10 +2993,21 @@ KernelCoverageReport Runtime::build_kernel_coverage(const OptimizationReport& op
 AssetPrefetchReport Runtime::build_asset_prefetch(
     const WorkloadManifest& manifest,
     const OptimizationReport& optimization) const {
+    const auto host_graph_it = std::find_if(devices_.begin(), devices_.end(), [](const HardwareGraph& graph) {
+        return graph.probe == "host";
+    });
+    const std::string canonical_host_uid = host_graph_it == devices_.end() ? std::string() : host_graph_it->uid;
+    const auto canonicalize_device_uid = [&](std::string device_uid) {
+        if ((device_uid == "host" || device_uid.rfind("host:", 0) == 0) && !canonical_host_uid.empty()) {
+            return canonical_host_uid;
+        }
+        return device_uid;
+    };
     const auto queue_hint_for_asset = [&](const WorkloadAsset& asset, const std::string& device_uid) {
-        const auto* target_graph = device_uid.empty() ? nullptr : find_graph_by_uid(devices_, device_uid);
-        const bool target_is_host = target_graph != nullptr && target_graph->probe == "host";
-        if (device_uid.empty() || target_is_host || asset.preferred_residency == "host") {
+        const auto canonical_device_uid = canonicalize_device_uid(device_uid);
+        const bool target_is_host =
+            canonical_device_uid.empty() ? false : (canonical_device_uid == canonical_host_uid);
+        if (canonical_device_uid.empty() || target_is_host || asset.preferred_residency == "host") {
             return std::string("host_io");
         }
         if (asset.preferred_residency == "device" || asset.preferred_residency == "accelerator") {
@@ -2975,8 +3041,9 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
                 continue;
             }
             auto& devices = tensor_devices[entry.tensor_id];
-            if (std::find(devices.begin(), devices.end(), entry.device_uid) == devices.end()) {
-                devices.push_back(entry.device_uid);
+            const auto canonical_device_uid = canonicalize_device_uid(entry.device_uid);
+            if (std::find(devices.begin(), devices.end(), canonical_device_uid) == devices.end()) {
+                devices.push_back(canonical_device_uid);
             }
         }
     }
@@ -3053,12 +3120,13 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
             }
             for (const auto& device_uid : devices_it->second) {
                 const auto queue_hint = queue_hint_for_asset(asset, device_uid);
+                const auto canonical_device_uid = canonicalize_device_uid(device_uid);
                 append_prefetch_entry(AssetPrefetchEntry{
                     asset.id,
                     asset.id,
                     asset.path,
                     tensor_id,
-                    device_uid,
+                    canonical_device_uid,
                     asset.file_offset,
                     per_tensor_bytes,
                     queue_hint,
@@ -3103,10 +3171,7 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
                         }
                     }
                 } else {
-                    const auto host_graph_it = std::find_if(devices_.begin(), devices_.end(), [](const HardwareGraph& graph) {
-                        return graph.probe == "host";
-                    });
-                    target_devices.push_back(host_graph_it == devices_.end() ? std::string() : host_graph_it->uid);
+                    target_devices.push_back(canonical_host_uid);
                 }
                 if (target_devices.empty()) {
                     continue;

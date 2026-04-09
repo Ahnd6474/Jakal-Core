@@ -37,6 +37,28 @@ double inference_bias(const OperationOptimizationResult& operation, const Hardwa
     if (summary.supports_asynchronous_dispatch && operation.config.overlap_transfers) {
         bias += 0.08;
     }
+    if (operation.operation.attention_head_count > 0u) {
+        const double head_scale =
+            std::log2(static_cast<double>(std::max(operation.operation.attention_head_count, 1u)) + 1.0);
+        if (graph.probe == "host") {
+            bias += operation.operation.attention_head_group_size <= 4u
+                        ? std::min(head_scale * 0.04, 0.18)
+                        : std::min(head_scale * 0.02, 0.10);
+            if (operation.operation.preferred_kv_residency == "host" ||
+                operation.operation.preferred_kv_residency == "shared") {
+                bias += 0.10;
+            }
+        } else {
+            bias += std::min(head_scale * 0.05, 0.24);
+            if (operation.operation.preferred_token_block >= 64u) {
+                bias += 0.08;
+            }
+            if (operation.operation.preferred_kv_residency == "accelerator" ||
+                operation.operation.preferred_kv_residency == "shared") {
+                bias += 0.06;
+            }
+        }
+    }
     if ((operation.operation.input_bytes + operation.operation.output_bytes) >= (16ull * 1024ull * 1024ull) &&
         !summary.coherent_with_host &&
         !summary.unified_address_space) {
@@ -47,6 +69,27 @@ double inference_bias(const OperationOptimizationResult& operation, const Hardwa
     }
 
     return std::clamp(bias, 0.45, 2.50);
+}
+
+std::uint32_t head_group_count(const OperationOptimizationResult& operation) {
+    if (operation.operation.attention_head_count == 0u) {
+        return 1u;
+    }
+    const auto group_size = std::max(operation.operation.attention_head_group_size, 1u);
+    return std::max<std::uint32_t>(1u, (operation.operation.attention_head_count + group_size - 1u) / group_size);
+}
+
+std::uint32_t token_block_count(
+    const OperationOptimizationResult& operation,
+    const std::size_t total_items) {
+    if (operation.operation.preferred_token_block == 0u || total_items == 0u) {
+        return 1u;
+    }
+    return std::max<std::uint32_t>(
+        1u,
+        static_cast<std::uint32_t>(
+            (total_items + static_cast<std::size_t>(operation.operation.preferred_token_block) - 1u) /
+            static_cast<std::size_t>(operation.operation.preferred_token_block)));
 }
 
 }  // namespace
@@ -101,6 +144,8 @@ std::vector<DeviceAssignment> DefaultIntraDeviceScheduler::make_assignments(
     assignments.reserve(
         operation.config.participating_devices.size() *
         static_cast<std::size_t>(std::max(operation.config.logical_partitions, 1u)));
+    const auto semantic_head_groups = head_group_count(operation);
+    const auto semantic_token_blocks = token_block_count(operation, total_items);
     std::size_t consumed = 0;
 
     for (std::size_t index = 0; index < operation.config.participating_devices.size(); ++index) {
@@ -136,7 +181,15 @@ std::vector<DeviceAssignment> DefaultIntraDeviceScheduler::make_assignments(
                 ratio / static_cast<double>(partitions),
                 {consumed + local_consumed, partition_count},
                 partition,
-                partitions});
+                partitions,
+                semantic_head_groups == 0u ? 0u : (partition % semantic_head_groups),
+                semantic_head_groups,
+                operation.operation.preferred_token_block == 0u
+                    ? 0u
+                    : static_cast<std::uint32_t>(
+                          (consumed + local_consumed) /
+                          static_cast<std::size_t>(operation.operation.preferred_token_block)),
+                semantic_token_blocks});
             local_consumed += partition_count;
         }
 

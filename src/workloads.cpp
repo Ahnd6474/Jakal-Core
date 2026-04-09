@@ -2588,7 +2588,6 @@ void finalize_workload_graph(WorkloadGraph& graph) {
             tensor.bytes,
             tensor.persistent});
     }
-
     for (const auto& dependency : explicit_dependencies) {
         const auto duplicate = std::find_if(
             graph.dependencies.begin(),
@@ -2602,7 +2601,6 @@ void finalize_workload_graph(WorkloadGraph& graph) {
             graph.dependencies.push_back(dependency);
         }
     }
-
     for (auto& operation : graph.operations) {
         for (const auto& dependency : graph.dependencies) {
             if (dependency.target_operation_name == operation.name &&
@@ -3169,7 +3167,6 @@ WorkloadGraph default_workload_graph(const WorkloadSpec& workload) {
     graph.signature = workload.name + "|" + to_string(workload.kind) + "|" + workload.dataset_tag +
                       "|" + to_string(canonical_workload_phase(workload)) +
                       "|" + canonical_workload_shape_bucket(workload);
-
     const std::uint64_t working_set =
         workload.working_set_bytes == 0 ? (32ull * kMiB) : workload.working_set_bytes;
     const std::uint64_t sample_bytes = clamp_u64(working_set / 12ull, 2ull * kMiB, 16ull * kMiB);

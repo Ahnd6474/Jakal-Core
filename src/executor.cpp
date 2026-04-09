@@ -10,10 +10,13 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -54,6 +57,103 @@ float quantize_value(const float value, const bool low_precision) {
     }
     return std::round(value * 1024.0f) / 1024.0f;
 }
+
+class ExecutorWorkerPool final {
+public:
+    static ExecutorWorkerPool& instance() {
+        static ExecutorWorkerPool pool;
+        return pool;
+    }
+
+    ExecutorWorkerPool(const ExecutorWorkerPool&) = delete;
+    ExecutorWorkerPool& operator=(const ExecutorWorkerPool&) = delete;
+
+    void run_batch(std::vector<std::function<void()>> tasks) {
+        if (tasks.empty()) {
+            return;
+        }
+        if (workers_.size() <= 1u || tasks.size() <= 1u) {
+            for (auto& task : tasks) {
+                task();
+            }
+            return;
+        }
+
+        Batch batch;
+        batch.remaining = tasks.size();
+        {
+            std::scoped_lock lock(mutex_);
+            for (auto& task : tasks) {
+                queued_tasks_.push_back([task = std::move(task), &batch]() mutable {
+                    task();
+                    if (batch.remaining.fetch_sub(1u) == 1u) {
+                        std::scoped_lock done_lock(batch.done_mutex);
+                        batch.done = true;
+                        batch.done_condition.notify_one();
+                    }
+                });
+            }
+        }
+        condition_.notify_all();
+
+        std::unique_lock wait_lock(batch.done_mutex);
+        batch.done_condition.wait(wait_lock, [&batch]() { return batch.done; });
+    }
+
+private:
+    struct Batch {
+        std::mutex done_mutex;
+        std::condition_variable done_condition;
+        std::atomic_size_t remaining{0u};
+        bool done = false;
+    };
+
+    ExecutorWorkerPool() {
+        const auto worker_count = std::max(1u, std::thread::hardware_concurrency());
+        const auto thread_count = worker_count > 1u ? worker_count - 1u : 0u;
+        workers_.reserve(thread_count);
+        for (std::size_t index = 0; index < thread_count; ++index) {
+            workers_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+
+    ~ExecutorWorkerPool() {
+        {
+            std::scoped_lock lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    void worker_loop() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(mutex_);
+                condition_.wait(lock, [&]() { return stopping_ || !queued_tasks_.empty(); });
+                if (stopping_ && queued_tasks_.empty()) {
+                    break;
+                }
+                task = std::move(queued_tasks_.front());
+                queued_tasks_.pop_front();
+            }
+            if (task) {
+                task();
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<std::function<void()>> queued_tasks_;
+    std::vector<std::thread> workers_;
+    bool stopping_ = false;
+};
 
 std::vector<float> make_pattern(const std::size_t count, const float phase) {
     std::vector<float> data(count);
@@ -1819,7 +1919,6 @@ DirectExecutionReport DirectExecutor::execute(
     const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index) const {
     DirectExecutionReport report;
     report.optimization = optimization;
-
     auto host_backend = executors::make_host_kernel_backend();
     OpenClDirectBackend opencl_backend;
     auto level_zero_backend = executors::make_level_zero_kernel_backend();
@@ -2159,23 +2258,14 @@ DirectExecutionReport DirectExecutor::execute(
                         run_group(group);
                     }
                 } else {
-                    std::atomic_size_t next_group{0u};
-                    std::vector<std::thread> workers;
-                    workers.reserve(worker_count);
-                    for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
-                        workers.emplace_back([&]() {
-                            while (true) {
-                                const auto group_index = next_group.fetch_add(1u);
-                                if (group_index >= assignment_groups.size()) {
-                                    break;
-                                }
-                                run_group(assignment_groups[group_index]);
-                            }
+                    std::vector<std::function<void()>> tasks;
+                    tasks.reserve(assignment_groups.size());
+                    for (const auto& group : assignment_groups) {
+                        tasks.push_back([&, group]() {
+                            run_group(group);
                         });
                     }
-                    for (auto& worker : workers) {
-                        worker.join();
-                    }
+                    ExecutorWorkerPool::instance().run_batch(std::move(tasks));
                 }
 
                 for (std::size_t index = 0; index < assignments.size(); ++index) {
@@ -2238,6 +2328,23 @@ DirectExecutionReport DirectExecutor::execute(
                 // Host-native and its lowered variants are also the semantic reference
                 // path. Accept them even when low-precision host kernels drift against
                 // the synthetic verifier.
+                record.relative_error = 0.0;
+            }
+            if (record.relative_error > optimized.operation.max_relative_error &&
+                record.backend_name.rfind("host-native", 0) != 0) {
+                record.used_host = true;
+                record.used_opencl = false;
+                record.runtime_us = std::max(record.runtime_us, record.reference_runtime_us);
+                if (!record.backend_error.empty()) {
+                    record.backend_error += "; ";
+                }
+                record.backend_error += "verification-fallback";
+                if (optimized.operation.op_class == OperationClass::reduction) {
+                    merged_scalar = verification_scalar;
+                } else {
+                    merged_output = verification_vector;
+                }
+                record.backend_name = "host-native+verification-fallback";
                 record.relative_error = 0.0;
             }
             record.verified = record.relative_error <= optimized.operation.max_relative_error;

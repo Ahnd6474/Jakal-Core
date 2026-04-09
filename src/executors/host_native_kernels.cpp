@@ -164,6 +164,35 @@ std::size_t choose_linear_chunk(
     return 512u * vector_bonus;
 }
 
+std::size_t choose_row_chunk(
+    const OperationSpec& operation,
+    const std::uint32_t rows,
+    const std::size_t fallback) {
+    if (operation.cpu_single_thread_cutoff > 0u) {
+        const auto work_items =
+            static_cast<std::uint64_t>(rows) *
+            std::max<std::uint64_t>(1ull, operation.extents.size() > 1u ? operation.extents[1] : 1ull) *
+            std::max<std::uint64_t>(1ull, operation.extents.size() > 2u ? operation.extents[2] : 1ull);
+        if (work_items < static_cast<std::uint64_t>(operation.cpu_single_thread_cutoff)) {
+            return static_cast<std::size_t>(rows);
+        }
+    }
+    return std::max<std::size_t>(1u, operation.cpu_parallel_chunk == 0u ? fallback : operation.cpu_parallel_chunk);
+}
+
+std::uint32_t fit_tile_to_pack_budget(
+    const std::uint32_t tile_k,
+    std::uint32_t tile_n,
+    const std::uint64_t pack_budget_bytes) {
+    if (pack_budget_bytes == 0u || tile_k == 0u || tile_n == 0u) {
+        return tile_n;
+    }
+    while ((static_cast<std::uint64_t>(tile_k) * tile_n * sizeof(float)) > pack_budget_bytes && tile_n > 8u) {
+        tile_n = std::max<std::uint32_t>(8u, tile_n - 8u);
+    }
+    return tile_n;
+}
+
 bool has_fused_name(const OperationSpec& operation, const std::string_view name) {
     return std::find(
                operation.fused_operation_names.begin(),
@@ -174,12 +203,29 @@ bool has_fused_name(const OperationSpec& operation, const std::string_view name)
 enum class HostElementwisePattern {
     generic,
     fused_bias_relu,
-    fused_mlp_activation
+    fused_mlp_activation,
+    post_tonemap,
+    streaming_dual_input,
+    gate_residual
 };
 
 HostElementwisePattern select_elementwise_pattern(const OperationSpec& operation) {
     if (has_fused_name(operation, "mlp-activation")) {
         return HostElementwisePattern::fused_mlp_activation;
+    }
+    if (has_fused_name(operation, "post-tonemap") ||
+        operation.name.find("tonemap") != std::string::npos) {
+        return HostElementwisePattern::post_tonemap;
+    }
+    if (has_fused_name(operation, "ew-post") ||
+        operation.name.find("reactive-mask") != std::string::npos ||
+        operation.name.find("frame-pre") != std::string::npos) {
+        return HostElementwisePattern::streaming_dual_input;
+    }
+    if (operation.name.find("gate") != std::string::npos ||
+        operation.name.find("mix") != std::string::npos ||
+        has_fused_name(operation, "sigmoid")) {
+        return HostElementwisePattern::gate_residual;
     }
     if (has_fused_name(operation, "bias") ||
         has_fused_name(operation, "relu") ||
@@ -193,10 +239,20 @@ HostElementwisePattern select_elementwise_pattern(const OperationSpec& operation
 enum class HostReductionPattern {
     generic,
     fused_epilogue,
-    streaming_chain
+    streaming_chain,
+    attention_pool,
+    luminance_pass
 };
 
 HostReductionPattern select_reduction_pattern(const OperationSpec& operation) {
+    if (operation.name.find("attention-score") != std::string::npos ||
+        operation.name.find("token-pool") != std::string::npos) {
+        return HostReductionPattern::attention_pool;
+    }
+    if (operation.name.find("luma") != std::string::npos ||
+        has_fused_name(operation, "post-tonemap")) {
+        return HostReductionPattern::luminance_pass;
+    }
     if (has_fused_name(operation, "bias") ||
         has_fused_name(operation, "relu") ||
         has_fused_name(operation, "post-tonemap")) {
@@ -784,6 +840,71 @@ void run_elementwise_fp32_mlp_activation(
     run_elementwise_fp32_generic(lhs, rhs, index, end, output);
 }
 
+void run_elementwise_fp32_post_tonemap(
+    std::span<const float> lhs,
+    std::span<const float> rhs,
+    const std::size_t begin,
+    const std::size_t end,
+    std::span<float> output) {
+    const __m256 scale_l = _mm256_set1_ps(1.125f);
+    const __m256 scale_r = _mm256_set1_ps(0.25f);
+    const __m256 bias = _mm256_set1_ps(0.03125f);
+    std::size_t index = begin;
+    for (; index + 32u <= end; index += 32u) {
+        for (std::size_t lane = 0u; lane < 32u; lane += 8u) {
+            const __m256 left = _mm256_mul_ps(_mm256_loadu_ps(lhs.data() + index + lane), scale_l);
+            const __m256 right = _mm256_mul_ps(_mm256_loadu_ps(rhs.data() + index + lane), scale_r);
+            _mm256_storeu_ps(
+                output.data() + index + lane,
+                _mm256_sub_ps(_mm256_add_ps(left, right), bias));
+        }
+    }
+    run_elementwise_fp32_generic(lhs, rhs, index, end, output);
+}
+
+void run_elementwise_fp32_streaming_dual_input(
+    std::span<const float> lhs,
+    std::span<const float> rhs,
+    const std::size_t begin,
+    const std::size_t end,
+    std::span<float> output) {
+    const __m256 scale_l = _mm256_set1_ps(1.125f);
+    const __m256 scale_r = _mm256_set1_ps(0.25f);
+    const __m256 bias = _mm256_set1_ps(0.03125f);
+    std::size_t index = begin;
+    for (; index + 16u <= end; index += 16u) {
+        const __m256 left0 = _mm256_mul_ps(_mm256_loadu_ps(lhs.data() + index), scale_l);
+        const __m256 right0 = _mm256_mul_ps(_mm256_loadu_ps(rhs.data() + index), scale_r);
+        const __m256 left1 = _mm256_mul_ps(_mm256_loadu_ps(lhs.data() + index + 8u), scale_l);
+        const __m256 right1 = _mm256_mul_ps(_mm256_loadu_ps(rhs.data() + index + 8u), scale_r);
+        _mm256_storeu_ps(output.data() + index, _mm256_sub_ps(_mm256_add_ps(left0, right0), bias));
+        _mm256_storeu_ps(output.data() + index + 8u, _mm256_sub_ps(_mm256_add_ps(left1, right1), bias));
+    }
+    run_elementwise_fp32_generic(lhs, rhs, index, end, output);
+}
+
+void run_elementwise_fp32_gate_residual(
+    std::span<const float> lhs,
+    std::span<const float> rhs,
+    const std::size_t begin,
+    const std::size_t end,
+    std::span<float> output) {
+    const __m256 scale_l = _mm256_set1_ps(1.125f);
+    const __m256 scale_r = _mm256_set1_ps(0.25f);
+    const __m256 neg_bias = _mm256_set1_ps(-0.03125f);
+    std::size_t index = begin;
+    for (; index + 24u <= end; index += 24u) {
+        for (std::size_t lane = 0u; lane < 24u; lane += 8u) {
+            const __m256 left = _mm256_mul_ps(_mm256_loadu_ps(lhs.data() + index + lane), scale_l);
+            const __m256 right = _mm256_mul_ps(_mm256_loadu_ps(rhs.data() + index + lane), scale_r);
+            _mm256_storeu_ps(
+                output.data() + index + lane,
+                _mm256_add_ps(_mm256_add_ps(left, right), neg_bias));
+        }
+    }
+    run_elementwise_fp32_generic(lhs, rhs, index, end, output);
+}
+
 void run_elementwise_fp32(
     const HostElementwisePattern pattern,
     std::span<const float> lhs,
@@ -797,6 +918,15 @@ void run_elementwise_fp32(
         return;
     case HostElementwisePattern::fused_mlp_activation:
         run_elementwise_fp32_mlp_activation(lhs, rhs, begin, end, output);
+        return;
+    case HostElementwisePattern::post_tonemap:
+        run_elementwise_fp32_post_tonemap(lhs, rhs, begin, end, output);
+        return;
+    case HostElementwisePattern::streaming_dual_input:
+        run_elementwise_fp32_streaming_dual_input(lhs, rhs, begin, end, output);
+        return;
+    case HostElementwisePattern::gate_residual:
+        run_elementwise_fp32_gate_residual(lhs, rhs, begin, end, output);
         return;
     case HostElementwisePattern::generic:
     default:
@@ -859,6 +989,44 @@ float run_reduction_fp32_streaming_chain(
     return total;
 }
 
+float run_reduction_fp32_attention_pool(
+    std::span<const float> input,
+    const std::size_t begin,
+    const std::size_t end) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    std::size_t index = begin;
+    for (; index + 24u <= end; index += 24u) {
+        acc0 = _mm256_add_ps(acc0, _mm256_loadu_ps(input.data() + index));
+        acc1 = _mm256_add_ps(acc1, _mm256_loadu_ps(input.data() + index + 8u));
+        acc2 = _mm256_add_ps(acc2, _mm256_loadu_ps(input.data() + index + 16u));
+    }
+    float total = horizontal_sum(_mm256_add_ps(_mm256_add_ps(acc0, acc1), acc2));
+    for (; index < end; ++index) {
+        total += input[index];
+    }
+    return total;
+}
+
+float run_reduction_fp32_luminance_pass(
+    std::span<const float> input,
+    const std::size_t begin,
+    const std::size_t end) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    std::size_t index = begin;
+    for (; index + 16u <= end; index += 16u) {
+        acc0 = _mm256_add_ps(acc0, _mm256_loadu_ps(input.data() + index));
+        acc1 = _mm256_add_ps(acc1, _mm256_loadu_ps(input.data() + index + 8u));
+    }
+    float total = horizontal_sum(_mm256_add_ps(acc0, acc1));
+    for (; index < end; ++index) {
+        total += input[index];
+    }
+    return total;
+}
+
 float run_reduction_fp32(
     const HostReductionPattern pattern,
     std::span<const float> input,
@@ -869,6 +1037,10 @@ float run_reduction_fp32(
         return run_reduction_fp32_fused_epilogue(input, begin, end);
     case HostReductionPattern::streaming_chain:
         return run_reduction_fp32_streaming_chain(input, begin, end);
+    case HostReductionPattern::attention_pool:
+        return run_reduction_fp32_attention_pool(input, begin, end);
+    case HostReductionPattern::luminance_pass:
+        return run_reduction_fp32_luminance_pass(input, begin, end);
     case HostReductionPattern::generic:
     default:
         return run_reduction_fp32_generic(input, begin, end);
@@ -878,6 +1050,10 @@ float run_reduction_fp32(
 #endif
 
 }  // namespace
+
+bool host_native_kernels_compiled_with_avx512() {
+    return host_native_avx512_available();
+}
 
 bool try_run_host_native_elementwise(
     const HardwareGraph& graph,
@@ -959,6 +1135,7 @@ bool try_run_host_native_reduction(
 
 bool try_run_host_native_matmul(
     const HardwareGraph& graph,
+    const OperationSpec& operation,
     std::span<const float> lhs,
     std::span<const float> rhs,
     const std::uint32_t rows,
@@ -977,31 +1154,32 @@ bool try_run_host_native_matmul(
     }
 
     const auto effective_tile_m_value = effective_tile_hint(tile_m, kHostMatmulMBlock, kHostMatmulMr, kHostMatmulMr);
-    const auto effective_tile_n_value = effective_tile_hint(tile_n, kHostMatmulNBlock, kHostMatmulNr, kHostMatmulNr);
+    auto effective_tile_n_value = effective_tile_hint(tile_n, kHostMatmulNBlock, kHostMatmulNr, kHostMatmulNr);
     const auto effective_tile_k_value = effective_tile_hint(tile_k, kHostMatmulKBlock, kHostMatmulNr, kHostMatmulNr);
-    const auto min_chunk = std::max<std::size_t>(1u, parallel_chunk_rows == 0u ? 4u : parallel_chunk_rows);
-    run_parallel_rows(rows, min_chunk, [&](const std::size_t begin, const std::size_t end) {
-#if defined(__AVX512F__)
-        if (summary.native_vector_bits >= 512u && columns >= kHostMatmulAvx512Nr && depth >= 16u) {
-            const auto avx512_tile_m = effective_tile_hint(tile_m, 64u, kHostMatmulAvx512Mr, kHostMatmulAvx512Mr);
-            const auto avx512_tile_n = effective_tile_hint(tile_n, 96u, kHostMatmulAvx512Nr, kHostMatmulAvx512Nr);
-            const auto avx512_tile_k = effective_tile_hint(tile_k, 128u, 16u, 16u);
-            run_fp32_blocked_matmul_rows_avx512(
-                lhs,
-                rhs,
-                rows,
-                columns,
-                depth,
-                rhs_transposed,
-                avx512_tile_m,
-                avx512_tile_n,
-                avx512_tile_k,
-                begin,
-                end,
-                output);
-            return;
-        }
-#endif
+    effective_tile_n_value = fit_tile_to_pack_budget(
+        effective_tile_k_value,
+        effective_tile_n_value,
+        operation.cpu_pack_budget_bytes);
+    if (operation.cpu_use_avx512 &&
+        host_native_avx512_available() &&
+        try_run_host_native_matmul_avx512(
+            graph,
+            lhs,
+            rhs,
+            rows,
+            columns,
+            depth,
+            rhs_transposed,
+            tile_m,
+            tile_n,
+            tile_k,
+            parallel_chunk_rows,
+            output)) {
+        return true;
+    }
+
+    const auto min_chunk = choose_row_chunk(operation, rows, parallel_chunk_rows == 0u ? 4u : parallel_chunk_rows);
+    if (min_chunk >= rows) {
         run_fp32_blocked_matmul_rows(
             lhs,
             rhs,
@@ -1012,13 +1190,30 @@ bool try_run_host_native_matmul(
             effective_tile_m_value,
             effective_tile_n_value,
             effective_tile_k_value,
-            begin,
-            end,
+            0u,
+            rows,
             output);
-    });
+    } else {
+        run_parallel_rows(rows, min_chunk, [&](const std::size_t begin, const std::size_t end) {
+            run_fp32_blocked_matmul_rows(
+                lhs,
+                rhs,
+                rows,
+                columns,
+                depth,
+                rhs_transposed,
+                effective_tile_m_value,
+                effective_tile_n_value,
+                effective_tile_k_value,
+                begin,
+                end,
+                output);
+        });
+    }
     return true;
 #else
     (void)graph;
+    (void)operation;
     (void)lhs;
     (void)rhs;
     (void)rows;
@@ -1036,6 +1231,7 @@ bool try_run_host_native_matmul(
 
 bool try_run_host_native_low_precision_matmul(
     const HardwareGraph& graph,
+    const OperationSpec& operation,
     std::span<const float> lhs,
     std::span<const float> rhs,
     const std::uint32_t rows,
@@ -1049,6 +1245,7 @@ bool try_run_host_native_low_precision_matmul(
     if (prefer_bf16 &&
         try_run_host_native_bf16_matmul(
             graph,
+            operation,
             lhs,
             rhs,
             rows,
@@ -1069,13 +1266,75 @@ bool try_run_host_native_low_precision_matmul(
         return false;
     }
 
-    const auto min_chunk = std::max<std::size_t>(1u, parallel_chunk_rows == 0u ? 4u : parallel_chunk_rows);
-    run_parallel_rows(rows, min_chunk, [&](const std::size_t begin, const std::size_t end) {
-        run_fp16_matmul_rows(lhs, rhs, columns, depth, rhs_transposed, begin, end, output);
-    });
+    const auto effective_tile_m_value = effective_tile_hint(
+        operation.cpu_tile_m,
+        32u,
+        4u,
+        4u);
+    auto effective_tile_n_value = effective_tile_hint(
+        operation.cpu_tile_n,
+        32u,
+        8u,
+        8u);
+    const auto effective_tile_k_value = effective_tile_hint(
+        operation.cpu_tile_k,
+        64u,
+        8u,
+        8u);
+    effective_tile_n_value = fit_tile_to_pack_budget(
+        effective_tile_k_value,
+        effective_tile_n_value,
+        operation.cpu_pack_budget_bytes);
+
+    const auto run_blocked = [&](const std::size_t begin, const std::size_t end) {
+        const auto row_start = static_cast<std::uint32_t>(begin);
+        const auto row_limit = static_cast<std::uint32_t>(end);
+        for (std::uint32_t col_block = 0u; col_block < columns; col_block += effective_tile_n_value) {
+            const auto col_count = std::min(effective_tile_n_value, columns - col_block);
+            std::vector<float> packed_rhs(static_cast<std::size_t>(effective_tile_k_value) * col_count, 0.0f);
+            for (std::uint32_t k_block = 0u; k_block < depth; k_block += effective_tile_k_value) {
+                const auto k_count = std::min(effective_tile_k_value, depth - k_block);
+                pack_rhs_panel(
+                    rhs,
+                    columns,
+                    depth,
+                    k_block,
+                    k_count,
+                    col_block,
+                    col_count,
+                    rhs_transposed,
+                    std::span<float>(packed_rhs.data(), static_cast<std::size_t>(k_count) * col_count));
+                for (std::uint32_t row_block = row_start; row_block < row_limit; row_block += effective_tile_m_value) {
+                    const auto row_end = std::min(row_limit, row_block + effective_tile_m_value);
+                    for (std::uint32_t row = row_block; row < row_end; ++row) {
+                        const auto lhs_base = static_cast<std::size_t>(row) * depth;
+                        for (std::uint32_t col = 0u; col < col_count; ++col) {
+                            const auto out_index = static_cast<std::size_t>(row) * columns + col_block + col;
+                            float acc = output[out_index];
+                            for (std::uint32_t inner = 0u; inner < k_count; ++inner) {
+                                acc = quantize_fp16_scalar(
+                                    acc +
+                                    (quantize_fp16_scalar(lhs[lhs_base + k_block + inner]) *
+                                     quantize_fp16_scalar(
+                                         packed_rhs[static_cast<std::size_t>(inner) * col_count + col])));
+                            }
+                            output[out_index] = acc;
+                        }
+                    }
+                }
+            }
+        }
+    };
+    const auto min_chunk = choose_row_chunk(operation, rows, parallel_chunk_rows == 0u ? 4u : parallel_chunk_rows);
+    if (min_chunk >= rows) {
+        run_blocked(0u, rows);
+    } else {
+        run_parallel_rows(rows, min_chunk, run_blocked);
+    }
     return true;
 #else
     (void)graph;
+    (void)operation;
     (void)lhs;
     (void)rhs;
     (void)rows;

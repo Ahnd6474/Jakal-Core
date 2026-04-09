@@ -33,12 +33,23 @@
 namespace jakal::executors {
 
 bool vulkan_direct_backend_available_internal();
+std::string vulkan_direct_backend_status_detail_internal();
 std::unique_ptr<IKernelBackend> make_vulkan_direct_kernel_backend_internal();
 
 namespace {
 
+struct VulkanDirectProbeState {
+    bool available = false;
+    std::string detail = "probe not run";
+};
+
 #if defined(_WIN32)
 using LibraryHandle = HMODULE;
+
+struct ProcessResult {
+    int exit_code = -1;
+    std::string output;
+};
 
 LibraryHandle load_library(const char* name) {
     return LoadLibraryA(name);
@@ -52,6 +63,68 @@ void close_library(LibraryHandle library) {
     if (library != nullptr) {
         FreeLibrary(library);
     }
+}
+
+ProcessResult run_process_capture_output(const std::string& command_line) {
+    ProcessResult result;
+
+    SECURITY_ATTRIBUTES security_attributes{};
+    security_attributes.nLength = sizeof(security_attributes);
+    security_attributes.bInheritHandle = TRUE;
+
+    HANDLE read_pipe = nullptr;
+    HANDLE write_pipe = nullptr;
+    if (!CreatePipe(&read_pipe, &write_pipe, &security_attributes, 0)) {
+        result.output = "CreatePipe failed";
+        return result;
+    }
+    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA startup_info{};
+    startup_info.cb = sizeof(startup_info);
+    startup_info.dwFlags = STARTF_USESTDHANDLES;
+    startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup_info.hStdOutput = write_pipe;
+    startup_info.hStdError = write_pipe;
+
+    PROCESS_INFORMATION process_info{};
+    auto mutable_command = command_line;
+    const BOOL created = CreateProcessA(
+        nullptr,
+        mutable_command.data(),
+        nullptr,
+        nullptr,
+        TRUE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &startup_info,
+        &process_info);
+
+    CloseHandle(write_pipe);
+    write_pipe = nullptr;
+
+    if (!created) {
+        result.output = "CreateProcess failed";
+        CloseHandle(read_pipe);
+        return result;
+    }
+
+    char buffer[4096];
+    DWORD read = 0;
+    while (ReadFile(read_pipe, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
+        result.output.append(buffer, buffer + read);
+    }
+
+    WaitForSingleObject(process_info.hProcess, INFINITE);
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process_info.hProcess, &exit_code);
+    result.exit_code = static_cast<int>(exit_code);
+
+    CloseHandle(process_info.hThread);
+    CloseHandle(process_info.hProcess);
+    CloseHandle(read_pipe);
+    return result;
 }
 #else
 using LibraryHandle = void*;
@@ -119,15 +192,15 @@ std::optional<CompilerCommand> locate_shader_compiler() {
     if (const char* sdk = std::getenv("VULKAN_SDK")) {
         const auto root = std::filesystem::path(sdk);
 #if defined(_WIN32)
-        candidates.push_back((root / "Bin" / "glslangValidator.exe").string());
         candidates.push_back((root / "Bin" / "glslc.exe").string());
+        candidates.push_back((root / "Bin" / "glslangValidator.exe").string());
 #else
-        candidates.push_back((root / "bin" / "glslangValidator").string());
         candidates.push_back((root / "bin" / "glslc").string());
+        candidates.push_back((root / "bin" / "glslangValidator").string());
 #endif
     }
-    candidates.push_back("glslangValidator");
     candidates.push_back("glslc");
+    candidates.push_back("glslangValidator");
 
     for (const auto& candidate : candidates) {
         if (candidate.empty()) {
@@ -163,10 +236,14 @@ bool write_text_file(const std::filesystem::path& path, const std::string& text)
 std::optional<std::vector<std::uint32_t>> compile_glsl(
     const CompilerCommand& compiler,
     const std::string& key,
-    const std::string& source) {
+    const std::string& source,
+    std::string* error_detail = nullptr) {
     const auto source_path = temp_shader_path(key, ".comp");
     const auto spirv_path = temp_shader_path(key, ".spv");
     if (!write_text_file(source_path, source)) {
+        if (error_detail != nullptr) {
+            *error_detail = "failed to write temporary shader source";
+        }
         return std::nullopt;
     }
 
@@ -179,12 +256,37 @@ std::optional<std::vector<std::uint32_t>> compile_glsl(
                   source_path.string() + "\" -o \"" + spirv_path.string() + "\"";
     }
 
+#if defined(_WIN32)
+    const auto process = run_process_capture_output(command);
+    const bool success = process.exit_code == 0;
+#else
+    const auto log_path = temp_shader_path(key, ".log");
+    command += " >\"" + log_path.string() + "\" 2>&1";
     const bool success = std::system(command.c_str()) == 0;
+#endif
     std::ifstream stream(spirv_path, std::ios::binary);
     if (!success || !stream.is_open()) {
+        if (error_detail != nullptr) {
+#if defined(_WIN32)
+            *error_detail = process.output;
+#else
+            std::ifstream log_stream(log_path, std::ios::binary);
+            if (log_stream.is_open()) {
+                *error_detail = std::string(
+                    (std::istreambuf_iterator<char>(log_stream)),
+                    std::istreambuf_iterator<char>());
+            }
+#endif
+            if (error_detail->empty()) {
+                *error_detail = success ? "shader compiler did not emit SPIR-V output" : "shader compiler returned failure";
+            }
+        }
         std::error_code ec;
         std::filesystem::remove(source_path, ec);
         std::filesystem::remove(spirv_path, ec);
+#if !defined(_WIN32)
+        std::filesystem::remove(log_path, ec);
+#endif
         return std::nullopt;
     }
 
@@ -195,6 +297,9 @@ std::optional<std::vector<std::uint32_t>> compile_glsl(
         std::error_code ec;
         std::filesystem::remove(source_path, ec);
         std::filesystem::remove(spirv_path, ec);
+#if !defined(_WIN32)
+        std::filesystem::remove(log_path, ec);
+#endif
         return std::nullopt;
     }
 
@@ -203,8 +308,136 @@ std::optional<std::vector<std::uint32_t>> compile_glsl(
     std::error_code ec;
     std::filesystem::remove(source_path, ec);
     std::filesystem::remove(spirv_path, ec);
+#if !defined(_WIN32)
+    std::filesystem::remove(log_path, ec);
+#endif
+    if (!stream.good() && !stream.eof()) {
+        if (error_detail != nullptr) {
+            *error_detail = "failed to read compiled SPIR-V output";
+        }
+        return std::nullopt;
+    }
+    return words;
+}
+
+std::filesystem::path vulkan_cache_root() {
+#if defined(_WIN32)
+    if (const char* local_app_data = std::getenv("LOCALAPPDATA")) {
+        return std::filesystem::path(local_app_data) / "Jakal-Core" / "vulkan-cache";
+    }
+#else
+    if (const char* xdg_cache_home = std::getenv("XDG_CACHE_HOME")) {
+        return std::filesystem::path(xdg_cache_home) / "jakal-core" / "vulkan-cache";
+    }
+    if (const char* home = std::getenv("HOME")) {
+        return std::filesystem::path(home) / ".cache" / "jakal-core" / "vulkan-cache";
+    }
+#endif
+    return std::filesystem::temp_directory_path() / "jakal-core" / "vulkan-cache";
+}
+
+std::filesystem::path shader_cache_path(const std::string& key) {
+    return vulkan_cache_root() / (key + ".spv");
+}
+
+std::filesystem::path pipeline_cache_path() {
+    return vulkan_cache_root() / "pipelines.bin";
+}
+
+std::optional<std::vector<std::byte>> load_cached_blob(const std::filesystem::path& path) {
+    if (!std::filesystem::exists(path)) {
+        return std::nullopt;
+    }
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream.is_open()) {
+        return std::nullopt;
+    }
+    stream.seekg(0, std::ios::end);
+    const auto size = stream.tellg();
+    stream.seekg(0, std::ios::beg);
+    if (size <= 0) {
+        return std::nullopt;
+    }
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+    stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
     if (!stream.good() && !stream.eof()) {
         return std::nullopt;
+    }
+    return bytes;
+}
+
+void store_cached_blob(const std::filesystem::path& path, const void* data, const std::size_t size) {
+    if (data == nullptr || size == 0u) {
+        return;
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+    }
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream.is_open()) {
+        return;
+    }
+    stream.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+}
+
+std::optional<std::vector<std::uint32_t>> load_cached_spirv(const std::string& key) {
+    const auto path = shader_cache_path(key);
+    if (!std::filesystem::exists(path)) {
+        return std::nullopt;
+    }
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream.is_open()) {
+        return std::nullopt;
+    }
+    stream.seekg(0, std::ios::end);
+    const auto size = stream.tellg();
+    stream.seekg(0, std::ios::beg);
+    if (size <= 0 || (static_cast<std::size_t>(size) % sizeof(std::uint32_t)) != 0u) {
+        return std::nullopt;
+    }
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(size) / sizeof(std::uint32_t));
+    stream.read(reinterpret_cast<char*>(words.data()), static_cast<std::streamsize>(size));
+    if (!stream.good() && !stream.eof()) {
+        return std::nullopt;
+    }
+    return words;
+}
+
+void store_cached_spirv(const std::string& key, const std::vector<std::uint32_t>& words) {
+    const auto path = shader_cache_path(key);
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+    }
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream.is_open()) {
+        return;
+    }
+    stream.write(
+        reinterpret_cast<const char*>(words.data()),
+        static_cast<std::streamsize>(words.size() * sizeof(std::uint32_t)));
+}
+
+std::optional<std::vector<std::uint32_t>> load_or_compile_glsl(
+    const std::string& key,
+    const std::string& source,
+    std::string* error_detail = nullptr) {
+    if (const auto cached = load_cached_spirv(key)) {
+        return cached;
+    }
+    const auto compiler = locate_shader_compiler();
+    if (!compiler.has_value()) {
+        if (error_detail != nullptr) {
+            *error_detail = "no shader compiler found";
+        }
+        return std::nullopt;
+    }
+    const auto words = compile_glsl(*compiler, key, source, error_detail);
+    if (words.has_value()) {
+        store_cached_spirv(key, *words);
     }
     return words;
 }
@@ -212,6 +445,9 @@ std::optional<std::vector<std::uint32_t>> compile_glsl(
 enum class ShaderKind {
     elementwise,
     reduction,
+    matmul,
+    conv3x3,
+    resample,
 };
 
 std::string shader_source(const ShaderKind kind) {
@@ -220,7 +456,18 @@ std::string shader_source(const ShaderKind kind) {
 layout(set = 0, binding = 0) readonly buffer Input0 { float values[]; } input0_;
 layout(set = 0, binding = 1) readonly buffer Input1 { float values[]; } input1_;
 layout(set = 0, binding = 2) buffer Output { float values[]; } output_;
-layout(push_constant) uniform Push { uint count; int low_precision; } pc;
+layout(push_constant) uniform Push {
+    uint p0;
+    uint p1;
+    uint p2;
+    uint p3;
+    uint p4;
+    uint p5;
+    uint p6;
+    uint p7;
+    int low_precision;
+    int flags;
+} pc;
 float q(float value) { return pc.low_precision == 0 ? value : round(value * 1024.0) / 1024.0; }
 )GLSL";
 
@@ -229,7 +476,7 @@ float q(float value) { return pc.low_precision == 0 ? value : round(value * 1024
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    if (gid >= pc.count) {
+    if (gid >= pc.p0) {
         return;
     }
     float left = q(input0_.values[gid] * 1.125);
@@ -239,13 +486,14 @@ void main() {
 )GLSL";
     }
 
-    return prefix + R"GLSL(
+    if (kind == ShaderKind::reduction) {
+        return prefix + R"GLSL(
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 shared float scratch[256];
 void main() {
     uint lid = gl_LocalInvocationID.x;
     float acc = 0.0;
-    for (uint index = lid; index < pc.count; index += gl_WorkGroupSize.x) {
+    for (uint index = lid; index < pc.p0; index += gl_WorkGroupSize.x) {
         acc = q(acc + input0_.values[index]);
     }
     scratch[lid] = acc;
@@ -259,6 +507,105 @@ void main() {
     if (lid == 0) {
         output_.values[0] = scratch[0];
     }
+}
+)GLSL";
+    }
+
+    if (kind == ShaderKind::matmul) {
+        return prefix + R"GLSL(
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= pc.p0 || col >= pc.p1) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint inner = 0; inner < pc.p2; ++inner) {
+        float left = q(input0_.values[row * pc.p2 + inner]);
+        uint rhs_index = (pc.flags & 1) != 0 ? (col * pc.p2 + inner) : (inner * pc.p1 + col);
+        float right = q(input1_.values[rhs_index]);
+        acc = q(acc + (left * right));
+    }
+    output_.values[row * pc.p1 + col] = acc;
+}
+)GLSL";
+    }
+
+    if (kind == ShaderKind::conv3x3) {
+        return prefix + R"GLSL(
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+const float kernel_[9] = float[9](
+    0.0625, 0.125, 0.0625,
+    0.125, 0.25, 0.125,
+    0.0625, 0.125, 0.0625);
+void main() {
+    uint out_x = gl_GlobalInvocationID.x;
+    uint out_y = gl_GlobalInvocationID.y;
+    uint out_h = pc.p0 - 2;
+    uint out_w = pc.p1 - 2;
+    if (out_x >= out_w || out_y >= out_h) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint ky = 0; ky < 3; ++ky) {
+        for (uint kx = 0; kx < 3; ++kx) {
+            uint index = (pc.flags & 1) != 0
+                ? (((out_y * out_w) + out_x) * 9 + ky * 3 + kx)
+                : ((out_y + ky) * pc.p1 + (out_x + kx));
+            float value = q(input0_.values[index]);
+            acc = q(acc + (value * kernel_[ky * 3 + kx]));
+        }
+    }
+    output_.values[out_y * out_w + out_x] = acc;
+}
+)GLSL";
+    }
+
+    return prefix + R"GLSL(
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint local_y = gl_GlobalInvocationID.y;
+    if (x >= pc.p3 || local_y >= pc.p5) {
+        return;
+    }
+    uint y = pc.p4 + local_y;
+    float v00 = 0.0;
+    float v01 = 0.0;
+    float v10 = 0.0;
+    float v11 = 0.0;
+    float wx = 0.0;
+    float wy = 0.0;
+    if ((pc.flags & 1) != 0) {
+        uint base = ((y * pc.p3) + x) * 6;
+        v00 = q(input0_.values[base + 0]);
+        v01 = q(input0_.values[base + 1]);
+        v10 = q(input0_.values[base + 2]);
+        v11 = q(input0_.values[base + 3]);
+        wx = input0_.values[base + 4];
+        wy = input0_.values[base + 5];
+    } else {
+        float src_y = (float(y) + 0.5) * float(pc.p0) / float(pc.p2) - 0.5;
+        float clamped_y = clamp(src_y, 0.0, float(pc.p0 - 1));
+        uint y0 = uint(clamped_y);
+        uint y1 = min(y0 + 1, pc.p0 - 1);
+        wy = clamped_y - float(y0);
+
+        float src_x = (float(x) + 0.5) * float(pc.p1) / float(pc.p3) - 0.5;
+        float clamped_x = clamp(src_x, 0.0, float(pc.p1 - 1));
+        uint x0 = uint(clamped_x);
+        uint x1 = min(x0 + 1, pc.p1 - 1);
+        wx = clamped_x - float(x0);
+
+        v00 = q(input0_.values[y0 * pc.p1 + x0]);
+        v01 = q(input0_.values[y0 * pc.p1 + x1]);
+        v10 = q(input0_.values[y1 * pc.p1 + x0]);
+        v11 = q(input0_.values[y1 * pc.p1 + x1]);
+    }
+    float top = q(v00 + ((v01 - v00) * wx));
+    float bottom = q(v10 + ((v11 - v10) * wx));
+    output_.values[local_y * pc.p3 + x] = q(top + ((bottom - top) * wy));
 }
 )GLSL";
 }
@@ -282,8 +629,16 @@ public:
 VulkanApi& global_vulkan_api();
 
 struct PushConstants {
-    std::uint32_t count = 0u;
+    std::uint32_t p0 = 0u;
+    std::uint32_t p1 = 0u;
+    std::uint32_t p2 = 0u;
+    std::uint32_t p3 = 0u;
+    std::uint32_t p4 = 0u;
+    std::uint32_t p5 = 0u;
+    std::uint32_t p6 = 0u;
+    std::uint32_t p7 = 0u;
     std::int32_t low_precision = 0;
+    std::int32_t flags = 0;
 };
 
 struct VulkanBuffer {
@@ -305,6 +660,7 @@ struct VulkanContext {
     VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
 
     PFN_vkDestroyInstance vkDestroyInstance = nullptr;
     PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices = nullptr;
@@ -335,6 +691,9 @@ struct VulkanContext {
     PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout = nullptr;
     PFN_vkCreateComputePipelines vkCreateComputePipelines = nullptr;
     PFN_vkDestroyPipeline vkDestroyPipeline = nullptr;
+    PFN_vkCreatePipelineCache vkCreatePipelineCache = nullptr;
+    PFN_vkDestroyPipelineCache vkDestroyPipelineCache = nullptr;
+    PFN_vkGetPipelineCacheData vkGetPipelineCacheData = nullptr;
     PFN_vkCreateCommandPool vkCreateCommandPool = nullptr;
     PFN_vkDestroyCommandPool vkDestroyCommandPool = nullptr;
     PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers = nullptr;
@@ -372,6 +731,7 @@ void destroy_buffer(VulkanContext& context, VulkanBuffer& buffer);
 std::string shader_key(ShaderKind kind);
 VkPipeline ensure_pipeline(VulkanContext& context, ShaderKind shader_kind);
 bool probe_vulkan_direct_support();
+VulkanDirectProbeState probe_vulkan_direct_backend();
 
 class VulkanDirectBackend final : public IKernelBackend {
 public:
@@ -431,6 +791,8 @@ private:
         std::span<const float> input1,
         std::size_t output_count,
         std::uint32_t dispatch_x,
+        std::uint32_t dispatch_y,
+        const PushConstants& push_constants,
         bool low_precision,
         bool scalar_output) const;
 
@@ -479,6 +841,19 @@ VulkanContext::~VulkanContext() {
     if (device != VK_NULL_HANDLE && vkDeviceWaitIdle != nullptr) {
         vkDeviceWaitIdle(device);
     }
+    if (device != VK_NULL_HANDLE &&
+        pipeline_cache != VK_NULL_HANDLE &&
+        vkGetPipelineCacheData != nullptr) {
+        std::size_t cache_size = 0u;
+        if (vkGetPipelineCacheData(device, pipeline_cache, &cache_size, nullptr) == VK_SUCCESS &&
+            cache_size > 0u) {
+            std::vector<std::byte> cache_blob(cache_size);
+            if (vkGetPipelineCacheData(device, pipeline_cache, &cache_size, cache_blob.data()) == VK_SUCCESS &&
+                cache_size > 0u) {
+                store_cached_blob(pipeline_cache_path(), cache_blob.data(), cache_size);
+            }
+        }
+    }
     for (auto& [key, pipeline] : pipelines) {
         (void)key;
         if (pipeline != VK_NULL_HANDLE && vkDestroyPipeline != nullptr) {
@@ -493,6 +868,9 @@ VulkanContext::~VulkanContext() {
     }
     if (pipeline_layout != VK_NULL_HANDLE && vkDestroyPipelineLayout != nullptr) {
         vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+    }
+    if (pipeline_cache != VK_NULL_HANDLE && vkDestroyPipelineCache != nullptr) {
+        vkDestroyPipelineCache(device, pipeline_cache, nullptr);
     }
     if (descriptor_pool != VK_NULL_HANDLE && vkDestroyDescriptorPool != nullptr) {
         vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
@@ -686,6 +1064,12 @@ std::shared_ptr<VulkanContext> create_vulkan_context() {
         load_device_function<PFN_vkCreateComputePipelines>(api, context->device, "vkCreateComputePipelines");
     context->vkDestroyPipeline =
         load_device_function<PFN_vkDestroyPipeline>(api, context->device, "vkDestroyPipeline");
+    context->vkCreatePipelineCache =
+        load_device_function<PFN_vkCreatePipelineCache>(api, context->device, "vkCreatePipelineCache");
+    context->vkDestroyPipelineCache =
+        load_device_function<PFN_vkDestroyPipelineCache>(api, context->device, "vkDestroyPipelineCache");
+    context->vkGetPipelineCacheData =
+        load_device_function<PFN_vkGetPipelineCacheData>(api, context->device, "vkGetPipelineCacheData");
     context->vkCreateCommandPool =
         load_device_function<PFN_vkCreateCommandPool>(api, context->device, "vkCreateCommandPool");
     context->vkDestroyCommandPool =
@@ -762,6 +1146,32 @@ std::shared_ptr<VulkanContext> create_vulkan_context() {
         &context->queue);
     if (context->queue == VK_NULL_HANDLE) {
         return {};
+    }
+
+    if (context->vkCreatePipelineCache != nullptr) {
+        const auto cached_pipeline_data = load_cached_blob(pipeline_cache_path());
+
+        VkPipelineCacheCreateInfo pipeline_cache_info{};
+        pipeline_cache_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        if (cached_pipeline_data.has_value()) {
+            pipeline_cache_info.initialDataSize = cached_pipeline_data->size();
+            pipeline_cache_info.pInitialData = cached_pipeline_data->data();
+        }
+        if (context->vkCreatePipelineCache(
+                context->device,
+                &pipeline_cache_info,
+                nullptr,
+                &context->pipeline_cache) != VK_SUCCESS) {
+            pipeline_cache_info.initialDataSize = 0u;
+            pipeline_cache_info.pInitialData = nullptr;
+            if (context->vkCreatePipelineCache(
+                    context->device,
+                    &pipeline_cache_info,
+                    nullptr,
+                    &context->pipeline_cache) != VK_SUCCESS) {
+                context->pipeline_cache = VK_NULL_HANDLE;
+            }
+        }
     }
 
     VkCommandPoolCreateInfo command_pool_info{};
@@ -918,7 +1328,19 @@ void destroy_buffer(VulkanContext& context, VulkanBuffer& buffer) {
 }
 
 std::string shader_key(const ShaderKind kind) {
-    return kind == ShaderKind::elementwise ? "elementwise" : "reduction";
+    switch (kind) {
+    case ShaderKind::elementwise:
+        return "v2.elementwise";
+    case ShaderKind::reduction:
+        return "v2.reduction";
+    case ShaderKind::matmul:
+        return "v2.matmul";
+    case ShaderKind::conv3x3:
+        return "v2.conv3x3";
+    case ShaderKind::resample:
+    default:
+        return "v2.resample";
+    }
 }
 
 VkPipeline ensure_pipeline(VulkanContext& context, const ShaderKind shader_kind) {
@@ -927,12 +1349,7 @@ VkPipeline ensure_pipeline(VulkanContext& context, const ShaderKind shader_kind)
         return it->second;
     }
 
-    static const auto compiler = locate_shader_compiler();
-    if (!compiler.has_value()) {
-        return VK_NULL_HANDLE;
-    }
-
-    const auto words = compile_glsl(*compiler, key, shader_source(shader_kind));
+    const auto words = load_or_compile_glsl(key, shader_source(shader_kind));
     if (!words.has_value()) {
         return VK_NULL_HANDLE;
     }
@@ -961,7 +1378,7 @@ VkPipeline ensure_pipeline(VulkanContext& context, const ShaderKind shader_kind)
     VkPipeline pipeline = VK_NULL_HANDLE;
     if (context.vkCreateComputePipelines(
             context.device,
-            VK_NULL_HANDLE,
+            context.pipeline_cache,
             1u,
             &pipeline_info,
             nullptr,
@@ -975,15 +1392,44 @@ VkPipeline ensure_pipeline(VulkanContext& context, const ShaderKind shader_kind)
     return pipeline;
 }
 
+VulkanDirectProbeState probe_vulkan_direct_backend() {
+    VulkanDirectProbeState state;
+    static constexpr std::array<ShaderKind, 5> kAllShaderKinds = {
+        ShaderKind::elementwise,
+        ShaderKind::reduction,
+        ShaderKind::matmul,
+        ShaderKind::conv3x3,
+        ShaderKind::resample,
+    };
+    for (const auto shader_kind : kAllShaderKinds) {
+        std::string compile_error;
+        if (!load_or_compile_glsl(shader_key(shader_kind), shader_source(shader_kind), &compile_error).has_value()) {
+            state.detail = "shader compile/cache failed for " + shader_key(shader_kind);
+            if (!compile_error.empty()) {
+                state.detail += ": " + compile_error;
+            }
+            return state;
+        }
+    }
+    auto context = create_vulkan_context();
+    if (context == nullptr) {
+        state.detail = "failed to create Vulkan context";
+        return state;
+    }
+    std::scoped_lock lock(context->mutex);
+    for (const auto shader_kind : kAllShaderKinds) {
+        if (ensure_pipeline(*context, shader_kind) == VK_NULL_HANDLE) {
+            state.detail = "failed to create Vulkan pipeline for " + shader_key(shader_kind);
+            return state;
+        }
+    }
+    state.available = true;
+    state.detail = "ready";
+    return state;
+}
+
 bool probe_vulkan_direct_support() {
-    const auto compiler = locate_shader_compiler();
-    if (!compiler.has_value()) {
-        return false;
-    }
-    if (!compile_glsl(*compiler, "availability.elementwise", shader_source(ShaderKind::elementwise)).has_value()) {
-        return false;
-    }
-    return create_vulkan_context() != nullptr;
+    return probe_vulkan_direct_backend().available;
 }
 
 bool VulkanDirectBackend::matches(const HardwareGraph& graph) const {
@@ -1012,6 +1458,18 @@ BackendRunResult VulkanDirectBackend::run_elementwise(
         rhs,
         lhs.size(),
         std::max(1u, static_cast<std::uint32_t>((lhs.size() + 255u) / 256u)),
+        1u,
+        PushConstants{
+            static_cast<std::uint32_t>(lhs.size()),
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            low_precision ? 1 : 0,
+            0},
         low_precision,
         false);
 }
@@ -1029,50 +1487,126 @@ BackendRunResult VulkanDirectBackend::run_reduction(
         {},
         1u,
         1u,
+        1u,
+        PushConstants{
+            static_cast<std::uint32_t>(input.size()),
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            low_precision ? 1 : 0,
+            0},
         low_precision,
         true);
 }
 
 BackendRunResult VulkanDirectBackend::run_matmul(
-    const HardwareGraph&,
-    const OperationSpec&,
-    const std::span<const float>,
-    const std::span<const float>,
-    const std::uint32_t,
-    const std::uint32_t,
-    const std::uint32_t,
-    const bool) const {
-    BackendRunResult result;
-    result.error = "vulkan-matmul-pending";
-    return result;
+    const HardwareGraph& graph,
+    const OperationSpec& operation,
+    const std::span<const float> lhs,
+    const std::span<const float> rhs,
+    const std::uint32_t rows,
+    const std::uint32_t columns,
+    const std::uint32_t depth,
+    const bool low_precision) const {
+    (void)operation;
+    return run_compute(
+        graph,
+        ShaderKind::matmul,
+        lhs,
+        rhs,
+        static_cast<std::size_t>(rows) * columns,
+        std::max(1u, (columns + 15u) / 16u),
+        std::max(1u, (rows + 15u) / 16u),
+        PushConstants{
+            rows,
+            columns,
+            depth,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            low_precision ? 1 : 0,
+            0},
+        low_precision,
+        false);
 }
 
 BackendRunResult VulkanDirectBackend::run_conv3x3(
-    const HardwareGraph&,
-    const OperationSpec&,
-    const std::span<const float>,
-    const std::uint32_t,
-    const std::uint32_t,
-    const bool) const {
-    BackendRunResult result;
-    result.error = "vulkan-conv-pending";
-    return result;
+    const HardwareGraph& graph,
+    const OperationSpec& operation,
+    const std::span<const float> input,
+    const std::uint32_t height,
+    const std::uint32_t width,
+    const bool low_precision) const {
+    if (height < 3u || width < 3u) {
+        BackendRunResult result;
+        result.error = "vulkan-conv-shape";
+        return result;
+    }
+    const auto out_height = height - 2u;
+    const auto out_width = width - 2u;
+    (void)operation;
+    return run_compute(
+        graph,
+        ShaderKind::conv3x3,
+        input,
+        {},
+        static_cast<std::size_t>(out_height) * out_width,
+        std::max(1u, (out_width + 15u) / 16u),
+        std::max(1u, (out_height + 15u) / 16u),
+        PushConstants{
+            height,
+            width,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            low_precision ? 1 : 0,
+            0},
+        low_precision,
+        false);
 }
 
 BackendRunResult VulkanDirectBackend::run_resample(
-    const HardwareGraph&,
-    const OperationSpec&,
-    const std::span<const float>,
-    const std::uint32_t,
-    const std::uint32_t,
-    const std::uint32_t,
-    const std::uint32_t,
-    const std::uint32_t,
-    const std::uint32_t,
-    const bool) const {
-    BackendRunResult result;
-    result.error = "vulkan-resample-pending";
-    return result;
+    const HardwareGraph& graph,
+    const OperationSpec& operation,
+    const std::span<const float> input,
+    const std::uint32_t src_h,
+    const std::uint32_t src_w,
+    const std::uint32_t dst_h,
+    const std::uint32_t dst_w,
+    const std::uint32_t row_offset,
+    const std::uint32_t row_count,
+    const bool low_precision) const {
+    (void)operation;
+    return run_compute(
+        graph,
+        ShaderKind::resample,
+        input,
+        {},
+        static_cast<std::size_t>(row_count) * dst_w,
+        std::max(1u, (dst_w + 15u) / 16u),
+        std::max(1u, (row_count + 15u) / 16u),
+        PushConstants{
+            src_h,
+            src_w,
+            dst_h,
+            dst_w,
+            row_offset,
+            row_count,
+            0u,
+            0u,
+            low_precision ? 1 : 0,
+            0},
+        low_precision,
+        false);
 }
 
 std::shared_ptr<VulkanContext> VulkanDirectBackend::acquire_context() const {
@@ -1091,6 +1625,8 @@ BackendRunResult VulkanDirectBackend::run_compute(
     const std::span<const float> input1,
     const std::size_t output_count,
     const std::uint32_t dispatch_x,
+    const std::uint32_t dispatch_y,
+    const PushConstants& push_constants,
     const bool low_precision,
     const bool scalar_output) const {
     BackendRunResult result;
@@ -1273,17 +1809,14 @@ BackendRunResult VulkanDirectBackend::run_compute(
             0u,
             nullptr);
 
-        PushConstants push{};
-        push.count = static_cast<std::uint32_t>(input0.size());
-        push.low_precision = low_precision ? 1 : 0;
         context->vkCmdPushConstants(
             command_buffer,
             context->pipeline_layout,
             VK_SHADER_STAGE_COMPUTE_BIT,
             0u,
             sizeof(PushConstants),
-            &push);
-        context->vkCmdDispatch(command_buffer, dispatch_x, 1u, 1u);
+            &push_constants);
+        context->vkCmdDispatch(command_buffer, dispatch_x, dispatch_y, 1u);
 
         if (context->vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
             error = "vulkan-command-end";
@@ -1376,8 +1909,13 @@ std::unique_ptr<IKernelBackend> make_vulkan_direct_kernel_backend_internal() {
 }
 
 bool vulkan_direct_backend_available_internal() {
-    static const bool available = probe_vulkan_direct_support();
-    return available;
+    static const auto probe_state = probe_vulkan_direct_backend();
+    return probe_state.available;
+}
+
+std::string vulkan_direct_backend_status_detail_internal() {
+    static const auto probe_state = probe_vulkan_direct_backend();
+    return probe_state.detail;
 }
 
 }  // namespace jakal::executors

@@ -61,6 +61,7 @@ struct InstallLayout {
     std::filesystem::path remove_dir;
     std::filesystem::path state_dir;
     std::filesystem::path self_check_marker;
+    std::filesystem::path status_snapshot;
 };
 
 struct BackendSupportRow {
@@ -203,6 +204,7 @@ InstallLayout resolve_install_layout(const char* argv0) {
     layout.remove_dir = layout.share_dir / "remove";
     layout.state_dir = user_state_root() / "state";
     layout.self_check_marker = layout.state_dir / "bootstrap-self-check.txt";
+    layout.status_snapshot = layout.state_dir / "bootstrap-status.txt";
     return layout;
 }
 
@@ -361,7 +363,9 @@ BackendSupportRow make_vulkan_row() {
     } else if (!compiler) {
         row.detail = "Shader compiler missing";
     } else if (!direct_available) {
-        row.detail = "Loader/compiler found but direct backend not active";
+        row.detail =
+            "Loader/compiler found but direct backend not active: " +
+            jakal::executors::vulkan_direct_backend_status_detail();
     } else {
         row.detail = "Vulkan loader and shader compiler detected";
     }
@@ -456,6 +460,63 @@ bool write_marker_summary(const std::filesystem::path& path, const std::string& 
     return output.good();
 }
 
+bool write_text_file(const std::filesystem::path& path, const std::string& contents) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream output(path, std::ios::trunc);
+    if (!output.is_open()) {
+        return false;
+    }
+    output << contents;
+    return output.good();
+}
+
+std::string build_status_snapshot(const jakal::Runtime& runtime) {
+    std::ostringstream output;
+    output << "Active Backends Snapshot\n";
+    if (runtime.devices().empty()) {
+        output << "  no hardware graphs discovered\n";
+        return output.str();
+    }
+    for (const auto& graph : runtime.devices()) {
+        output << "  " << graph.presentation_name
+               << " | probe=" << graph.probe
+               << " | backend=" << jakal::runtime_backend_name_for_graph(graph)
+               << " | supported_ops=" << supported_ops_for(graph)
+               << '\n';
+    }
+    if (!runtime.jakal_toolkit_index().empty()) {
+        output << "Toolkit Snapshot\n";
+        for (const auto& entry : runtime.jakal_toolkit_index()) {
+            output << "  device=" << entry.device_uid << '\n';
+            for (const auto& variant : entry.variants) {
+                output << "    " << jakal::to_string(variant.binding.backend)
+                       << " executable=" << yes_no(variant.executable)
+                       << " score=" << std::fixed << std::setprecision(3) << variant.toolkit_score
+                       << '\n';
+            }
+        }
+    }
+    return output.str();
+}
+
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    std::ostringstream output;
+    output << input.rdbuf();
+    return output.str();
+}
+
+void persist_status_snapshot(
+    const InstallLayout& layout,
+    const jakal::Runtime& runtime,
+    const bool persist_marker) {
+    if (!persist_marker) {
+        return;
+    }
+    (void)write_text_file(layout.status_snapshot, build_status_snapshot(runtime));
+}
+
 bool perform_self_check(
     const InstallLayout& layout,
     const jakal::Runtime& runtime,
@@ -501,7 +562,7 @@ bool perform_self_check(
 
 void print_help() {
     std::cout
-        << "jakal_bootstrap [--status] [--self-check] [--force-self-check] [--no-persist]\n"
+        << "jakal_bootstrap [--status] [--status-live] [--self-check] [--force-self-check] [--no-persist]\n"
         << "                [--disable-opencl] [--disable-level-zero] [--disable-cuda] [--disable-rocm]\n";
 }
 
@@ -509,6 +570,7 @@ void print_help() {
 
 int main(int argc, char** argv) {
     bool show_status = false;
+    bool status_live = false;
     bool run_self_check = false;
     bool force_self_check = false;
     bool persist_marker = true;
@@ -518,6 +580,9 @@ int main(int argc, char** argv) {
         const std::string arg = argv[index];
         if (arg == "--status") {
             show_status = true;
+        } else if (arg == "--status-live") {
+            show_status = true;
+            status_live = true;
         } else if (arg == "--self-check") {
             run_self_check = true;
         } else if (arg == "--force-self-check") {
@@ -544,25 +609,40 @@ int main(int argc, char** argv) {
     }
 
     const auto layout = resolve_install_layout(argc > 0 ? argv[0] : nullptr);
-    jakal::Runtime runtime(options);
     const auto supported_backends = collect_supported_backends(options);
 
     const bool marker_exists = std::filesystem::exists(layout.self_check_marker);
+    const bool snapshot_exists = std::filesystem::exists(layout.status_snapshot);
     if (!show_status && !run_self_check) {
         show_status = true;
         run_self_check = !marker_exists;
     }
 
+    const bool needs_live_runtime = run_self_check || status_live || !snapshot_exists;
+    options.eager_hardware_refresh = needs_live_runtime;
+    std::optional<jakal::Runtime> runtime;
+    if (needs_live_runtime) {
+        runtime.emplace(options);
+    }
+
     if (show_status) {
         print_install_layout(layout);
         print_supported_backends(supported_backends);
-        print_active_backends(runtime);
-        print_toolkit_variants(runtime);
+        if (runtime.has_value()) {
+            print_active_backends(*runtime);
+            print_toolkit_variants(*runtime);
+            persist_status_snapshot(layout, *runtime, persist_marker);
+        } else {
+            std::cout << '\n' << read_text_file(layout.status_snapshot);
+        }
     }
 
     if (run_self_check || marker_exists) {
         std::string summary;
-        const bool ok = perform_self_check(layout, runtime, persist_marker, force_self_check, summary);
+        if (!runtime.has_value()) {
+            runtime.emplace(options);
+        }
+        const bool ok = perform_self_check(layout, *runtime, persist_marker, force_self_check, summary);
         std::cout << "\nSelf Check\n";
         std::cout << "  marker: " << layout.self_check_marker.string() << '\n';
         std::cout << "  status: " << summary << '\n';

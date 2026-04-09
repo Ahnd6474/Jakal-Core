@@ -293,7 +293,7 @@ public:
     }
 
     [[nodiscard]] bool matches(const HardwareGraph& graph) const override {
-        return looks_like_gpu_graph(graph);
+        return graph.probe == "vulkan";
     }
 
     [[nodiscard]] JakalL0Binding describe(const HardwareGraph& graph) const override {
@@ -553,10 +553,6 @@ bool backend_kind_supports_direct_execution(const JakalBackendKind backend_kind)
 bool backend_kind_supports_operation(
     const JakalBackendKind backend_kind,
     const OperationClass op_class) {
-    if (backend_kind == JakalBackendKind::vulkan_compute) {
-        return op_class == OperationClass::elementwise_map ||
-               op_class == OperationClass::reduction;
-    }
     switch (op_class) {
     case OperationClass::elementwise_map:
     case OperationClass::reduction:

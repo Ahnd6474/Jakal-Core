@@ -1,5 +1,6 @@
 #include "jakal/executors/host_native_kernels.hpp"
 #include "jakal/executors/host_thread_pool.hpp"
+#include "jakal/execution.hpp"
 
 #include <algorithm>
 #include <array>
@@ -125,10 +126,69 @@ void run_bf16_matmul_rows(
     }
 }
 
+void pack_rhs_panel(
+    std::span<const float> rhs,
+    const std::uint32_t columns,
+    const std::uint32_t depth,
+    const std::uint32_t k_begin,
+    const std::uint32_t k_count,
+    const std::uint32_t col_begin,
+    const std::uint32_t col_count,
+    const bool rhs_transposed,
+    std::span<float> packed_rhs) {
+    for (std::uint32_t k = 0u; k < k_count; ++k) {
+        for (std::uint32_t n = 0u; n < col_count; ++n) {
+            const auto rhs_index = rhs_transposed
+                ? static_cast<std::size_t>(col_begin + n) * depth + (k_begin + k)
+                : static_cast<std::size_t>(k_begin + k) * columns + (col_begin + n);
+            packed_rhs[static_cast<std::size_t>(k) * col_count + n] = rhs[rhs_index];
+        }
+    }
+}
+
+std::uint32_t effective_tile_hint(
+    const std::uint32_t requested,
+    const std::uint32_t fallback,
+    const std::uint32_t multiple,
+    const std::uint32_t minimum) {
+    const auto value = requested == 0u ? fallback : requested;
+    return std::max(minimum, ((std::max(value, minimum) + multiple - 1u) / multiple) * multiple);
+}
+
+std::uint32_t fit_tile_to_pack_budget(
+    const std::uint32_t tile_k,
+    std::uint32_t tile_n,
+    const std::uint64_t pack_budget_bytes) {
+    if (pack_budget_bytes == 0u || tile_k == 0u || tile_n == 0u) {
+        return tile_n;
+    }
+    while ((static_cast<std::uint64_t>(tile_k) * tile_n * sizeof(float)) > pack_budget_bytes && tile_n > 8u) {
+        tile_n = std::max<std::uint32_t>(8u, tile_n - 8u);
+    }
+    return tile_n;
+}
+
+std::size_t choose_row_chunk(
+    const OperationSpec& operation,
+    const std::uint32_t rows,
+    const std::size_t fallback) {
+    if (operation.cpu_single_thread_cutoff > 0u) {
+        const auto work_items =
+            static_cast<std::uint64_t>(rows) *
+            std::max<std::uint64_t>(1ull, operation.extents.size() > 1u ? operation.extents[1] : 1ull) *
+            std::max<std::uint64_t>(1ull, operation.extents.size() > 2u ? operation.extents[2] : 1ull);
+        if (work_items < static_cast<std::uint64_t>(operation.cpu_single_thread_cutoff)) {
+            return static_cast<std::size_t>(rows);
+        }
+    }
+    return std::max<std::size_t>(1u, operation.cpu_parallel_chunk == 0u ? fallback : operation.cpu_parallel_chunk);
+}
+
 }  // namespace
 
 bool try_run_host_native_bf16_matmul(
     const HardwareGraph& graph,
+    const OperationSpec& operation,
     std::span<const float> lhs,
     std::span<const float> rhs,
     const std::uint32_t rows,
@@ -143,13 +203,82 @@ bool try_run_host_native_bf16_matmul(
         return false;
     }
 
-    const auto min_chunk = std::max<std::size_t>(1u, parallel_chunk_rows == 0u ? 4u : parallel_chunk_rows);
-    HostThreadPool::instance().parallel_for(rows, min_chunk, [&](const std::size_t begin, const std::size_t end) {
-        run_bf16_matmul_rows(lhs, rhs, columns, depth, rhs_transposed, begin, end, output);
-    });
+    const auto effective_tile_m_value = effective_tile_hint(operation.cpu_tile_m, 32u, 4u, 4u);
+    auto effective_tile_n_value = effective_tile_hint(operation.cpu_tile_n, 32u, 8u, 8u);
+    const auto effective_tile_k_value = effective_tile_hint(operation.cpu_tile_k, 64u, 16u, 16u);
+    effective_tile_n_value = fit_tile_to_pack_budget(
+        effective_tile_k_value,
+        effective_tile_n_value,
+        operation.cpu_pack_budget_bytes);
+    const auto run_blocked = [&](const std::size_t begin, const std::size_t end) {
+        const auto row_start = static_cast<std::uint32_t>(begin);
+        const auto row_limit = static_cast<std::uint32_t>(end);
+        for (std::uint32_t col_block = 0u; col_block < columns; col_block += effective_tile_n_value) {
+            const auto col_count = std::min(effective_tile_n_value, columns - col_block);
+            std::vector<float> packed_rhs(static_cast<std::size_t>(effective_tile_k_value) * col_count, 0.0f);
+            for (std::uint32_t k_block = 0u; k_block < depth; k_block += effective_tile_k_value) {
+                const auto k_count = std::min(effective_tile_k_value, depth - k_block);
+                pack_rhs_panel(
+                    rhs,
+                    columns,
+                    depth,
+                    k_block,
+                    k_count,
+                    col_block,
+                    col_count,
+                    rhs_transposed,
+                    std::span<float>(packed_rhs.data(), static_cast<std::size_t>(k_count) * col_count));
+                for (std::uint32_t row_block = row_start; row_block < row_limit; row_block += effective_tile_m_value) {
+                    const auto row_end = std::min(row_limit, row_block + effective_tile_m_value);
+                    for (std::uint32_t row = row_block; row < row_end; ++row) {
+                        const auto lhs_base = static_cast<std::size_t>(row) * depth;
+                        for (std::uint32_t col = 0u; col < col_count; ++col) {
+                            const auto out_index = static_cast<std::size_t>(row) * columns + col_block + col;
+                            float scalar_acc = output[out_index];
+                            std::uint32_t inner = 0u;
+                            for (; inner + 32u <= k_count; inner += 32u) {
+                                const __m512 lhs_lo = _mm512_loadu_ps(lhs.data() + lhs_base + k_block + inner);
+                                const __m512 lhs_hi = _mm512_loadu_ps(lhs.data() + lhs_base + k_block + inner + 16u);
+                                alignas(64) float rhs_lo_lanes[16]{};
+                                alignas(64) float rhs_hi_lanes[16]{};
+                                for (std::uint32_t lane = 0u; lane < 16u; ++lane) {
+                                    rhs_lo_lanes[lane] =
+                                        packed_rhs[static_cast<std::size_t>(inner + lane) * col_count + col];
+                                    rhs_hi_lanes[lane] =
+                                        packed_rhs[static_cast<std::size_t>(inner + 16u + lane) * col_count + col];
+                                }
+                                const __m512 rhs_lo = _mm512_load_ps(rhs_lo_lanes);
+                                const __m512 rhs_hi = _mm512_load_ps(rhs_hi_lanes);
+                                const __m512bh lhs_bf16 = _mm512_cvtne2ps_pbh(lhs_hi, lhs_lo);
+                                const __m512bh rhs_bf16 = _mm512_cvtne2ps_pbh(rhs_hi, rhs_lo);
+                                scalar_acc = quantize_bf16_scalar(
+                                    scalar_acc + horizontal_sum_512(_mm512_dpbf16_ps(_mm512_setzero_ps(), lhs_bf16, rhs_bf16)));
+                            }
+                            for (; inner < k_count; ++inner) {
+                                scalar_acc = quantize_bf16_scalar(
+                                    scalar_acc +
+                                    (quantize_bf16_scalar(lhs[lhs_base + k_block + inner]) *
+                                     quantize_bf16_scalar(
+                                         packed_rhs[static_cast<std::size_t>(inner) * col_count + col])));
+                            }
+                            output[out_index] = scalar_acc;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    const auto min_chunk = choose_row_chunk(operation, rows, parallel_chunk_rows == 0u ? 4u : parallel_chunk_rows);
+    if (min_chunk >= rows) {
+        run_blocked(0u, rows);
+    } else {
+        HostThreadPool::instance().parallel_for(rows, min_chunk, run_blocked);
+    }
     return true;
 #else
     (void)graph;
+    (void)operation;
     (void)lhs;
     (void)rhs;
     (void)rows;

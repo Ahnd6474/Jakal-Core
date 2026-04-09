@@ -21,6 +21,10 @@ struct DeviceAssignment {
     ShardRange shard;
     std::uint32_t logical_partition_index = 0;
     std::uint32_t logical_partition_count = 1;
+    std::uint32_t head_group_index = 0;
+    std::uint32_t head_group_count = 1;
+    std::uint32_t token_block_index = 0;
+    std::uint32_t token_block_count = 1;
 };
 
 struct OperationData {

@@ -28,6 +28,7 @@ add_library(jakal_core
     src/executors/common_scheduler.cpp
     src/executors/direct_backends.cpp
     src/executors/host_native_kernels.cpp
+    src/executors/host_native_kernels_avx512.cpp
     src/executors/host_native_kernels_bf16.cpp
     src/executors/native_gpu_backends.cpp
     src/executors/vulkan_direct_backend.cpp
@@ -97,6 +98,10 @@ if(MSVC)
         PROPERTIES
             COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(
+        src/executors/host_native_kernels_avx512.cpp
+        PROPERTIES
+            COMPILE_OPTIONS "/arch:AVX512")
+    set_source_files_properties(
         src/executors/host_native_kernels_bf16.cpp
         PROPERTIES
             COMPILE_OPTIONS "/arch:AVX512")
@@ -105,6 +110,10 @@ else()
         src/executors/host_native_kernels.cpp
         PROPERTIES
             COMPILE_OPTIONS "-mavx2;-mf16c")
+    set_source_files_properties(
+        src/executors/host_native_kernels_avx512.cpp
+        PROPERTIES
+            COMPILE_OPTIONS "-mavx512f")
     set_source_files_properties(
         src/executors/host_native_kernels_bf16.cpp
         PROPERTIES

@@ -550,7 +550,8 @@ public:
     NativeKernelBackendBase(const JakalBackendKind backend, std::string probe_name)
         : backend_(backend),
           probe_name_(std::move(probe_name)),
-          host_(make_host_kernel_backend()) {}
+          host_(make_host_kernel_backend()),
+          modeled_(make_modeled_gpu_kernel_backend(backend)) {}
 
     [[nodiscard]] bool matches(const HardwareGraph& graph) const override { return graph.probe == probe_name_; }
     [[nodiscard]] std::string name() const override { return to_string(backend_) + "-native"; }
@@ -559,6 +560,9 @@ public:
     }
 
     BackendRunResult run_elementwise(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> lhs, const std::span<const float> rhs, const bool low_precision) const override {
+        if (should_use_modeled_backend(graph)) {
+            return modeled_->run_elementwise(graph, operation, lhs, rhs, low_precision);
+        }
         auto result = run_elementwise_native(graph, lhs, rhs, low_precision);
         if (result.success) {
             return mark_async_result(
@@ -575,6 +579,9 @@ public:
         return fallback;
     }
     BackendRunResult run_reduction(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const bool low_precision) const override {
+        if (should_use_modeled_backend(graph)) {
+            return modeled_->run_reduction(graph, operation, input, low_precision);
+        }
         auto result = run_reduction_native(graph, input, low_precision);
         if (result.success) {
             return mark_async_result(
@@ -591,6 +598,9 @@ public:
         return fallback;
     }
     BackendRunResult run_matmul(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
+        if (should_use_modeled_backend(graph)) {
+            return modeled_->run_matmul(graph, operation, lhs, rhs, rows, columns, depth, low_precision);
+        }
         auto result = run_matmul_native(graph, operation, lhs, rhs, rows, columns, depth, low_precision);
         if (result.success) {
             return mark_async_result(
@@ -607,6 +617,9 @@ public:
         return fallback;
     }
     BackendRunResult run_conv3x3(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
+        if (should_use_modeled_backend(graph)) {
+            return modeled_->run_conv3x3(graph, operation, input, height, width, low_precision);
+        }
         auto result = run_conv3x3_native(graph, operation, input, height, width, low_precision);
         if (result.success) {
             return mark_async_result(
@@ -624,6 +637,9 @@ public:
         return fallback;
     }
     BackendRunResult run_resample(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
+        if (should_use_modeled_backend(graph)) {
+            return modeled_->run_resample(graph, operation, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
+        }
         auto result = run_resample_native(graph, operation, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
         if (result.success) {
             return mark_async_result(
@@ -641,6 +657,10 @@ public:
     }
 
 protected:
+    [[nodiscard]] bool should_use_modeled_backend(const HardwareGraph& graph) const {
+        return graph.driver_version.empty() && graph.runtime_version.empty() && graph.compiler_version.empty();
+    }
+
     struct DispatchCacheEntry {
         std::string revision;
         std::uint32_t hits = 0;
@@ -844,6 +864,7 @@ protected:
     JakalBackendKind backend_;
     std::string probe_name_;
     std::unique_ptr<IKernelBackend> host_;
+    std::unique_ptr<IKernelBackend> modeled_;
     mutable std::mutex persistent_dispatch_mutex_;
     mutable std::uint64_t persistent_dispatch_tick_ = 0u;
     mutable std::unordered_map<std::string, DispatchCacheEntry> persistent_dispatch_cache_;
