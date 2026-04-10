@@ -32,14 +32,21 @@ set(CPACK_INSTALLED_DIRECTORIES "D:/GitHub/Jakal-Core;/")
 set(CPACK_INSTALL_CMAKE_PROJECTS "")
 set(CPACK_INSTALL_PREFIX "C:/Program Files (x86)/JakalCore")
 set(CPACK_MODULE_PATH "")
-set(CPACK_NSIS_CREATE_ICONS_EXTRA "CreateShortCut \"$SMPROGRAMS\\$STARTMENU_FOLDER\\Jakal Hardware Setup.lnk\" \"$INSTDIR\\bin\\launch-jakal-hardware-setup.cmd\"")
+set(CPACK_NSIS_CREATE_ICONS_EXTRA "CreateShortCut \"$SMPROGRAMS\\$STARTMENU_FOLDER\\Jakal Hardware Setup.lnk\" \"$INSTDIR\\bin\\launch-jakal-hardware-setup.cmd\" \"\" \"$INSTDIR\\bin\\jakal-core-logo.ico\" 0")
 set(CPACK_NSIS_DELETE_ICONS_EXTRA "Delete \"$SMPROGRAMS\\$STARTMENU_FOLDER\\Jakal Hardware Setup.lnk\"")
 set(CPACK_NSIS_DISPLAY_NAME "Jakal-Core")
 set(CPACK_NSIS_DISPLAY_NAME_SET "TRUE")
 set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL "ON")
 set(CPACK_NSIS_EXECUTABLE "D:/GitHub/Jakal-Core/tools/nsis/portable/nsis-3.11/makensis.exe")
+set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\jakal-core-logo.ico")
 set(CPACK_NSIS_INSTALLER_ICON_CODE "")
-set(CPACK_NSIS_INSTALLER_MUI_ICON_CODE "")
+set(CPACK_NSIS_INSTALLER_MUI_ICON_CODE "!define MUI_ICON \"D:\\GitHub\\Jakal-Core\\build_ninja\\branding\\jakal-core-logo.ico\"
+!define MUI_UNICON \"D:\\GitHub\\Jakal-Core\\build_ninja\\branding\\jakal-core-logo.ico\"")
+set(CPACK_NSIS_INSTALLER_MUI_WELCOMEFINISH_CODE "!define MUI_HEADERIMAGE_BITMAP \"D:\\GitHub\\Jakal-Core\\build_ninja\\branding\\jakal-core-logo-header.bmp\"
+!define MUI_HEADERIMAGE_UNBITMAP \"D:\\GitHub\\Jakal-Core\\build_ninja\\branding\\jakal-core-logo-header.bmp\"
+!define MUI_WELCOMEFINISHPAGE_BITMAP \"D:\\GitHub\\Jakal-Core\\build_ninja\\branding\\jakal-core-logo-wizard.bmp\"
+!define MUI_UNWELCOMEFINISHPAGE_BITMAP \"D:\\GitHub\\Jakal-Core\\build_ninja\\branding\\jakal-core-logo-wizard.bmp\"
+")
 set(CPACK_NSIS_INSTALL_ROOT "$PROGRAMFILES64")
 set(CPACK_NSIS_MENU_LINKS "bin\\jakal_bootstrap.exe;Jakal Bootstrap;bin\\launch-jakal-hardware-setup.cmd;Jakal Hardware Setup;share\\doc\\JakalCore\\README.md;README")
 set(CPACK_NSIS_MODIFY_PATH "OFF")

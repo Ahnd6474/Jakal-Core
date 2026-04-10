@@ -339,6 +339,9 @@ JAKAL_CORE_ENABLE_CODE_SIGNING:BOOL=OFF
 //Path to a program.
 JAKAL_CORE_MAKENSIS_EXECUTABLE:FILEPATH=D:/GitHub/Jakal-Core/tools/nsis/portable/nsis-3.11/makensis.exe
 
+//Path to a program.
+JAKAL_CORE_POWERSHELL_EXECUTABLE:FILEPATH=C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+
 //Path to signtool.exe
 JAKAL_CORE_SIGNTOOL_PATH:FILEPATH=
 

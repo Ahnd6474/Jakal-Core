@@ -18,6 +18,40 @@ set(JAKAL_CORE_SIGNTOOL_PATH "" CACHE FILEPATH "Path to signtool.exe")
 set(JAKAL_CORE_CODESIGN_CERT_SHA1 "" CACHE STRING "Certificate thumbprint used for Windows code signing")
 set(JAKAL_CORE_CODESIGN_TIMESTAMP_URL "http://timestamp.digicert.com" CACHE STRING "RFC3161 timestamp URL for Windows code signing")
 
+set(JAKAL_CORE_BRAND_SOURCE_PNG "${CMAKE_CURRENT_SOURCE_DIR}/Jakal_core_logo.png")
+set(JAKAL_CORE_BRAND_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/branding")
+set(JAKAL_CORE_BRAND_RUNTIME_PNG "")
+set(JAKAL_CORE_BRAND_RUNTIME_ICO "")
+set(JAKAL_CORE_BRAND_NSIS_HEADER_BMP "")
+set(JAKAL_CORE_BRAND_NSIS_WIZARD_BMP "")
+
+if(EXISTS "${JAKAL_CORE_BRAND_SOURCE_PNG}")
+    if(WIN32)
+        find_program(JAKAL_CORE_POWERSHELL_EXECUTABLE NAMES powershell pwsh REQUIRED)
+        file(MAKE_DIRECTORY "${JAKAL_CORE_BRAND_OUTPUT_DIR}")
+        execute_process(
+            COMMAND
+                "${JAKAL_CORE_POWERSHELL_EXECUTABLE}"
+                -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/packaging/generate-brand-assets.ps1"
+                -SourcePng "${JAKAL_CORE_BRAND_SOURCE_PNG}"
+                -OutputDir "${JAKAL_CORE_BRAND_OUTPUT_DIR}"
+                -BaseName "jakal-core-logo"
+            RESULT_VARIABLE JAKAL_CORE_BRAND_GENERATION_RESULT
+        )
+        if(NOT JAKAL_CORE_BRAND_GENERATION_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to generate Windows branding assets from ${JAKAL_CORE_BRAND_SOURCE_PNG}")
+        endif()
+
+        set(JAKAL_CORE_BRAND_RUNTIME_PNG "${JAKAL_CORE_BRAND_OUTPUT_DIR}/jakal-core-logo.png")
+        set(JAKAL_CORE_BRAND_RUNTIME_ICO "${JAKAL_CORE_BRAND_OUTPUT_DIR}/jakal-core-logo.ico")
+        set(JAKAL_CORE_BRAND_NSIS_HEADER_BMP "${JAKAL_CORE_BRAND_OUTPUT_DIR}/jakal-core-logo-header.bmp")
+        set(JAKAL_CORE_BRAND_NSIS_WIZARD_BMP "${JAKAL_CORE_BRAND_OUTPUT_DIR}/jakal-core-logo-wizard.bmp")
+    else()
+        set(JAKAL_CORE_BRAND_RUNTIME_PNG "${JAKAL_CORE_BRAND_SOURCE_PNG}")
+    endif()
+endif()
+
 add_library(jakal_core
     src/device.cpp
     src/execution.cpp
@@ -306,6 +340,28 @@ install(
     DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/config
     COMPONENT runtime)
 
+if(JAKAL_CORE_BRAND_RUNTIME_PNG)
+    install(
+        FILES
+            "${JAKAL_CORE_BRAND_RUNTIME_PNG}"
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/branding
+        COMPONENT runtime)
+endif()
+
+if(JAKAL_CORE_BRAND_RUNTIME_ICO)
+    install(
+        FILES
+            "${JAKAL_CORE_BRAND_RUNTIME_ICO}"
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT runtime)
+
+    install(
+        FILES
+            "${JAKAL_CORE_BRAND_RUNTIME_ICO}"
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/branding
+        COMPONENT runtime)
+endif()
+
 install(
     FILES
         python/jakal_runtime.py
@@ -383,8 +439,36 @@ if(WIN32)
         set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
         set(CPACK_NSIS_MODIFY_PATH OFF)
         set(CPACK_NSIS_MUI_FINISHPAGE_RUN "bin\\\\launch-jakal-hardware-setup.cmd")
-        set(CPACK_NSIS_CREATE_ICONS_EXTRA
-            "CreateShortCut \\\"$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\Jakal Hardware Setup.lnk\\\" \\\"$INSTDIR\\\\bin\\\\launch-jakal-hardware-setup.cmd\\\"")
+        if(JAKAL_CORE_BRAND_RUNTIME_ICO)
+            string(REPLACE "/" "\\\\" _jakal_brand_ico_nsis "${JAKAL_CORE_BRAND_RUNTIME_ICO}")
+            set(CPACK_NSIS_INSTALLER_MUI_ICON_CODE
+"!define MUI_ICON \\\"${_jakal_brand_ico_nsis}\\\"
+!define MUI_UNICON \\\"${_jakal_brand_ico_nsis}\\\"")
+            set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\jakal-core-logo.ico")
+            set(CPACK_NSIS_CREATE_ICONS_EXTRA
+                "CreateShortCut \\\"$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\Jakal Hardware Setup.lnk\\\" \\\"$INSTDIR\\\\bin\\\\launch-jakal-hardware-setup.cmd\\\" \\\"\\\" \\\"$INSTDIR\\\\bin\\\\jakal-core-logo.ico\\\" 0")
+        else()
+            set(CPACK_NSIS_CREATE_ICONS_EXTRA
+                "CreateShortCut \\\"$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\Jakal Hardware Setup.lnk\\\" \\\"$INSTDIR\\\\bin\\\\launch-jakal-hardware-setup.cmd\\\"")
+        endif()
+        if(JAKAL_CORE_BRAND_NSIS_HEADER_BMP OR JAKAL_CORE_BRAND_NSIS_WIZARD_BMP)
+            set(_jakal_branding_code "")
+            if(JAKAL_CORE_BRAND_NSIS_HEADER_BMP)
+                string(REPLACE "/" "\\\\" _jakal_brand_header_nsis "${JAKAL_CORE_BRAND_NSIS_HEADER_BMP}")
+                string(APPEND _jakal_branding_code
+"!define MUI_HEADERIMAGE_BITMAP \\\"${_jakal_brand_header_nsis}\\\"
+!define MUI_HEADERIMAGE_UNBITMAP \\\"${_jakal_brand_header_nsis}\\\"
+")
+            endif()
+            if(JAKAL_CORE_BRAND_NSIS_WIZARD_BMP)
+                string(REPLACE "/" "\\\\" _jakal_brand_wizard_nsis "${JAKAL_CORE_BRAND_NSIS_WIZARD_BMP}")
+                string(APPEND _jakal_branding_code
+"!define MUI_WELCOMEFINISHPAGE_BITMAP \\\"${_jakal_brand_wizard_nsis}\\\"
+!define MUI_UNWELCOMEFINISHPAGE_BITMAP \\\"${_jakal_brand_wizard_nsis}\\\"
+")
+            endif()
+            set(CPACK_NSIS_INSTALLER_MUI_WELCOMEFINISH_CODE "${_jakal_branding_code}")
+        endif()
         set(CPACK_NSIS_DELETE_ICONS_EXTRA
             "Delete \\\"$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\Jakal Hardware Setup.lnk\\\"")
         if(TARGET jakal_bootstrap)

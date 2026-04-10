@@ -127,6 +127,18 @@ if(CMAKE_INSTALL_COMPONENT STREQUAL "runtime" OR NOT CMAKE_INSTALL_COMPONENT)
 endif()
 
 if(CMAKE_INSTALL_COMPONENT STREQUAL "runtime" OR NOT CMAKE_INSTALL_COMPONENT)
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/jakal-core/branding" TYPE FILE FILES "D:/GitHub/Jakal-Core/build_ninja/branding/jakal-core-logo.png")
+endif()
+
+if(CMAKE_INSTALL_COMPONENT STREQUAL "runtime" OR NOT CMAKE_INSTALL_COMPONENT)
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/bin" TYPE FILE FILES "D:/GitHub/Jakal-Core/build_ninja/branding/jakal-core-logo.ico")
+endif()
+
+if(CMAKE_INSTALL_COMPONENT STREQUAL "runtime" OR NOT CMAKE_INSTALL_COMPONENT)
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/jakal-core/branding" TYPE FILE FILES "D:/GitHub/Jakal-Core/build_ninja/branding/jakal-core-logo.ico")
+endif()
+
+if(CMAKE_INSTALL_COMPONENT STREQUAL "runtime" OR NOT CMAKE_INSTALL_COMPONENT)
   file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/jakal-core/python" TYPE FILE FILES
     "D:/GitHub/Jakal-Core/python/jakal_runtime.py"
     "D:/GitHub/Jakal-Core/python/jakal_app_adapter.py"
