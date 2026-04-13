@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -233,6 +234,73 @@ CopyComputeBreakdown estimate_copy_compute_breakdown(
     breakdown.compute_runtime_us =
         std::max(0.25, std::max(tail_runtime_us - breakdown.residual_copy_runtime_us, tail_runtime_us * 0.35));
     return breakdown;
+}
+
+struct ActualPoolSnapshot {
+    std::string pool_id;
+    std::string resource_tag;
+    std::uint64_t reserved_bytes = 0u;
+    std::uint32_t reuse_hits = 0u;
+};
+
+void append_actual_pool_binding(
+    const HardwareGraph& graph,
+    const std::string& backend_name,
+    const ActualPoolSnapshot& snapshot,
+    BackendRunResult& result) {
+    if (snapshot.pool_id.empty() || snapshot.reserved_bytes == 0u) {
+        return;
+    }
+    result.buffer_pool_bindings.push_back(BackendBufferPoolBinding{
+        graph.uid,
+        backend_name,
+        snapshot.pool_id,
+        snapshot.resource_tag,
+        snapshot.reserved_bytes,
+        snapshot.reuse_hits});
+}
+
+void append_actual_transfer_records(
+    const HardwareGraph& graph,
+    const std::string& backend_name,
+    const std::vector<std::pair<ActualPoolSnapshot, std::uint64_t>>& inputs,
+    const std::vector<std::pair<ActualPoolSnapshot, std::uint64_t>>& outputs,
+    BackendRunResult& result) {
+    const auto total_transfer_bytes = std::accumulate(
+        inputs.begin(),
+        inputs.end(),
+        std::accumulate(
+            outputs.begin(),
+            outputs.end(),
+            0ull,
+            [](const std::uint64_t total, const auto& item) { return total + item.second; }),
+        [](const std::uint64_t total, const auto& item) { return total + item.second; });
+    if (total_transfer_bytes == 0u || result.copy_runtime_us <= 0.0) {
+        return;
+    }
+
+    const auto append_kind = [&](const char* movement_kind,
+                                 const std::vector<std::pair<ActualPoolSnapshot, std::uint64_t>>& items) {
+        for (const auto& [snapshot, bytes] : items) {
+            if (bytes == 0u) {
+                continue;
+            }
+            result.transfer_records.push_back(TransferExecutionRecord{
+                graph.uid,
+                backend_name,
+                movement_kind,
+                snapshot.pool_id,
+                snapshot.resource_tag,
+                bytes,
+                result.copy_runtime_us *
+                    (static_cast<double>(bytes) /
+                     static_cast<double>(std::max<std::uint64_t>(total_transfer_bytes, 1u))),
+                snapshot.reuse_hits});
+        }
+    };
+
+    append_kind("h2d", inputs);
+    append_kind("d2h", outputs);
 }
 
 constexpr const char* kCudaLikeProgramSource = R"GPU(
@@ -863,8 +931,9 @@ protected:
             result.copy_queue_count > 0u && result.async_dispatch_capable
                 ? std::clamp(0.24 + (0.08 * static_cast<double>(stream_groups - 1u)) + result.copy_overlap_ratio, 0.0, 1.0)
                 : 0.0;
-        result.persistent_resource_reuse_hits = resource_hits;
-        if (!resource_snapshot.pool_id.empty()) {
+        result.persistent_resource_reuse_hits =
+            std::max(result.persistent_resource_reuse_hits, resource_hits);
+        if (result.buffer_pool_bindings.empty() && !resource_snapshot.pool_id.empty()) {
             result.buffer_pool_bindings.push_back(BackendBufferPoolBinding{
                 graph.uid,
                 name(),
@@ -873,7 +942,8 @@ protected:
                 resource_snapshot.reserved_bytes,
                 resource_snapshot.reuse_hits});
         }
-        if (input_bytes > 0u) {
+        const bool emit_synthetic_transfer_records = result.transfer_records.empty();
+        if (emit_synthetic_transfer_records && input_bytes > 0u) {
             const auto copy_in_us =
                 result.copy_runtime_us * (static_cast<double>(input_bytes) / static_cast<double>(std::max<std::size_t>(input_bytes + output_bytes, 1u)));
             result.transfer_records.push_back(TransferExecutionRecord{
@@ -886,7 +956,7 @@ protected:
                 copy_in_us,
                 resource_snapshot.reuse_hits});
         }
-        if (output_bytes > 0u) {
+        if (emit_synthetic_transfer_records && output_bytes > 0u) {
             const auto copy_out_us =
                 result.copy_runtime_us * (static_cast<double>(output_bytes) / static_cast<double>(std::max<std::size_t>(input_bytes + output_bytes, 1u)));
             result.transfer_records.push_back(TransferExecutionRecord{
@@ -1082,9 +1152,11 @@ private:
         cu_event_t compute_ready_event = nullptr;
         cu_module_t module = nullptr;
         std::array<std::vector<float>, 2> staging_buffers;
+        std::array<std::uint32_t, 2> staging_buffer_reuse_hits{};
         std::unordered_map<std::string, cu_function_t> kernels;
         std::unordered_map<std::string, cu_device_ptr_t> reusable_buffers;
         std::unordered_map<std::string, std::size_t> reusable_buffer_sizes;
+        std::unordered_map<std::string, std::uint32_t> reusable_buffer_hits;
         std::unordered_map<std::string, std::uint64_t> reusable_buffer_last_used;
         std::uint64_t reusable_buffer_bytes = 0u;
         std::uint64_t reusable_buffer_budget_bytes = 0u;
@@ -1168,6 +1240,7 @@ private:
         }
         context.reusable_buffers.clear();
         context.reusable_buffer_sizes.clear();
+        context.reusable_buffer_hits.clear();
         context.reusable_buffer_last_used.clear();
         context.reusable_buffer_bytes = 0u;
         context.kernels.clear();
@@ -1217,6 +1290,8 @@ private:
             }
             slot_size = bytes;
             context.reusable_buffer_bytes += bytes;
+        } else {
+            ++context.reusable_buffer_hits[slot];
         }
         touch_buffer(context, slot);
         ptr = slot_ptr;
@@ -1245,12 +1320,81 @@ private:
         }
         const void* source = input.data();
         if (!input.empty()) {
-            auto& staging = context.staging_buffers[staging_slot % context.staging_buffers.size()];
+            const auto slot_index = staging_slot % context.staging_buffers.size();
+            auto& staging = context.staging_buffers[slot_index];
+            if ((staging.capacity() * sizeof(float)) >= input.size_bytes() && !staging.empty()) {
+                ++context.staging_buffer_reuse_hits[slot_index];
+            }
             staging.resize(input.size());
             std::memcpy(staging.data(), input.data(), input.size_bytes());
             source = staging.data();
         }
         return api().cu_memcpy_htod_async(ptr, source, input.size_bytes(), stream) == 0;
+    }
+
+    ActualPoolSnapshot device_pool_snapshot(
+        const HardwareGraph& graph,
+        const Context& context,
+        const std::string& slot) const {
+        const auto size_it = context.reusable_buffer_sizes.find(slot);
+        if (size_it == context.reusable_buffer_sizes.end() || size_it->second == 0u) {
+            return {};
+        }
+        const auto hit_it = context.reusable_buffer_hits.find(slot);
+        return ActualPoolSnapshot{
+            graph.uid + "|" + name() + "|device-buffer|" + slot,
+            slot,
+            static_cast<std::uint64_t>(size_it->second),
+            hit_it == context.reusable_buffer_hits.end() ? 0u : hit_it->second};
+    }
+
+    ActualPoolSnapshot staging_pool_snapshot(
+        const HardwareGraph& graph,
+        const Context& context,
+        const std::size_t staging_slot) const {
+        const auto& staging = context.staging_buffers[staging_slot % context.staging_buffers.size()];
+        const auto reserved_bytes = static_cast<std::uint64_t>(staging.capacity() * sizeof(float));
+        if (reserved_bytes == 0u) {
+            return {};
+        }
+        return ActualPoolSnapshot{
+            graph.uid + "|" + name() + "|host-staging|" + std::to_string(staging_slot),
+            "staging-" + std::to_string(staging_slot),
+            reserved_bytes,
+            context.staging_buffer_reuse_hits[staging_slot % context.staging_buffers.size()]};
+    }
+
+    void append_actual_pool_usage(
+        const HardwareGraph& graph,
+        const Context& context,
+        BackendRunResult& result,
+        const std::vector<std::pair<std::string, std::uint64_t>>& input_slots,
+        const std::vector<std::pair<std::string, std::uint64_t>>& output_slots,
+        const std::vector<std::size_t>& staging_slots = {}) const {
+        std::vector<std::pair<ActualPoolSnapshot, std::uint64_t>> input_transfers;
+        std::vector<std::pair<ActualPoolSnapshot, std::uint64_t>> output_transfers;
+        for (const auto& [slot, bytes] : input_slots) {
+            const auto snapshot = device_pool_snapshot(graph, context, slot);
+            append_actual_pool_binding(graph, name(), snapshot, result);
+            if (snapshot.reserved_bytes > 0u) {
+                input_transfers.push_back({snapshot, bytes});
+            }
+        }
+        for (const auto& [slot, bytes] : output_slots) {
+            const auto snapshot = device_pool_snapshot(graph, context, slot);
+            append_actual_pool_binding(graph, name(), snapshot, result);
+            if (snapshot.reserved_bytes > 0u) {
+                output_transfers.push_back({snapshot, bytes});
+            }
+        }
+        for (const auto slot_index : staging_slots) {
+            append_actual_pool_binding(
+                graph,
+                name(),
+                staging_pool_snapshot(graph, context, slot_index),
+                result);
+        }
+        append_actual_transfer_records(graph, name(), input_transfers, output_transfers, result);
     }
 
     std::shared_ptr<Context> acquire_context(const HardwareGraph& graph) const {
@@ -1406,6 +1550,15 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_pool_usage(
+                graph,
+                *context,
+                result,
+                {{"unary-in", static_cast<std::uint64_t>(input.size_bytes())}},
+                {{"unary-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}},
+                can_split_dispatch(*context) ? std::vector<std::size_t>{0u} : std::vector<std::size_t>{});
+        }
         return result;
     }
 
@@ -1479,6 +1632,18 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_pool_usage(
+                graph,
+                *context,
+                result,
+                {
+                    {"lhs", static_cast<std::uint64_t>(lhs.size_bytes())},
+                    {"rhs", static_cast<std::uint64_t>(rhs.size_bytes())},
+                },
+                {{"binary-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}},
+                can_split_dispatch(*context) ? std::vector<std::size_t>{0u, 1u} : std::vector<std::size_t>{});
+        }
         return result;
     }
 
@@ -1489,6 +1654,7 @@ private:
         double copy_in_us = 0.0;
         double copy_out_us = 0.0;
         double compute_us = 0.0;
+        std::uint64_t partial_buffer_bytes = 0u;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock execution_lock(context->execution_mutex);
             if (!activate(*context)) { result.error = "cuda-activate"; return; }
@@ -1498,6 +1664,7 @@ private:
             const auto global = std::min<std::size_t>(std::max<std::size_t>(local, round_up<std::size_t>(input.size(), local)), local * 64u);
             const auto groups = global / local;
             std::vector<float> partials(groups, 0.0f);
+            partial_buffer_bytes = static_cast<std::uint64_t>(partials.size() * sizeof(float));
             cu_device_ptr_t d_in = 0, d_partial = 0;
             if (can_split_dispatch(*context)) {
                 if (!alloc_and_copy_input_async(*context, "reduce-in", d_in, input, context->copy_stream) ||
@@ -1552,6 +1719,15 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_pool_usage(
+                graph,
+                *context,
+                result,
+                {{"reduce-in", static_cast<std::uint64_t>(input.size_bytes())}},
+                {{"reduce-partial", partial_buffer_bytes}},
+                can_split_dispatch(*context) ? std::vector<std::size_t>{0u} : std::vector<std::size_t>{});
+        }
         return result;
     }
 
@@ -1630,6 +1806,18 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_pool_usage(
+                graph,
+                *context,
+                result,
+                {
+                    {"matmul-lhs", static_cast<std::uint64_t>(lhs.size_bytes())},
+                    {"matmul-rhs", static_cast<std::uint64_t>(rhs.size_bytes())},
+                },
+                {{"matmul-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}},
+                can_split_dispatch(*context) ? std::vector<std::size_t>{0u, 1u} : std::vector<std::size_t>{});
+        }
         return result;
     }
 
@@ -1839,6 +2027,7 @@ private:
         std::unordered_map<std::string, ze_kernel_handle_t> kernels;
         std::unordered_map<std::string, void*> reusable_buffers;
         std::unordered_map<std::string, std::size_t> reusable_buffer_sizes;
+        std::unordered_map<std::string, std::uint32_t> reusable_buffer_hits;
         std::unordered_map<std::string, std::uint64_t> reusable_buffer_last_used;
         std::uint64_t reusable_buffer_bytes = 0u;
         std::uint64_t reusable_buffer_budget_bytes = 0u;
@@ -1904,6 +2093,7 @@ private:
         }
         context.reusable_buffers.clear();
         context.reusable_buffer_sizes.clear();
+        context.reusable_buffer_hits.clear();
         context.reusable_buffer_last_used.clear();
         context.reusable_buffer_bytes = 0u;
         context.reusable_buffer_tick = 0u;
@@ -1929,10 +2119,53 @@ private:
             }
             slot_size = bytes;
             context.reusable_buffer_bytes += bytes;
+        } else {
+            ++context.reusable_buffer_hits[slot];
         }
         touch_buffer(context, slot);
         *ptr = slot_ptr;
         return true;
+    }
+
+    ActualPoolSnapshot shared_pool_snapshot(
+        const HardwareGraph& graph,
+        const Context& context,
+        const std::string& slot) const {
+        const auto size_it = context.reusable_buffer_sizes.find(slot);
+        if (size_it == context.reusable_buffer_sizes.end() || size_it->second == 0u) {
+            return {};
+        }
+        const auto hit_it = context.reusable_buffer_hits.find(slot);
+        return ActualPoolSnapshot{
+            graph.uid + "|" + name() + "|shared-buffer|" + slot,
+            slot,
+            static_cast<std::uint64_t>(size_it->second),
+            hit_it == context.reusable_buffer_hits.end() ? 0u : hit_it->second};
+    }
+
+    void append_actual_shared_pool_usage(
+        const HardwareGraph& graph,
+        const Context& context,
+        BackendRunResult& result,
+        const std::vector<std::pair<std::string, std::uint64_t>>& input_slots,
+        const std::vector<std::pair<std::string, std::uint64_t>>& output_slots) const {
+        std::vector<std::pair<ActualPoolSnapshot, std::uint64_t>> input_transfers;
+        std::vector<std::pair<ActualPoolSnapshot, std::uint64_t>> output_transfers;
+        for (const auto& [slot, bytes] : input_slots) {
+            const auto snapshot = shared_pool_snapshot(graph, context, slot);
+            append_actual_pool_binding(graph, name(), snapshot, result);
+            if (snapshot.reserved_bytes > 0u) {
+                input_transfers.push_back({snapshot, bytes});
+            }
+        }
+        for (const auto& [slot, bytes] : output_slots) {
+            const auto snapshot = shared_pool_snapshot(graph, context, slot);
+            append_actual_pool_binding(graph, name(), snapshot, result);
+            if (snapshot.reserved_bytes > 0u) {
+                output_transfers.push_back({snapshot, bytes});
+            }
+        }
+        append_actual_transfer_records(graph, name(), input_transfers, output_transfers, result);
     }
 
     BinaryBlob compile_binary(const bool low_precision_variant) const {
@@ -2129,6 +2362,17 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_shared_pool_usage(
+                graph,
+                *context,
+                result,
+                {
+                    {"elementwise-lhs", static_cast<std::uint64_t>(lhs.size_bytes())},
+                    {"elementwise-rhs", static_cast<std::uint64_t>(rhs.size_bytes())},
+                },
+                {{"elementwise-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}});
+        }
         return result;
     }
 
@@ -2139,12 +2383,14 @@ private:
         double copy_in_us = 0.0;
         double copy_out_us = 0.0;
         double compute_us = 0.0;
+        std::uint64_t partial_buffer_bytes = 0u;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             const auto local = kNativeReductionGroupSize;
             const auto global = std::min<std::size_t>(std::max<std::size_t>(local, round_up<std::size_t>(input.size(), local)), local * 64u);
             const auto groups = static_cast<std::uint32_t>(global / local);
             std::vector<float> partials(groups, 0.0f);
+            partial_buffer_bytes = static_cast<std::uint64_t>(partials.size() * sizeof(float));
             void* in_mem = nullptr; void* partial_mem = nullptr;
             if (!ensure_shared_buffer(*context, "reduce-in", input.size_bytes(), &in_mem) ||
                 !ensure_shared_buffer(*context, "reduce-partial", partials.size() * sizeof(float), &partial_mem)) {
@@ -2168,6 +2414,14 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_shared_pool_usage(
+                graph,
+                *context,
+                result,
+                {{"reduce-in", static_cast<std::uint64_t>(input.size_bytes())}},
+                {{"reduce-partial", partial_buffer_bytes}});
+        }
         return result;
     }
 
@@ -2207,6 +2461,17 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_shared_pool_usage(
+                graph,
+                *context,
+                result,
+                {
+                    {"matmul-lhs", static_cast<std::uint64_t>(lhs.size_bytes())},
+                    {"matmul-rhs", static_cast<std::uint64_t>(rhs.size_bytes())},
+                },
+                {{"matmul-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}});
+        }
         return result;
     }
 
@@ -2266,6 +2531,14 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_shared_pool_usage(
+                graph,
+                *context,
+                result,
+                {{"conv-in", static_cast<std::uint64_t>(input.size_bytes())}},
+                {{"conv-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}});
+        }
         return result;
     }
 
@@ -2331,6 +2604,14 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_shared_pool_usage(
+                graph,
+                *context,
+                result,
+                {{"resample-in", static_cast<std::uint64_t>(input.size_bytes())}},
+                {{"resample-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}});
+        }
         return result;
     }
 
@@ -2460,9 +2741,11 @@ private:
         hip_event_t compute_ready_event = nullptr;
         hip_module_t module = nullptr;
         std::array<std::vector<float>, 2> staging_buffers;
+        std::array<std::uint32_t, 2> staging_buffer_reuse_hits{};
         std::unordered_map<std::string, hip_function_t> kernels;
         std::unordered_map<std::string, void*> reusable_buffers;
         std::unordered_map<std::string, std::size_t> reusable_buffer_sizes;
+        std::unordered_map<std::string, std::uint32_t> reusable_buffer_hits;
         std::unordered_map<std::string, std::uint64_t> reusable_buffer_last_used;
         std::uint64_t reusable_buffer_bytes = 0u;
         std::uint64_t reusable_buffer_budget_bytes = 0u;
@@ -2610,6 +2893,7 @@ private:
         }
         context.reusable_buffers.clear();
         context.reusable_buffer_sizes.clear();
+        context.reusable_buffer_hits.clear();
         context.reusable_buffer_last_used.clear();
         context.reusable_buffer_bytes = 0u;
         context.reusable_buffer_tick = 0u;
@@ -2635,6 +2919,8 @@ private:
             }
             slot_size = bytes;
             context.reusable_buffer_bytes += bytes;
+        } else {
+            ++context.reusable_buffer_hits[slot];
         }
         touch_buffer(context, slot);
         ptr = slot_ptr;
@@ -2657,12 +2943,81 @@ private:
         if (!ensure_buffer(context, slot, input.size_bytes(), ptr)) return false;
         const void* source = input.data();
         if (!input.empty()) {
-            auto& staging = context.staging_buffers[staging_slot % context.staging_buffers.size()];
+            const auto slot_index = staging_slot % context.staging_buffers.size();
+            auto& staging = context.staging_buffers[slot_index];
+            if ((staging.capacity() * sizeof(float)) >= input.size_bytes() && !staging.empty()) {
+                ++context.staging_buffer_reuse_hits[slot_index];
+            }
             staging.resize(input.size());
             std::memcpy(staging.data(), input.data(), input.size_bytes());
             source = staging.data();
         }
         return api().hip_memcpy_htod_async(ptr, source, input.size_bytes(), stream) == 0;
+    }
+
+    ActualPoolSnapshot device_pool_snapshot(
+        const HardwareGraph& graph,
+        const Context& context,
+        const std::string& slot) const {
+        const auto size_it = context.reusable_buffer_sizes.find(slot);
+        if (size_it == context.reusable_buffer_sizes.end() || size_it->second == 0u) {
+            return {};
+        }
+        const auto hit_it = context.reusable_buffer_hits.find(slot);
+        return ActualPoolSnapshot{
+            graph.uid + "|" + name() + "|device-buffer|" + slot,
+            slot,
+            static_cast<std::uint64_t>(size_it->second),
+            hit_it == context.reusable_buffer_hits.end() ? 0u : hit_it->second};
+    }
+
+    ActualPoolSnapshot staging_pool_snapshot(
+        const HardwareGraph& graph,
+        const Context& context,
+        const std::size_t staging_slot) const {
+        const auto& staging = context.staging_buffers[staging_slot % context.staging_buffers.size()];
+        const auto reserved_bytes = static_cast<std::uint64_t>(staging.capacity() * sizeof(float));
+        if (reserved_bytes == 0u) {
+            return {};
+        }
+        return ActualPoolSnapshot{
+            graph.uid + "|" + name() + "|host-staging|" + std::to_string(staging_slot),
+            "staging-" + std::to_string(staging_slot),
+            reserved_bytes,
+            context.staging_buffer_reuse_hits[staging_slot % context.staging_buffers.size()]};
+    }
+
+    void append_actual_pool_usage(
+        const HardwareGraph& graph,
+        const Context& context,
+        BackendRunResult& result,
+        const std::vector<std::pair<std::string, std::uint64_t>>& input_slots,
+        const std::vector<std::pair<std::string, std::uint64_t>>& output_slots,
+        const std::vector<std::size_t>& staging_slots = {}) const {
+        std::vector<std::pair<ActualPoolSnapshot, std::uint64_t>> input_transfers;
+        std::vector<std::pair<ActualPoolSnapshot, std::uint64_t>> output_transfers;
+        for (const auto& [slot, bytes] : input_slots) {
+            const auto snapshot = device_pool_snapshot(graph, context, slot);
+            append_actual_pool_binding(graph, name(), snapshot, result);
+            if (snapshot.reserved_bytes > 0u) {
+                input_transfers.push_back({snapshot, bytes});
+            }
+        }
+        for (const auto& [slot, bytes] : output_slots) {
+            const auto snapshot = device_pool_snapshot(graph, context, slot);
+            append_actual_pool_binding(graph, name(), snapshot, result);
+            if (snapshot.reserved_bytes > 0u) {
+                output_transfers.push_back({snapshot, bytes});
+            }
+        }
+        for (const auto slot_index : staging_slots) {
+            append_actual_pool_binding(
+                graph,
+                name(),
+                staging_pool_snapshot(graph, context, slot_index),
+                result);
+        }
+        append_actual_transfer_records(graph, name(), input_transfers, output_transfers, result);
     }
 
     void free_device(void* ptr) const { if (ptr != nullptr) (void)api().hip_free(ptr); }
@@ -2736,6 +3091,15 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_pool_usage(
+                graph,
+                *context,
+                result,
+                {{"unary-in", static_cast<std::uint64_t>(input.size_bytes())}},
+                {{"unary-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}},
+                can_split_dispatch(*context) ? std::vector<std::size_t>{0u} : std::vector<std::size_t>{});
+        }
         return result;
     }
 
@@ -2810,6 +3174,18 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_pool_usage(
+                graph,
+                *context,
+                result,
+                {
+                    {"binary-lhs", static_cast<std::uint64_t>(lhs.size_bytes())},
+                    {"binary-rhs", static_cast<std::uint64_t>(rhs.size_bytes())},
+                },
+                {{"binary-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}},
+                can_split_dispatch(*context) ? std::vector<std::size_t>{0u, 1u} : std::vector<std::size_t>{});
+        }
         return result;
     }
 
@@ -2863,6 +3239,18 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_pool_usage(
+                graph,
+                *context,
+                result,
+                {
+                    {"elementwise-lhs", static_cast<std::uint64_t>(lhs.size_bytes())},
+                    {"elementwise-rhs", static_cast<std::uint64_t>(rhs.size_bytes())},
+                },
+                {{"elementwise-out", static_cast<std::uint64_t>(result.output.size() * sizeof(float))}},
+                can_split_dispatch(*context) ? std::vector<std::size_t>{0u, 1u} : std::vector<std::size_t>{});
+        }
         return result;
     }
 
@@ -2873,6 +3261,7 @@ private:
         double copy_in_us = 0.0;
         double copy_out_us = 0.0;
         double compute_us = 0.0;
+        std::uint64_t partial_buffer_bytes = 0u;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             auto kernel = get_kernel(*context, "reduce_sum");
@@ -2881,6 +3270,7 @@ private:
             const auto global = std::min<std::size_t>(std::max<std::size_t>(local, round_up<std::size_t>(input.size(), local)), local * 64u);
             const auto groups = global / local;
             std::vector<float> partials(groups, 0.0f);
+            partial_buffer_bytes = static_cast<std::uint64_t>(partials.size() * sizeof(float));
             void* d_in = nullptr; void* d_partial = nullptr;
             if (can_split_dispatch(*context)) {
                 if (!alloc_and_copy_input_async(*context, "reduce-in", d_in, input, context->copy_stream, 0u) ||
@@ -2917,6 +3307,15 @@ private:
         });
         result.copy_runtime_us = copy_in_us + copy_out_us;
         result.compute_runtime_us = compute_us;
+        if (result.success) {
+            append_actual_pool_usage(
+                graph,
+                *context,
+                result,
+                {{"reduce-in", static_cast<std::uint64_t>(input.size_bytes())}},
+                {{"reduce-partial", partial_buffer_bytes}},
+                can_split_dispatch(*context) ? std::vector<std::size_t>{0u} : std::vector<std::size_t>{});
+        }
         return result;
     }
 

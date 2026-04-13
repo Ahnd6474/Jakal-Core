@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -20,7 +21,9 @@ void print_usage() {
         << "  devices [--host-only] [--runtime-root PATH]\n"
         << "  paths [--runtime-root PATH]\n"
         << "  smoke [--host-only] [--runtime-root PATH]\n"
-        << "  run-manifest <path> [--host-only] [--runtime-root PATH]\n";
+        << "  run-manifest <path> [--host-only] [--runtime-root PATH] [--summary-only-diagnostics]\n"
+        << "      [--verification-interval N] [--verification-sample-budget N]\n"
+        << "      [--telemetry-batch-lines N] [--telemetry-batch-bytes N]\n";
 }
 
 struct CliOptions {
@@ -29,7 +32,28 @@ struct CliOptions {
     std::filesystem::path manifest_path;
     bool host_only = false;
     bool json = false;
+    bool summary_only_diagnostics = false;
+    std::optional<std::uint32_t> verification_interval;
+    std::optional<std::uint32_t> verification_sample_budget;
+    std::optional<std::size_t> telemetry_batch_lines;
+    std::optional<std::size_t> telemetry_batch_bytes;
 };
+
+std::optional<std::uint32_t> parse_u32_arg(const std::string& value) {
+    try {
+        return static_cast<std::uint32_t>(std::stoul(value));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::size_t> parse_size_arg(const std::string& value) {
+    try {
+        return static_cast<std::size_t>(std::stoull(value));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
 
 CliOptions parse_args(int argc, char** argv) {
     CliOptions options;
@@ -46,8 +70,28 @@ CliOptions parse_args(int argc, char** argv) {
             options.json = true;
             continue;
         }
+        if (arg == "--summary-only-diagnostics") {
+            options.summary_only_diagnostics = true;
+            continue;
+        }
         if (arg == "--runtime-root" && index + 1 < argc) {
             options.runtime_root = argv[++index];
+            continue;
+        }
+        if (arg == "--verification-interval" && index + 1 < argc) {
+            options.verification_interval = parse_u32_arg(argv[++index]);
+            continue;
+        }
+        if (arg == "--verification-sample-budget" && index + 1 < argc) {
+            options.verification_sample_budget = parse_u32_arg(argv[++index]);
+            continue;
+        }
+        if (arg == "--telemetry-batch-lines" && index + 1 < argc) {
+            options.telemetry_batch_lines = parse_size_arg(argv[++index]);
+            continue;
+        }
+        if (arg == "--telemetry-batch-bytes" && index + 1 < argc) {
+            options.telemetry_batch_bytes = parse_size_arg(argv[++index]);
             continue;
         }
         if (options.manifest_path.empty()) {
@@ -364,6 +408,25 @@ DoctorSummary summarize_doctor(const jakal::Runtime& runtime) {
 jakal::RuntimeOptions make_options(const CliOptions& cli) {
     auto options = jakal::make_runtime_options_for_install(cli.runtime_root);
     options.product.observability.persist_telemetry = false;
+    if (cli.summary_only_diagnostics) {
+        options.product.performance.diagnostics_mode = jakal::RuntimeDiagnosticsMode::summary_only;
+    }
+    if (cli.verification_interval.has_value()) {
+        options.product.performance.direct_execution.enable_trusted_cached_validation = true;
+        options.product.performance.direct_execution.trusted_verification_interval =
+            *cli.verification_interval;
+    }
+    if (cli.verification_sample_budget.has_value()) {
+        options.product.performance.direct_execution.enable_trusted_cached_validation = true;
+        options.product.performance.direct_execution.trusted_verification_sample_budget =
+            *cli.verification_sample_budget;
+    }
+    if (cli.telemetry_batch_lines.has_value()) {
+        options.product.observability.telemetry_batch_line_count = *cli.telemetry_batch_lines;
+    }
+    if (cli.telemetry_batch_bytes.has_value()) {
+        options.product.observability.telemetry_batch_bytes = *cli.telemetry_batch_bytes;
+    }
     if (cli.host_only) {
         options.enable_opencl_probe = false;
         options.enable_level_zero_probe = false;

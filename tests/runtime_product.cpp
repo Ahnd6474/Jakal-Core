@@ -3,6 +3,7 @@
 #include "jakal/workloads.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -16,6 +17,63 @@ namespace {
 std::filesystem::path unique_temp_file(const std::string& stem, const std::string& extension) {
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
     return std::filesystem::temp_directory_path() / (stem + "-" + std::to_string(nonce) + extension);
+}
+
+const std::array<const char*, 8>& execution_cache_suffixes() {
+    static const std::array<const char*, 8> suffixes = {
+        "",
+        ".bin",
+        ".perf",
+        ".perf.bin",
+        ".perf.family",
+        ".perf.family.bin",
+        ".cpuhint",
+        ".cpuhint.bin",
+    };
+    return suffixes;
+}
+
+void copy_execution_cache_family(
+    const std::filesystem::path& source_base,
+    const std::filesystem::path& target_base) {
+    std::error_code ec;
+    for (const auto* suffix : execution_cache_suffixes()) {
+        const auto source = std::filesystem::path(source_base.string() + suffix);
+        const auto target = std::filesystem::path(target_base.string() + suffix);
+        std::filesystem::remove(target, ec);
+        if (std::filesystem::exists(source, ec)) {
+            std::filesystem::copy_file(
+                source,
+                target,
+                std::filesystem::copy_options::overwrite_existing,
+                ec);
+        }
+    }
+}
+
+void remove_execution_cache_family_entries(
+    const std::filesystem::path& base,
+    const std::vector<std::string>& suffixes) {
+    std::error_code ec;
+    for (const auto& suffix : suffixes) {
+        std::filesystem::remove(std::filesystem::path(base.string() + suffix), ec);
+    }
+}
+
+void write_corrupt_file(const std::filesystem::path& path, const std::string& payload) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output << payload;
+}
+
+void shift_file_time(
+    const std::filesystem::path& path,
+    const std::chrono::seconds delta) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return;
+    }
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::filesystem::last_write_time(path, now + delta, ec);
 }
 
 jakal::HardwareGraph make_synthetic_level_zero_graph() {
@@ -1148,6 +1206,98 @@ int main() {
         std::filesystem::remove(tier1_cache_path.string() + ".cpuhint", tier1_ec);
         std::filesystem::remove(tier1_cache_path.string() + ".cpuhint.bin", tier1_ec);
 
+        const auto compat_seed_cache_path = unique_temp_file("runtime-product-cache-compat-seed", ".tsv");
+        {
+            jakal::ExecutionOptimizer compat_seed_optimizer(compat_seed_cache_path);
+            const auto seeded = compat_seed_optimizer.optimize(
+                tier1_manifest.workload,
+                tier1_plan,
+                tier1_graphs,
+                &tier1_manifest.graph);
+            if (seeded.operations.empty()) {
+                std::cerr << "cache compatibility seed optimize produced no operations\n";
+                return 1;
+            }
+        }
+        const auto expect_cache_load = [&](const std::filesystem::path& cache_path,
+                                           const char* scenario) {
+            jakal::ExecutionOptimizer optimizer(cache_path);
+            const auto report = optimizer.optimize(
+                tier1_manifest.workload,
+                tier1_plan,
+                tier1_graphs,
+                &tier1_manifest.graph);
+            if (!report.loaded_from_cache || report.operations.empty()) {
+                std::cerr << "cache compatibility scenario failed: " << scenario << '\n';
+                return false;
+            }
+            return true;
+        };
+
+        const auto text_only_cache_path = unique_temp_file("runtime-product-cache-text-only", ".tsv");
+        copy_execution_cache_family(compat_seed_cache_path, text_only_cache_path);
+        remove_execution_cache_family_entries(
+            text_only_cache_path,
+            {".bin", ".perf.bin", ".perf.family.bin", ".cpuhint.bin"});
+        if (!expect_cache_load(text_only_cache_path, "text-only")) {
+            return 1;
+        }
+
+        const auto binary_only_cache_path = unique_temp_file("runtime-product-cache-binary-only", ".tsv");
+        copy_execution_cache_family(compat_seed_cache_path, binary_only_cache_path);
+        remove_execution_cache_family_entries(
+            binary_only_cache_path,
+            {"", ".perf", ".perf.family", ".cpuhint"});
+        if (!expect_cache_load(binary_only_cache_path, "binary-only")) {
+            return 1;
+        }
+
+        const auto text_stale_cache_path = unique_temp_file("runtime-product-cache-text-stale", ".tsv");
+        copy_execution_cache_family(compat_seed_cache_path, text_stale_cache_path);
+        write_corrupt_file(text_stale_cache_path, "# stale bootstrap text\n");
+        write_corrupt_file(std::filesystem::path(text_stale_cache_path.string() + ".perf"), "# stale perf text\n");
+        write_corrupt_file(std::filesystem::path(text_stale_cache_path.string() + ".perf.family"), "# stale family text\n");
+        write_corrupt_file(std::filesystem::path(text_stale_cache_path.string() + ".cpuhint"), "# stale cpu hint text\n");
+        shift_file_time(text_stale_cache_path, std::chrono::seconds(-30));
+        shift_file_time(std::filesystem::path(text_stale_cache_path.string() + ".perf"), std::chrono::seconds(-30));
+        shift_file_time(std::filesystem::path(text_stale_cache_path.string() + ".perf.family"), std::chrono::seconds(-30));
+        shift_file_time(std::filesystem::path(text_stale_cache_path.string() + ".cpuhint"), std::chrono::seconds(-30));
+        shift_file_time(std::filesystem::path(text_stale_cache_path.string() + ".bin"), std::chrono::seconds(30));
+        shift_file_time(std::filesystem::path(text_stale_cache_path.string() + ".perf.bin"), std::chrono::seconds(30));
+        shift_file_time(std::filesystem::path(text_stale_cache_path.string() + ".perf.family.bin"), std::chrono::seconds(30));
+        shift_file_time(std::filesystem::path(text_stale_cache_path.string() + ".cpuhint.bin"), std::chrono::seconds(30));
+        if (!expect_cache_load(text_stale_cache_path, "text-stale")) {
+            return 1;
+        }
+
+        const auto binary_stale_cache_path = unique_temp_file("runtime-product-cache-binary-stale", ".tsv");
+        copy_execution_cache_family(compat_seed_cache_path, binary_stale_cache_path);
+        write_corrupt_file(std::filesystem::path(binary_stale_cache_path.string() + ".bin"), "bad-binary");
+        write_corrupt_file(std::filesystem::path(binary_stale_cache_path.string() + ".perf.bin"), "bad-perf-binary");
+        write_corrupt_file(std::filesystem::path(binary_stale_cache_path.string() + ".perf.family.bin"), "bad-family-binary");
+        write_corrupt_file(std::filesystem::path(binary_stale_cache_path.string() + ".cpuhint.bin"), "bad-cpuhint-binary");
+        shift_file_time(std::filesystem::path(binary_stale_cache_path.string() + ".bin"), std::chrono::seconds(-30));
+        shift_file_time(std::filesystem::path(binary_stale_cache_path.string() + ".perf.bin"), std::chrono::seconds(-30));
+        shift_file_time(std::filesystem::path(binary_stale_cache_path.string() + ".perf.family.bin"), std::chrono::seconds(-30));
+        shift_file_time(std::filesystem::path(binary_stale_cache_path.string() + ".cpuhint.bin"), std::chrono::seconds(-30));
+        shift_file_time(binary_stale_cache_path, std::chrono::seconds(30));
+        shift_file_time(std::filesystem::path(binary_stale_cache_path.string() + ".perf"), std::chrono::seconds(30));
+        shift_file_time(std::filesystem::path(binary_stale_cache_path.string() + ".perf.family"), std::chrono::seconds(30));
+        shift_file_time(std::filesystem::path(binary_stale_cache_path.string() + ".cpuhint"), std::chrono::seconds(30));
+        if (!expect_cache_load(binary_stale_cache_path, "binary-stale")) {
+            return 1;
+        }
+
+        const auto mismatch_cache_path = unique_temp_file("runtime-product-cache-mismatch", ".tsv");
+        copy_execution_cache_family(compat_seed_cache_path, mismatch_cache_path);
+        write_corrupt_file(std::filesystem::path(mismatch_cache_path.string() + ".bin"), "schema-mismatch");
+        write_corrupt_file(std::filesystem::path(mismatch_cache_path.string() + ".perf.bin"), "schema-mismatch");
+        shift_file_time(std::filesystem::path(mismatch_cache_path.string() + ".bin"), std::chrono::seconds(30));
+        shift_file_time(std::filesystem::path(mismatch_cache_path.string() + ".perf.bin"), std::chrono::seconds(30));
+        if (!expect_cache_load(mismatch_cache_path, "schema-mismatch-recovery")) {
+            return 1;
+        }
+
         double repeated_managed_runtime_us = 0.0;
         std::ifstream telemetry(manifest_managed.telemetry_path);
         std::string telemetry_header;
@@ -1366,6 +1516,11 @@ int main() {
         }
 
         std::error_code ec;
+        const auto remove_execution_cache_family = [&](const std::filesystem::path& base) {
+            for (const auto* suffix : execution_cache_suffixes()) {
+                std::filesystem::remove(std::filesystem::path(base.string() + suffix), ec);
+            }
+        };
         std::filesystem::remove(manifest_path, ec);
         std::filesystem::remove(runtime_manifest_path, ec);
         std::filesystem::remove(blocked_manifest_path, ec);
@@ -1377,22 +1532,14 @@ int main() {
         std::filesystem::remove(weight_asset_path, ec);
         std::filesystem::remove(missing_weight_asset_path, ec);
         std::filesystem::remove(cache_path, ec);
-        std::filesystem::remove(execution_cache_path, ec);
-        std::filesystem::remove(execution_cache_path.string() + ".bin", ec);
-        std::filesystem::remove(execution_cache_path.string() + ".perf", ec);
-        std::filesystem::remove(execution_cache_path.string() + ".perf.bin", ec);
-        std::filesystem::remove(execution_cache_path.string() + ".perf.family", ec);
-        std::filesystem::remove(execution_cache_path.string() + ".perf.family.bin", ec);
-        std::filesystem::remove(execution_cache_path.string() + ".cpuhint", ec);
-        std::filesystem::remove(execution_cache_path.string() + ".cpuhint.bin", ec);
-        std::filesystem::remove(regression_gate_cache_path, ec);
-        std::filesystem::remove(regression_gate_cache_path.string() + ".bin", ec);
-        std::filesystem::remove(regression_gate_cache_path.string() + ".perf", ec);
-        std::filesystem::remove(regression_gate_cache_path.string() + ".perf.bin", ec);
-        std::filesystem::remove(regression_gate_cache_path.string() + ".perf.family", ec);
-        std::filesystem::remove(regression_gate_cache_path.string() + ".perf.family.bin", ec);
-        std::filesystem::remove(regression_gate_cache_path.string() + ".cpuhint", ec);
-        std::filesystem::remove(regression_gate_cache_path.string() + ".cpuhint.bin", ec);
+        remove_execution_cache_family(execution_cache_path);
+        remove_execution_cache_family(regression_gate_cache_path);
+        remove_execution_cache_family(compat_seed_cache_path);
+        remove_execution_cache_family(text_only_cache_path);
+        remove_execution_cache_family(binary_only_cache_path);
+        remove_execution_cache_family(text_stale_cache_path);
+        remove_execution_cache_family(binary_stale_cache_path);
+        remove_execution_cache_family(mismatch_cache_path);
         const auto packed_root = cache_path.parent_path() / (cache_path.stem().string() + "-packed-layouts");
         const auto spill_root = runtime.install_paths().cache_dir / "spill-artifacts";
         std::filesystem::remove_all(packed_root, ec);

@@ -170,6 +170,19 @@ public:
         condition_.notify_one();
     }
 
+    void enqueue_with_flushed_append(
+        const std::filesystem::path& path,
+        std::function<void()> task) {
+        {
+            std::scoped_lock lock(mutex_);
+            if (!path.empty()) {
+                queue_pending_append_locked(path.string());
+            }
+            tasks_.push_back(std::move(task));
+        }
+        condition_.notify_one();
+    }
+
 private:
     struct PendingAppend {
         std::filesystem::path path;
@@ -361,6 +374,22 @@ bool parse_ini_bool(const std::string& value, const bool fallback) {
     return fallback;
 }
 
+std::uint32_t parse_ini_u32(const std::string& value, const std::uint32_t fallback) {
+    try {
+        return static_cast<std::uint32_t>(std::stoul(trim_copy(value)));
+    } catch (const std::exception&) {
+        return fallback;
+    }
+}
+
+std::size_t parse_ini_size(const std::string& value, const std::size_t fallback) {
+    try {
+        return static_cast<std::size_t>(std::stoull(trim_copy(value)));
+    } catch (const std::exception&) {
+        return fallback;
+    }
+}
+
 void apply_runtime_ini_overrides(const std::filesystem::path& path, RuntimeOptions& options) {
     std::ifstream input(path);
     if (!input.is_open()) {
@@ -416,6 +445,42 @@ void apply_runtime_ini_overrides(const std::filesystem::path& path, RuntimeOptio
             } else if (key == "prefer_level_zero_over_opencl") {
                 options.prefer_level_zero_over_opencl =
                     parse_ini_bool(value, options.prefer_level_zero_over_opencl);
+            }
+        } else if (section == "performance") {
+            if (key == "diagnostics_mode") {
+                if (value == "summary_only") {
+                    options.product.performance.diagnostics_mode = RuntimeDiagnosticsMode::summary_only;
+                } else if (value == "full") {
+                    options.product.performance.diagnostics_mode = RuntimeDiagnosticsMode::full;
+                }
+            } else if (key == "summary_diagnostics_for_cached_runs") {
+                options.product.performance.use_summary_diagnostics_for_cached_runs =
+                    parse_ini_bool(
+                        value,
+                        options.product.performance.use_summary_diagnostics_for_cached_runs);
+            } else if (key == "trusted_cached_validation") {
+                options.product.performance.direct_execution.enable_trusted_cached_validation =
+                    parse_ini_bool(
+                        value,
+                        options.product.performance.direct_execution.enable_trusted_cached_validation);
+            } else if (key == "trusted_verification_interval") {
+                options.product.performance.direct_execution.trusted_verification_interval =
+                    parse_ini_u32(
+                        value,
+                        options.product.performance.direct_execution.trusted_verification_interval);
+            } else if (key == "trusted_verification_sample_budget") {
+                options.product.performance.direct_execution.trusted_verification_sample_budget =
+                    parse_ini_u32(
+                        value,
+                        options.product.performance.direct_execution.trusted_verification_sample_budget);
+            }
+        } else if (section == "observability") {
+            if (key == "telemetry_batch_line_count") {
+                options.product.observability.telemetry_batch_line_count =
+                    parse_ini_size(value, options.product.observability.telemetry_batch_line_count);
+            } else if (key == "telemetry_batch_bytes") {
+                options.product.observability.telemetry_batch_bytes =
+                    parse_ini_size(value, options.product.observability.telemetry_batch_bytes);
             }
         }
     }
@@ -1037,7 +1102,9 @@ void update_runtime_budget_cache(
     const std::filesystem::path& telemetry_path,
     const std::uint64_t epoch,
     const WorkloadSpec& workload,
-    const ManagedExecutionReport& report) {
+    const ManagedExecutionReport& report,
+    const std::size_t flush_line_count,
+    const std::size_t flush_bytes) {
     if (telemetry_path.empty() || !report.executed) {
         return;
     }
@@ -1115,13 +1182,21 @@ void update_runtime_budget_cache(
                << sample_queue_separation << '\t'
                << last_optimizer_budget_ms << '\n';
 
-    telemetry_writer().enqueue([telemetry_path, delta_path, delta_header, delta_payload = delta_line.str(), persist_snapshot, snapshot_entries = std::move(snapshot_entries)]() mutable {
-        if (persist_snapshot) {
-            persist_budget_cache_snapshot_copy(telemetry_path, snapshot_entries);
-            return;
-        }
-        append_tsv_line(delta_path, delta_header, delta_payload);
-    });
+    if (persist_snapshot) {
+        telemetry_writer().enqueue_with_flushed_append(
+            delta_path,
+            [telemetry_path, snapshot_entries = std::move(snapshot_entries)]() mutable {
+                persist_budget_cache_snapshot_copy(telemetry_path, snapshot_entries);
+            });
+        return;
+    }
+
+    telemetry_writer().enqueue_append(
+        delta_path,
+        delta_header,
+        delta_line.str(),
+        flush_line_count,
+        flush_bytes);
 }
 
 std::uint32_t clamp_runtime_optimizer_budget(
@@ -4404,7 +4479,13 @@ void Runtime::persist_telemetry(
         append_tsv_line(path, header, line.str());
     }
 
-    update_runtime_budget_cache(path, execution_epoch_, workload, report);
+    update_runtime_budget_cache(
+        path,
+        execution_epoch_,
+        workload,
+        report,
+        options_.product.observability.telemetry_batch_line_count,
+        options_.product.observability.telemetry_batch_bytes);
 }
 
 bool Runtime::should_include_descriptor(const HardwareGraph& candidate) const {

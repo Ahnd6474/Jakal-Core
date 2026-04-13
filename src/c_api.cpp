@@ -357,6 +357,14 @@ jakal::WorkloadSpec convert_workload(const jakal_core_workload_spec& workload) {
         workload.shape_bucket == nullptr ? std::string{} : std::string(workload.shape_bucket)};
 }
 
+void apply_tristate_bool(const unsigned int encoded, bool& target) {
+    if (encoded == 1u) {
+        target = true;
+    } else if (encoded == 2u) {
+        target = false;
+    }
+}
+
 jakal::RuntimeOptions convert_runtime_options(const jakal_core_runtime_options& options) {
     auto runtime_options = jakal::make_runtime_options_for_install(
         options.install_root == nullptr ? std::filesystem::path{} : std::filesystem::path(options.install_root));
@@ -377,6 +385,33 @@ jakal::RuntimeOptions convert_runtime_options(const jakal_core_runtime_options& 
     }
     if (options.telemetry_path != nullptr && options.telemetry_path[0] != '\0') {
         runtime_options.product.observability.telemetry_path = options.telemetry_path;
+    }
+    if (options.diagnostics_mode == 1u) {
+        runtime_options.product.performance.diagnostics_mode = jakal::RuntimeDiagnosticsMode::full;
+    } else if (options.diagnostics_mode == 2u) {
+        runtime_options.product.performance.diagnostics_mode = jakal::RuntimeDiagnosticsMode::summary_only;
+    }
+    apply_tristate_bool(
+        options.use_summary_diagnostics_for_cached_runs,
+        runtime_options.product.performance.use_summary_diagnostics_for_cached_runs);
+    apply_tristate_bool(
+        options.enable_trusted_cached_validation,
+        runtime_options.product.performance.direct_execution.enable_trusted_cached_validation);
+    if (options.trusted_verification_interval > 0u) {
+        runtime_options.product.performance.direct_execution.trusted_verification_interval =
+            options.trusted_verification_interval;
+    }
+    if (options.trusted_verification_sample_budget > 0u) {
+        runtime_options.product.performance.direct_execution.trusted_verification_sample_budget =
+            options.trusted_verification_sample_budget;
+    }
+    if (options.telemetry_batch_line_count > 0u) {
+        runtime_options.product.observability.telemetry_batch_line_count =
+            options.telemetry_batch_line_count;
+    }
+    if (options.telemetry_batch_bytes > 0u) {
+        runtime_options.product.observability.telemetry_batch_bytes =
+            options.telemetry_batch_bytes;
     }
     return runtime_options;
 }

@@ -14,7 +14,7 @@
 #  define JAKAL_CORE_C_API
 #endif
 
-#define JAKAL_CORE_C_API_ABI_VERSION 1u
+#define JAKAL_CORE_C_API_ABI_VERSION 2u
 #define JAKAL_CORE_RUNTIME_TELEMETRY_SCHEMA_VERSION 2u
 #define JAKAL_CORE_EXECUTION_PERFORMANCE_CACHE_SCHEMA_VERSION 2u
 
@@ -131,6 +131,13 @@ typedef struct jakal_core_runtime_options {
     const char* cache_path;
     const char* execution_cache_path;
     const char* telemetry_path;
+    unsigned int diagnostics_mode;
+    unsigned int use_summary_diagnostics_for_cached_runs;
+    unsigned int enable_trusted_cached_validation;
+    unsigned int trusted_verification_interval;
+    unsigned int trusted_verification_sample_budget;
+    unsigned int telemetry_batch_line_count;
+    unsigned int telemetry_batch_bytes;
 } jakal_core_runtime_options;
 
 typedef struct jakal_core_runtime_paths {

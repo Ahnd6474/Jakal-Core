@@ -90,6 +90,13 @@ int main() {
     options.enable_rocm_probe = 0;
     options.prefer_level_zero_over_opencl = 1;
     options.eager_hardware_refresh = 1;
+    options.diagnostics_mode = 1u;
+    options.use_summary_diagnostics_for_cached_runs = 1u;
+    options.enable_trusted_cached_validation = 1u;
+    options.trusted_verification_interval = 6u;
+    options.trusted_verification_sample_budget = 2u;
+    options.telemetry_batch_line_count = 4u;
+    options.telemetry_batch_bytes = 4096u;
 
     auto* runtime = jakal_core_runtime_create_with_options(&options);
     if (runtime == nullptr) {
