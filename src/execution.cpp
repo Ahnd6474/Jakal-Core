@@ -179,6 +179,52 @@ std::filesystem::path cpu_runtime_hint_cache_binary_path_for(const std::filesyst
     return cpu_runtime_hint_cache_path_for(cache_path).string() + ".bin";
 }
 
+struct TextSchemaStatus {
+    bool present = false;
+    bool matches = false;
+};
+
+bool file_exists(const std::filesystem::path& path) {
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+}
+
+TextSchemaStatus read_text_schema_status(
+    const std::filesystem::path& path,
+    const std::uint32_t expected_version) {
+    TextSchemaStatus status;
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        return status;
+    }
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        if (line[0] != '#') {
+            break;
+        }
+        std::string normalized = line.substr(1u);
+        while (!normalized.empty() &&
+               (normalized.front() == ' ' || normalized.front() == '\t')) {
+            normalized.erase(normalized.begin());
+        }
+        if (normalized.rfind("schema_version\t", 0u) != 0u) {
+            continue;
+        }
+        status.present = true;
+        try {
+            status.matches =
+                static_cast<std::uint32_t>(std::stoul(normalized.substr(15u))) == expected_version;
+        } catch (const std::exception&) {
+            status.matches = false;
+        }
+        return status;
+    }
+    return status;
+}
+
 bool prefer_binary_cache(
     const std::filesystem::path& binary_path,
     const std::filesystem::path& text_path) {
@@ -191,6 +237,12 @@ bool prefer_binary_cache(
     }
     return std::filesystem::last_write_time(binary_path, ec) >=
            std::filesystem::last_write_time(text_path, ec);
+}
+
+bool binary_cache_needs_refresh(
+    const std::filesystem::path& binary_path,
+    const std::filesystem::path& text_path) {
+    return !file_exists(binary_path) || !prefer_binary_cache(binary_path, text_path);
 }
 
 template <typename T>
@@ -2278,6 +2330,7 @@ struct PlacementPolicyPassResult {
 struct ExecutionConfigSearchPassState {
     CompiledWorkloadGraph compiled_workload;
     std::unordered_map<std::string, ExecutionConfig> cached_by_operation;
+    OptimizationCacheStatus cache_status;
     bool fully_cached = false;
     bool runtime_sensitive_path = false;
     bool lightweight_path = false;
@@ -2339,12 +2392,25 @@ ExecutionConfigSearchPassState prepare_execution_config_search_pass(
             pass.compiled_workload.signature,
             workload_graph.operations,
             tuning_overrides);
-    pass.fully_cached = bootstrap_optimizer.has_full_cache(
+    pass.cache_status = bootstrap_optimizer.load_cached_configs(
         report_signature,
         workload_graph.operations,
         graph_lookup,
         &pass.cached_by_operation);
+    pass.fully_cached = pass.cache_status.fully_cached;
     pass.runtime_sensitive_path = adaptive_optimizer.should_reoptimize(report_signature);
+    if (pass.runtime_sensitive_path && !pass.cached_by_operation.empty()) {
+        const bool has_operation_fast_recovery = std::any_of(
+            workload_graph.operations.begin(),
+            workload_graph.operations.end(),
+            [&](const OperationSpec& operation) {
+                return adaptive_optimizer.should_reoptimize_operation(report_signature, operation.name);
+            });
+        if (!has_operation_fast_recovery) {
+            pass.runtime_sensitive_path = false;
+        }
+    }
+    pass.cache_status.runtime_sensitive_path = pass.runtime_sensitive_path;
     pass.lightweight_path =
         adaptive_optimizer.should_use_lightweight_path(report_signature, pass.fully_cached);
     pass.validation_tier =
@@ -3036,13 +3102,7 @@ std::string build_report_signature(
                << ':' << operation.cpu_vectorized
                << ':' << operation.gpu_tensorized
                << ':' << std::max(operation.cpu_micro_kernel_unroll, 1u)
-               << ':' << std::max(operation.cpu_tile_m, 1u)
-               << ':' << std::max(operation.cpu_tile_n, 1u)
-               << ':' << std::max(operation.cpu_tile_k, 1u)
-               << ':' << std::max(operation.cpu_parallel_chunk, 1u)
-               << ':' << operation.cpu_use_avx512
                << ':' << std::max<std::uint64_t>(operation.cpu_pack_budget_bytes, 1ull)
-               << ':' << std::max(operation.cpu_single_thread_cutoff, 1u)
                << ':' << operation.cpu_low_precision_kernel_family
                << ':' << std::max(operation.attention_head_count, 1u)
                << ':' << std::max(operation.attention_head_group_size, 1u)
@@ -7883,7 +7943,7 @@ OptimizationReport ExecutionOptimizer::optimize(
         report.workload_graph,
         tuning_overrides);
     adaptive_optimizer_.apply_feedback_tuning_hints(report.workload_graph);
-    const auto config_search_pass = prepare_execution_config_search_pass(
+    auto config_search_pass = prepare_execution_config_search_pass(
         adaptive_optimizer_,
         bootstrap_optimizer_,
         effective_workload,
@@ -7902,6 +7962,8 @@ OptimizationReport ExecutionOptimizer::optimize(
 
     std::vector<CachedExecutionConfig> persisted_configs;
     persisted_configs.reserve(operations.size());
+    std::vector<std::string> optimized_operation_names;
+    optimized_operation_names.reserve(operations.size());
 
     std::unordered_map<std::string, ExecutionConfig> cache_input = config_search_pass.cached_by_operation;
     report.graph_optimization = optimize_graph_continuous_state(
@@ -7918,7 +7980,9 @@ OptimizationReport ExecutionOptimizer::optimize(
         adaptive_optimizer_.backend_penalty_cache(),
         adaptive_optimizer_.warmed_devices(),
         placement_pass.graph_set_signature,
-        (config_search_pass.fully_cached && !config_search_pass.runtime_sensitive_path) ? &cache_input : nullptr,
+        (!config_search_pass.cached_by_operation.empty() && !config_search_pass.runtime_sensitive_path)
+            ? &cache_input
+            : nullptr,
         config_search_pass.lightweight_path || config_search_pass.runtime_sensitive_path,
         tuning_overrides,
         config_search_pass.validation_tier,
@@ -7957,20 +8021,53 @@ OptimizationReport ExecutionOptimizer::optimize(
         if (result.config.signature.empty()) {
             continue;
         }
+        if (cached_config == nullptr || operation_needs_fast_recovery) {
+            ++config_search_pass.cache_status.reoptimized_operations;
+        }
 
         result.benchmark.optimizer_name =
             config_search_pass.optimizer_route + ":" + result.benchmark.optimizer_name;
         persisted_configs.push_back(CachedExecutionConfig{
             operation.name,
             result.config});
+        optimized_operation_names.push_back(operation.name);
         report.graph_optimization.total_logical_partitions += result.config.logical_partitions;
         selected_configs[result.operation.name] = result.config;
         report.operations.push_back(std::move(result));
     }
 
     bootstrap_optimizer_.store_configs(report.signature, std::move(persisted_configs));
+    report.cache_status = config_search_pass.cache_status;
+    report.cache_status.total_operations = static_cast<std::uint32_t>(optimized_operation_names.size());
+    report.cache_status.cached_operations = 0u;
+    for (const auto& operation_name : optimized_operation_names) {
+        if (config_search_pass.cached_by_operation.contains(operation_name)) {
+            ++report.cache_status.cached_operations;
+        }
+    }
+    report.cache_status.missing_operations =
+        report.cache_status.total_operations > report.cache_status.cached_operations
+            ? (report.cache_status.total_operations - report.cache_status.cached_operations)
+            : 0u;
+    report.cache_status.fully_cached =
+        report.cache_status.signature_present &&
+        report.cache_status.invalid_device_operations == 0u &&
+        report.cache_status.missing_operations == 0u;
     report.loaded_from_cache =
-        config_search_pass.fully_cached && !config_search_pass.runtime_sensitive_path;
+        report.cache_status.fully_cached && !config_search_pass.runtime_sensitive_path;
+    if (report.loaded_from_cache) {
+        report.cache_status.summary = "full-cache-hit";
+    } else {
+        std::ostringstream cache_summary;
+        cache_summary << "signature="
+                      << (report.cache_status.signature_present ? "present" : "missing")
+                      << " cached_ops=" << report.cache_status.cached_operations << "/" << report.cache_status.total_operations
+                      << " missing_ops=" << report.cache_status.missing_operations
+                      << " invalid_device_ops=" << report.cache_status.invalid_device_operations
+                      << " reoptimized_ops=" << report.cache_status.reoptimized_operations
+                      << " runtime_sensitive=" << (report.cache_status.runtime_sensitive_path ? "yes" : "no");
+        report.cache_status.summary = cache_summary.str();
+    }
     return report;
 }
 
@@ -8005,6 +8102,8 @@ void BootstrapExecutionOptimizer::load_cache() {
     cache_loaded_ = true;
 
     const auto binary_path = bootstrap_cache_binary_path_for(cache_path_);
+    bool should_refresh_cache_files = false;
+    bool loaded_from_any_cache = false;
     if (prefer_binary_cache(binary_path, cache_path_)) {
         std::ifstream binary(binary_path, std::ios::binary);
         std::array<char, 8> magic{};
@@ -8036,15 +8135,27 @@ void BootstrapExecutionOptimizer::load_cache() {
                 }
             }
             if (!cache_.empty() || signature_count == 0u) {
+                loaded_from_any_cache = true;
+                should_refresh_cache_files = !file_exists(cache_path_);
+                if (should_refresh_cache_files) {
+                    persist_cache();
+                }
                 return;
             }
         }
+        should_refresh_cache_files = true;
     }
 
     std::ifstream input(cache_path_);
     if (!input.is_open()) {
         return;
     }
+    const auto text_schema = read_text_schema_status(cache_path_, 2u);
+    should_refresh_cache_files =
+        should_refresh_cache_files ||
+        !text_schema.present ||
+        !text_schema.matches ||
+        binary_cache_needs_refresh(binary_path, cache_path_);
 
     std::string line;
     while (std::getline(input, line)) {
@@ -8088,27 +8199,36 @@ void BootstrapExecutionOptimizer::load_cache() {
                 config.precision_mix = std::stod(fields[next++]);
             }
             cache_[fields[0]].push_back(CachedExecutionConfig{config.operation_name, std::move(config)});
+            loaded_from_any_cache = true;
         } catch (const std::exception&) {
             continue;
         }
     }
+    if (loaded_from_any_cache && should_refresh_cache_files) {
+        persist_cache();
+    }
 }
 
-bool BootstrapExecutionOptimizer::has_full_cache(
+OptimizationCacheStatus BootstrapExecutionOptimizer::load_cached_configs(
     const std::string& report_signature,
     const std::vector<OperationSpec>& operations,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
     std::unordered_map<std::string, ExecutionConfig>* cached_by_operation) {
+    OptimizationCacheStatus status;
+    status.total_operations = static_cast<std::uint32_t>(operations.size());
     if (cached_by_operation == nullptr) {
-        return false;
+        status.summary = "cache lookup disabled";
+        return status;
     }
 
     load_cache();
     cached_by_operation->clear();
     const auto cache_it = cache_.find(report_signature);
     if (cache_it == cache_.end()) {
-        return false;
+        status.summary = "report_signature_mismatch";
+        return status;
     }
+    status.signature_present = true;
 
     for (const auto& cached : cache_it->second) {
         if (!graph_lookup.contains(cached.config.primary_device_uid) ||
@@ -8116,18 +8236,32 @@ bool BootstrapExecutionOptimizer::has_full_cache(
                 cached.config.participating_devices.begin(),
                 cached.config.participating_devices.end(),
                 [&](const std::string& device_uid) { return !graph_lookup.contains(device_uid); })) {
-            cached_by_operation->clear();
-            return false;
+            ++status.invalid_device_operations;
+            continue;
         }
-        cached_by_operation->emplace(cached.operation_name, cached.config);
+        const auto [_, inserted] = cached_by_operation->emplace(cached.operation_name, cached.config);
+        if (inserted) {
+            ++status.cached_operations;
+        }
     }
     for (const auto& operation : operations) {
         if (!cached_by_operation->contains(operation.name)) {
-            cached_by_operation->clear();
-            return false;
+            ++status.missing_operations;
         }
     }
-    return true;
+    status.fully_cached =
+        status.signature_present &&
+        status.missing_operations == 0u &&
+        status.invalid_device_operations == 0u &&
+        status.cached_operations == status.total_operations;
+    if (status.fully_cached) {
+        status.summary = "full-cache-hit";
+    } else if (status.cached_operations > 0u) {
+        status.summary = "partial-cache-hit";
+    } else {
+        status.summary = "cache-entry-present-but-unusable";
+    }
+    return status;
 }
 
 void BootstrapExecutionOptimizer::store_configs(
@@ -8143,6 +8277,10 @@ void AdaptiveExecutionOptimizer::load_cache() {
         return;
     }
     cache_loaded_ = true;
+    bool should_refresh_summary_caches = false;
+    bool should_refresh_hint_cache = false;
+    bool loaded_any_summary_cache = false;
+    bool loaded_any_hint_cache = false;
 
     const auto load_summary_map_binary =
         [](const std::filesystem::path& path, std::unordered_map<std::string, PerformanceSummary>& target) {
@@ -8174,13 +8312,26 @@ void AdaptiveExecutionOptimizer::load_cache() {
     const auto load_summary_map =
         [&](const std::filesystem::path& path, std::unordered_map<std::string, PerformanceSummary>& target) {
             const auto binary_path = path.string() + ".bin";
-            if (prefer_binary_cache(binary_path, path) && load_summary_map_binary(binary_path, target)) {
-                return;
+            if (prefer_binary_cache(binary_path, path)) {
+                if (load_summary_map_binary(binary_path, target)) {
+                    loaded_any_summary_cache = loaded_any_summary_cache || !target.empty();
+                    should_refresh_summary_caches =
+                        should_refresh_summary_caches || !file_exists(path);
+                    return;
+                }
+                should_refresh_summary_caches = true;
             }
             std::ifstream input(path);
             if (!input.is_open()) {
                 return;
             }
+            const auto text_schema =
+                read_text_schema_status(path, kExecutionPerformanceCacheSchemaVersion);
+            should_refresh_summary_caches =
+                should_refresh_summary_caches ||
+                !text_schema.present ||
+                !text_schema.matches ||
+                binary_cache_needs_refresh(binary_path, path);
 
             std::string line;
             while (std::getline(input, line)) {
@@ -8269,6 +8420,7 @@ void AdaptiveExecutionOptimizer::load_cache() {
                         summary.worst_slowdown_vs_reference = std::stod(fields[next++]);
                     }
                     target[fields[0]] = std::move(summary);
+                    loaded_any_summary_cache = true;
                 } catch (const std::exception&) {
                     continue;
                 }
@@ -8301,15 +8453,31 @@ void AdaptiveExecutionOptimizer::load_cache() {
                 cpu_runtime_hint_cache_[std::move(key)] = std::move(summary);
             }
             if (!cpu_runtime_hint_cache_.empty() || entry_count == 0u) {
+                loaded_any_hint_cache = !cpu_runtime_hint_cache_.empty();
+                should_refresh_hint_cache = !file_exists(cpu_runtime_hint_cache_path_);
+                if (should_refresh_summary_caches || should_refresh_hint_cache) {
+                    persist_cache();
+                }
                 return;
             }
         }
+        should_refresh_hint_cache = true;
     }
 
     std::ifstream hint_input(cpu_runtime_hint_cache_path_);
     if (!hint_input.is_open()) {
+        if (loaded_any_summary_cache && should_refresh_summary_caches) {
+            persist_cache();
+        }
         return;
     }
+    const auto hint_text_schema =
+        read_text_schema_status(cpu_runtime_hint_cache_path_, kExecutionCpuHintCacheSchemaVersion);
+    should_refresh_hint_cache =
+        should_refresh_hint_cache ||
+        !hint_text_schema.present ||
+        !hint_text_schema.matches ||
+        binary_cache_needs_refresh(hint_binary_path, cpu_runtime_hint_cache_path_);
 
     std::string hint_line;
     while (std::getline(hint_input, hint_line)) {
@@ -8360,9 +8528,14 @@ void AdaptiveExecutionOptimizer::load_cache() {
                 summary.average_effective_latency_us = std::stod(fields[4]);
             }
             cpu_runtime_hint_cache_[fields[0]] = std::move(summary);
+            loaded_any_hint_cache = true;
         } catch (const std::exception&) {
             continue;
         }
+    }
+    if ((loaded_any_summary_cache || loaded_any_hint_cache) &&
+        (should_refresh_summary_caches || should_refresh_hint_cache)) {
+        persist_cache();
     }
 }
 
@@ -8404,7 +8577,7 @@ bool AdaptiveExecutionOptimizer::should_use_lightweight_path(
 
 bool AdaptiveExecutionOptimizer::should_reoptimize(const std::string& report_signature) const {
     const auto it = reoptimization_pressure_.find(report_signature);
-    if (it != reoptimization_pressure_.end() && it->second > 0u) {
+    if (it != reoptimization_pressure_.end() && it->second >= 3u) {
         return true;
     }
     return std::any_of(
@@ -8421,7 +8594,7 @@ bool AdaptiveExecutionOptimizer::should_reoptimize_operation(
     const std::string& operation_name) const {
     const auto key = report_signature + "|" + operation_name;
     const auto it = operation_reoptimization_pressure_.find(key);
-    return it != operation_reoptimization_pressure_.end() && it->second > 0u;
+    return it != operation_reoptimization_pressure_.end() && it->second >= 3u;
 }
 
 const std::unordered_map<std::string, PerformanceSummary>& AdaptiveExecutionOptimizer::performance_cache() const {
@@ -8742,26 +8915,38 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
         }
 
         std::uint32_t operation_pressure = 0u;
-        if (!record.verified || record.relative_error > (optimized.config.target_error_tolerance + 1.0e-12)) {
+        const bool cached_report = report.loaded_from_cache;
+        const bool verification_failed =
+            !record.verified || record.relative_error > (optimized.config.target_error_tolerance + 1.0e-12);
+        const bool severe_accelerator_regression =
+            !record.used_host && slowdown_vs_reference > 1.50;
+        const bool severe_prediction_miss =
+            !record.used_host && optimized.graph.predicted_latency_us > 0.0 &&
+            effective_latency_us > (optimized.graph.predicted_latency_us * 1.50);
+        if (verification_failed) {
             operation_pressure = std::max(operation_pressure, 3u);
         }
-        if (!record.used_host && slowdown_vs_reference > 1.10) {
+        if (severe_accelerator_regression || severe_prediction_miss) {
+            operation_pressure = std::max(operation_pressure, 3u);
+        }
+        if (cached_report && !record.used_host && slowdown_vs_reference > 1.10) {
             operation_pressure = std::max(operation_pressure, slowdown_vs_reference > 1.50 ? 3u : 2u);
         }
-        if (!record.used_host && optimized.graph.predicted_latency_us > 0.0 &&
+        if (cached_report && !record.used_host && optimized.graph.predicted_latency_us > 0.0 &&
             effective_latency_us > (optimized.graph.predicted_latency_us * 1.20)) {
             operation_pressure = std::max(operation_pressure, 2u);
         }
-        if (record.used_host &&
+        if (cached_report && record.used_host &&
             !record.used_opencl &&
             supports_feedback_tuned_cpu_chunk(optimized.operation) &&
             optimized.graph.predicted_latency_us > 0.0 &&
             effective_latency_us > (optimized.graph.predicted_latency_us * 1.08)) {
             operation_pressure = std::max(operation_pressure, 1u);
         }
-        if (record.staging_hit_rate < 0.35 ||
+        if (cached_report &&
+            (record.staging_hit_rate < 0.35 ||
             record.cross_device_sync_cost_us > 120.0 ||
-            record.residency_pressure > 0.85) {
+            record.residency_pressure > 0.85)) {
             operation_pressure = std::max(operation_pressure, 2u);
         }
 
@@ -8795,6 +8980,7 @@ void BootstrapExecutionOptimizer::persist_cache() const {
         return;
     }
 
+    output << "# schema_version\t2\n";
     output << "# signature\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tmapped_nodes\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\ttolerance\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\n";
     for (const auto& [signature, configs] : cache_) {
         for (const auto& cached : configs) {

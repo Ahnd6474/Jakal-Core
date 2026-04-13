@@ -217,10 +217,23 @@ struct TrustedVerificationEntry {
     std::uint64_t last_used = 0u;
 };
 
+struct CachedVerificationReference {
+    bool scalar = false;
+    double runtime_us = 0.0;
+    std::vector<float> vector_output;
+    double scalar_output = 0.0;
+    std::uint64_t last_used = 0u;
+};
+
 std::mutex g_trusted_verification_mutex;
 std::unordered_map<std::string, TrustedVerificationEntry> g_trusted_verification_cache;
 std::uint64_t g_trusted_verification_tick = 0u;
 constexpr std::size_t kMaxTrustedVerificationEntries = 256u;
+
+std::mutex g_cached_verification_reference_mutex;
+std::unordered_map<std::string, CachedVerificationReference> g_cached_verification_references;
+std::uint64_t g_cached_verification_reference_tick = 0u;
+constexpr std::size_t kMaxCachedVerificationReferences = 512u;
 
 std::vector<float> make_pattern(const std::size_t count, const float phase) {
     std::vector<float> data(count);
@@ -315,6 +328,22 @@ bool execution_trace_enabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+bool is_host_device_uid(const std::string& uid) {
+    return uid == "host" || uid.rfind("host:", 0) == 0;
+}
+
+bool is_host_only_config(const OperationOptimizationResult& optimized) {
+    if (!is_host_device_uid(optimized.config.primary_device_uid)) {
+        return false;
+    }
+    return std::all_of(
+        optimized.config.participating_devices.begin(),
+        optimized.config.participating_devices.end(),
+        [](const std::string& uid) {
+            return is_host_device_uid(uid);
+        });
+}
+
 void trace_execution_line(const std::string& text) {
     if (!execution_trace_enabled()) {
         return;
@@ -349,6 +378,83 @@ std::string operation_data_cache_key(const OperationSpec& operation) {
            << "|cpu.preT:" << operation.cpu_pretranspose_rhs
            << "|gpu.preT:" << operation.gpu_pretranspose_rhs;
     return stream.str();
+}
+
+std::string verification_reference_cache_key(
+    const OperationSpec& operation,
+    const bool low_precision,
+    const bool scalar) {
+    std::ostringstream stream;
+    stream << operation_data_cache_key(operation)
+           << "|verify.lowp:" << (low_precision ? '1' : '0')
+           << "|verify.scalar:" << (scalar ? '1' : '0');
+    return stream.str();
+}
+
+std::string trusted_verification_cache_key(const OptimizationReport& optimization) {
+    std::ostringstream stream;
+    stream << to_string(optimization.partition_strategy)
+           << '|'
+           << to_string(optimization.workload_kind)
+           << '|'
+           << to_string(optimization.workload_phase)
+           << '|'
+           << optimization.dataset_tag
+           << '|'
+           << optimization.workload_shape_bucket
+           << '|'
+           << optimization.operations.size();
+    for (const auto& optimized : optimization.operations) {
+        const auto& operation = optimized.operation;
+        const auto& config = optimized.config;
+        stream << '|' << operation.name
+               << ':' << to_string(operation.op_class)
+               << ':' << format_extents(operation.extents)
+               << "|variant:" << config.variant_id
+               << "|strategy:" << to_string(config.strategy)
+               << "|primary:" << config.primary_device_uid
+               << "|devices:";
+        for (const auto& uid : config.participating_devices) {
+            stream << uid << ',';
+        }
+        stream << "|queue:" << config.queue_depth
+               << "|stages:" << config.stages
+               << "|tile:" << config.tile_x << 'x' << config.tile_y << 'x' << config.tile_k
+               << "|parts:" << config.logical_partitions
+               << "|overlap:" << (config.overlap_transfers ? '1' : '0')
+               << "|lowp:" << (config.use_low_precision ? '1' : '0')
+               << "|tol:" << std::fixed << std::setprecision(6) << config.target_error_tolerance;
+    }
+    return stream.str();
+}
+
+std::optional<CachedVerificationReference> find_cached_verification_reference(const std::string& key) {
+    std::scoped_lock lock(g_cached_verification_reference_mutex);
+    const auto it = g_cached_verification_references.find(key);
+    if (it == g_cached_verification_references.end()) {
+        return std::nullopt;
+    }
+    it->second.last_used = ++g_cached_verification_reference_tick;
+    return it->second;
+}
+
+void store_cached_verification_reference(std::string key, CachedVerificationReference reference) {
+    std::scoped_lock lock(g_cached_verification_reference_mutex);
+    reference.last_used = ++g_cached_verification_reference_tick;
+    g_cached_verification_references[std::move(key)] = std::move(reference);
+    if (g_cached_verification_references.size() <= kMaxCachedVerificationReferences) {
+        return;
+    }
+    auto oldest = g_cached_verification_references.end();
+    for (auto it = g_cached_verification_references.begin(); it != g_cached_verification_references.end(); ++it) {
+        if (oldest == g_cached_verification_references.end() ||
+            it->second.last_used < oldest->second.last_used) {
+            oldest = it;
+        }
+    }
+    if (oldest != g_cached_verification_references.end()) {
+        g_cached_verification_references.erase(oldest);
+    }
 }
 
 std::uint32_t trusted_verification_runs_for(const std::string& signature) {
@@ -389,18 +495,20 @@ bool should_force_verification_canary(
     const OperationOptimizationResult& optimized,
     const std::size_t operation_index,
     const std::size_t operation_count) {
-    if (operation_index == 0u || operation_index + 1u == operation_count) {
+    const bool host_only = is_host_only_config(optimized);
+    if (!host_only && optimized.config.participating_devices.size() > 1u) {
         return true;
     }
-    if (optimized.config.logical_partitions > 1u || optimized.config.participating_devices.size() > 1u) {
+    if (!host_only && optimized.config.logical_partitions > 1u) {
         return true;
     }
-    if (optimized.config.use_low_precision) {
+    if (!host_only && optimized.config.use_low_precision) {
         return true;
     }
-    return optimized.operation.op_class == OperationClass::matmul ||
-           optimized.operation.op_class == OperationClass::convolution_2d ||
-           optimized.operation.op_class == OperationClass::resample_2d;
+    if (operation_count <= 2u) {
+        return false;
+    }
+    return operation_index == 0u || operation_index + 1u == operation_count;
 }
 
 bool should_verify_operation(
@@ -418,9 +526,14 @@ bool should_verify_operation(
         return true;
     }
     const auto interval = std::max<std::uint32_t>(1u, policy.trusted_verification_interval);
-    const auto budget = std::min<std::uint32_t>(
+    auto budget = std::min<std::uint32_t>(
         interval,
         std::max<std::uint32_t>(1u, policy.trusted_verification_sample_budget));
+    if (is_host_only_config(optimized) && optimization.operations.size() <= 8u) {
+        budget = 0u;
+    } else if (optimization.operations.size() <= 8u) {
+        budget = std::min<std::uint32_t>(budget, 1u);
+    }
     std::ostringstream key;
     key << optimization.signature
         << '|'
@@ -1988,14 +2101,19 @@ std::vector<float> materialize_resample_packed6(
     return packed;
 }
 
-std::shared_ptr<const executors::OperationData> make_operation_data(const OperationSpec& operation) {
+struct OperationDataCacheResult {
+    std::shared_ptr<const executors::OperationData> data;
+    bool reused_from_cache = false;
+};
+
+OperationDataCacheResult make_operation_data(const OperationSpec& operation) {
     const auto cache_key = operation_data_cache_key(operation);
     {
         std::scoped_lock lock(g_operation_data_cache_mutex);
         const auto it = g_operation_data_cache.find(cache_key);
         if (it != g_operation_data_cache.end() && it->second.data != nullptr) {
             it->second.last_used = ++g_operation_data_cache_tick;
-            return it->second.data;
+            return {it->second.data, true};
         }
     }
 
@@ -2060,7 +2178,7 @@ std::shared_ptr<const executors::OperationData> make_operation_data(const Operat
             }
         }
     }
-    return data;
+    return {data, false};
 }
 
 std::size_t shardable_items(const OperationSpec& operation) {
@@ -2336,7 +2454,12 @@ DirectExecutionReport DirectExecutor::execute(
     const auto& reference_host_graph = host_graph_it == graphs.end() ? empty_graph : *host_graph_it;
 
     bool all_succeeded = true;
-    const auto trusted_runs = trusted_verification_runs_for(optimization.signature);
+    const auto trusted_key = trusted_verification_cache_key(optimization);
+    const auto trusted_runs = trusted_verification_runs_for(trusted_key);
+    trace_execution_line(
+        "exec:trusted cached=" + (optimization.loaded_from_cache ? std::string("1") : std::string("0")) +
+        " runs=" + std::to_string(trusted_runs) +
+        " ops=" + std::to_string(optimization.operations.size()));
 
     for (std::size_t operation_index = 0; operation_index < optimization.operations.size(); ++operation_index) {
         const auto& optimized = optimization.operations[operation_index];
@@ -2363,6 +2486,9 @@ DirectExecutionReport DirectExecutor::execute(
             record.logical_partitions_used = optimized.config.logical_partitions;
             record.fused_operation_count =
                 static_cast<std::uint32_t>(optimized.operation.fused_operation_names.size());
+            if (operation_data.reused_from_cache) {
+                record.persistent_resource_reuse_hits += 1u;
+            }
             const auto transfer_metrics = summarize_transfer_overlap(optimized.graph);
             record.predicted_transfer_runtime_us = transfer_metrics.predicted_transfer_runtime_us;
             record.overlapped_transfer_runtime_us = transfer_metrics.overlapped_transfer_runtime_us;
@@ -2390,121 +2516,179 @@ DirectExecutionReport DirectExecutor::execute(
             verification_host_graph.probe = "host-emulated";
             std::vector<float> verification_vector;
             double verification_scalar = 0.0;
+            const auto load_or_compute_vector_reference =
+                [&](const bool low_precision, auto&& compute) -> CachedVerificationReference {
+                    const auto key =
+                        verification_reference_cache_key(optimized.operation, low_precision, false);
+                    if (const auto cached = find_cached_verification_reference(key); cached.has_value()) {
+                        return *cached;
+                    }
+                    const auto result = compute();
+                    CachedVerificationReference cached;
+                    cached.scalar = false;
+                    cached.runtime_us = result.runtime_us;
+                    cached.vector_output = result.output;
+                    store_cached_verification_reference(key, cached);
+                    return cached;
+                };
+            const auto load_or_compute_scalar_reference =
+                [&](const bool low_precision, auto&& compute) -> CachedVerificationReference {
+                    const auto key =
+                        verification_reference_cache_key(optimized.operation, low_precision, true);
+                    if (const auto cached = find_cached_verification_reference(key); cached.has_value()) {
+                        return *cached;
+                    }
+                    const auto result = compute();
+                    CachedVerificationReference cached;
+                    cached.scalar = true;
+                    cached.runtime_us = result.runtime_us;
+                    cached.scalar_output = result.scalar_output;
+                    store_cached_verification_reference(key, cached);
+                    return cached;
+                };
 
             if (verify_operation) switch (optimized.operation.op_class) {
             case OperationClass::elementwise_map: {
-                const auto reference = host_backend->run_elementwise(
-                    reference_host_graph,
-                    optimized.operation,
-                    operation_data->input0,
-                    operation_data->input1,
-                    reference_low_precision);
+                const auto reference = load_or_compute_vector_reference(reference_low_precision, [&]() {
+                    return host_backend->run_elementwise(
+                        reference_host_graph,
+                        optimized.operation,
+                        operation_data.data->input0,
+                        operation_data.data->input1,
+                        reference_low_precision);
+                });
                 record.reference_runtime_us = reference.runtime_us;
                 if (verification_low_precision == reference_low_precision) {
-                    verification_vector = reference.output;
+                    verification_vector = reference.vector_output;
                 } else {
-                    const auto verification = host_backend->run_elementwise(
-                        verification_host_graph,
-                        optimized.operation,
-                        operation_data->input0,
-                        operation_data->input1,
-                        verification_low_precision);
-                    verification_vector = verification.output;
+                    const auto verification = load_or_compute_vector_reference(verification_low_precision, [&]() {
+                        return host_backend->run_elementwise(
+                            verification_host_graph,
+                            optimized.operation,
+                            operation_data.data->input0,
+                            operation_data.data->input1,
+                            verification_low_precision);
+                    });
+                    verification_vector = verification.vector_output;
                 }
                 break;
             }
             case OperationClass::reduction: {
-                const auto reference =
-                    host_backend->run_reduction(reference_host_graph, optimized.operation, operation_data->input0, reference_low_precision);
+                const auto reference = load_or_compute_scalar_reference(reference_low_precision, [&]() {
+                    return host_backend->run_reduction(
+                        reference_host_graph,
+                        optimized.operation,
+                        operation_data.data->input0,
+                        reference_low_precision);
+                });
                 record.reference_runtime_us = reference.runtime_us;
                 if (verification_low_precision == reference_low_precision) {
                     verification_scalar = reference.scalar_output;
                 } else {
-                    const auto verification =
-                        host_backend->run_reduction(verification_host_graph, optimized.operation, operation_data->input0, verification_low_precision);
+                    const auto verification = load_or_compute_scalar_reference(verification_low_precision, [&]() {
+                        return host_backend->run_reduction(
+                            verification_host_graph,
+                            optimized.operation,
+                            operation_data.data->input0,
+                            verification_low_precision);
+                    });
                     verification_scalar = verification.scalar_output;
                 }
                 break;
             }
             case OperationClass::matmul: {
-                const auto reference = host_backend->run_matmul(
-                    reference_host_graph,
-                    optimized.operation,
-                    operation_data->input0,
-                    operation_data->input1,
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
-                    reference_low_precision);
-                record.reference_runtime_us = reference.runtime_us;
-                if (verification_low_precision == reference_low_precision) {
-                    verification_vector = reference.output;
-                } else {
-                    const auto verification = host_backend->run_matmul(
-                        verification_host_graph,
+                const auto reference = load_or_compute_vector_reference(reference_low_precision, [&]() {
+                    return host_backend->run_matmul(
+                        reference_host_graph,
                         optimized.operation,
-                        operation_data->input0,
-                        operation_data->cpu_rhs_materialized.empty() ? operation_data->input1 : operation_data->cpu_rhs_materialized,
+                        operation_data.data->input0,
+                        operation_data.data->input1,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
-                        verification_low_precision);
-                    verification_vector = verification.output;
+                        reference_low_precision);
+                });
+                record.reference_runtime_us = reference.runtime_us;
+                if (verification_low_precision == reference_low_precision) {
+                    verification_vector = reference.vector_output;
+                } else {
+                    const auto verification = load_or_compute_vector_reference(verification_low_precision, [&]() {
+                        return host_backend->run_matmul(
+                            verification_host_graph,
+                            optimized.operation,
+                            operation_data.data->input0,
+                            operation_data.data->cpu_rhs_materialized.empty()
+                                ? operation_data.data->input1
+                                : operation_data.data->cpu_rhs_materialized,
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
+                            verification_low_precision);
+                    });
+                    verification_vector = verification.vector_output;
                 }
                 break;
             }
             case OperationClass::convolution_2d: {
-                const auto reference = host_backend->run_conv3x3(
-                    reference_host_graph,
-                    optimized.operation,
-                    operation_data->input0,
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
-                    reference_low_precision);
-                record.reference_runtime_us = reference.runtime_us;
-                if (verification_low_precision == reference_low_precision) {
-                    verification_vector = reference.output;
-                } else {
-                    const auto verification = host_backend->run_conv3x3(
-                        verification_host_graph,
+                const auto reference = load_or_compute_vector_reference(reference_low_precision, [&]() {
+                    return host_backend->run_conv3x3(
+                        reference_host_graph,
                         optimized.operation,
-                        operation_data->input0,
+                        operation_data.data->input0,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
-                        verification_low_precision);
-                    verification_vector = verification.output;
+                        reference_low_precision);
+                });
+                record.reference_runtime_us = reference.runtime_us;
+                if (verification_low_precision == reference_low_precision) {
+                    verification_vector = reference.vector_output;
+                } else {
+                    const auto verification = load_or_compute_vector_reference(verification_low_precision, [&]() {
+                        return host_backend->run_conv3x3(
+                            verification_host_graph,
+                            optimized.operation,
+                            operation_data.data->input0,
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
+                            verification_low_precision);
+                    });
+                    verification_vector = verification.vector_output;
                 }
                 break;
             }
             case OperationClass::resample_2d:
             default: {
-                const auto reference = host_backend->run_resample(
-                    reference_host_graph,
-                    optimized.operation,
-                    operation_data->input0,
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(3)),
-                    0,
-                    static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
-                    reference_low_precision);
-                record.reference_runtime_us = reference.runtime_us;
-                if (verification_low_precision == reference_low_precision) {
-                    verification_vector = reference.output;
-                } else {
-                    const auto verification = host_backend->run_resample(
-                        verification_host_graph,
+                const auto reference = load_or_compute_vector_reference(reference_low_precision, [&]() {
+                    return host_backend->run_resample(
+                        reference_host_graph,
                         optimized.operation,
-                        operation_data->input0,
+                        operation_data.data->input0,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(3)),
                         0,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
-                        verification_low_precision);
-                    verification_vector = verification.output;
+                        reference_low_precision);
+                });
+                record.reference_runtime_us = reference.runtime_us;
+                if (verification_low_precision == reference_low_precision) {
+                    verification_vector = reference.vector_output;
+                } else {
+                    const auto verification = load_or_compute_vector_reference(verification_low_precision, [&]() {
+                        return host_backend->run_resample(
+                            verification_host_graph,
+                            optimized.operation,
+                            operation_data.data->input0,
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(3)),
+                            0,
+                            static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
+                            verification_low_precision);
+                    });
+                    verification_vector = verification.vector_output;
                 }
                 break;
             }
@@ -2620,7 +2804,7 @@ DirectExecutionReport DirectExecutor::execute(
                         dispatch_backend(
                             assignments.front(),
                             optimized,
-                            *operation_data,
+                            *operation_data.data,
                             *host_backend,
                             opencl_backend,
                             *level_zero_backend,
@@ -2661,7 +2845,7 @@ DirectExecutionReport DirectExecutor::execute(
                             dispatch_backend(
                                 assignment,
                                 optimized,
-                                *operation_data,
+                                *operation_data.data,
                                 *host_backend,
                                 opencl_backend,
                                 *level_zero_backend,
@@ -2796,6 +2980,7 @@ DirectExecutionReport DirectExecutor::execute(
                 "exec:done op=" + completed.operation_name +
                 " backend=" + completed.backend_name +
                 " runtime_us=" + std::to_string(completed.runtime_us) +
+                " verify=" + (verify_operation ? std::string("1") : std::string("0")) +
                 " relerr=" + std::to_string(completed.relative_error) +
                 " tol=" + std::to_string(optimized.operation.max_relative_error) +
                 " lowp=" + (optimized.config.use_low_precision ? std::string("1") : std::string("0")) +
@@ -2845,7 +3030,7 @@ DirectExecutionReport DirectExecutor::execute(
     report.speedup_vs_reference =
         report.total_runtime_us > 0.0 ? (report.total_reference_runtime_us / report.total_runtime_us) : 1.0;
     report.all_succeeded = all_succeeded;
-    update_trusted_verification_runs(optimization.signature, report.all_succeeded);
+    update_trusted_verification_runs(trusted_key, report.all_succeeded);
     return report;
 }
 

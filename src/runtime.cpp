@@ -13,6 +13,7 @@
 #include <deque>
 #include <functional>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -105,12 +106,26 @@ struct TelemetryBudgetCacheEntry {
 struct TelemetryBudgetCacheState {
     std::unordered_map<std::string, TelemetryBudgetCacheEntry> entries;
     std::uint32_t delta_rows = 0u;
+    std::uint32_t completed_snapshot_compactions = 0u;
+    std::uint32_t pending_snapshot_compactions = 0u;
+    double last_snapshot_compaction_latency_us = 0.0;
+    double max_snapshot_compaction_latency_us = 0.0;
     std::chrono::steady_clock::time_point last_compaction = std::chrono::steady_clock::now();
     bool loaded = false;
 };
 
 class AsyncFileWriter final {
 public:
+    struct PathSnapshot {
+        std::uint32_t backlog_tasks = 0u;
+        std::uint32_t backlog_appends = 0u;
+        std::uint64_t backlog_rows = 0u;
+        std::uint64_t backlog_bytes = 0u;
+        std::uint64_t flush_count = 0u;
+        double last_flush_latency_us = 0.0;
+        double max_flush_latency_us = 0.0;
+    };
+
     AsyncFileWriter()
         : worker_([this]() { run(); }) {}
 
@@ -146,8 +161,15 @@ public:
             return;
         }
         if (flush_line_count <= 1u && flush_bytes == 0u) {
-            enqueue([path, header, payload]() {
-                append_lines(path, header, payload);
+            {
+                std::scoped_lock lock(mutex_);
+                auto& stats = path_stats_[path.string()];
+                ++stats.backlog_appends;
+                stats.backlog_rows += 1u;
+                stats.backlog_bytes += payload.size();
+            }
+            enqueue([this, path, header, payload]() {
+                append_lines(path, header, payload, 1u, payload.size(), true);
             });
             return;
         }
@@ -177,10 +199,52 @@ public:
             std::scoped_lock lock(mutex_);
             if (!path.empty()) {
                 queue_pending_append_locked(path.string());
+                auto& stats = path_stats_[path.string()];
+                ++stats.backlog_tasks;
             }
-            tasks_.push_back(std::move(task));
+            tasks_.push_back([this, path_key = path.string(), task = std::move(task)]() mutable {
+                const auto start = std::chrono::steady_clock::now();
+                if (task) {
+                    task();
+                }
+                const auto end = std::chrono::steady_clock::now();
+                if (!path_key.empty()) {
+                    std::scoped_lock lock(mutex_);
+                    auto& stats = path_stats_[path_key];
+                    stats.backlog_tasks = stats.backlog_tasks > 0u ? (stats.backlog_tasks - 1u) : 0u;
+                    const auto elapsed_us =
+                        std::chrono::duration<double, std::micro>(end - start).count();
+                    stats.last_flush_latency_us = elapsed_us;
+                    stats.max_flush_latency_us =
+                        std::max(stats.max_flush_latency_us, elapsed_us);
+                }
+            });
         }
         condition_.notify_one();
+    }
+
+    [[nodiscard]] PathSnapshot snapshot_for_path(const std::filesystem::path& path) const {
+        if (path.empty()) {
+            return {};
+        }
+        std::scoped_lock lock(mutex_);
+        PathSnapshot snapshot;
+        const auto key = path.string();
+        if (const auto stats_it = path_stats_.find(key); stats_it != path_stats_.end()) {
+            snapshot.backlog_tasks = stats_it->second.backlog_tasks;
+            snapshot.backlog_appends = stats_it->second.backlog_appends;
+            snapshot.backlog_rows = stats_it->second.backlog_rows;
+            snapshot.backlog_bytes = stats_it->second.backlog_bytes;
+            snapshot.flush_count = stats_it->second.flush_count;
+            snapshot.last_flush_latency_us = stats_it->second.last_flush_latency_us;
+            snapshot.max_flush_latency_us = stats_it->second.max_flush_latency_us;
+        }
+        if (const auto pending_it = pending_appends_.find(key); pending_it != pending_appends_.end()) {
+            snapshot.backlog_appends += 1u;
+            snapshot.backlog_rows += pending_it->second.line_count;
+            snapshot.backlog_bytes += pending_it->second.payload_bytes;
+        }
+        return snapshot;
     }
 
 private:
@@ -192,10 +256,24 @@ private:
         std::size_t payload_bytes = 0u;
     };
 
-    static void append_lines(
+    struct PathStats {
+        std::uint32_t backlog_tasks = 0u;
+        std::uint32_t backlog_appends = 0u;
+        std::uint64_t backlog_rows = 0u;
+        std::uint64_t backlog_bytes = 0u;
+        std::uint64_t flush_count = 0u;
+        double last_flush_latency_us = 0.0;
+        double max_flush_latency_us = 0.0;
+    };
+
+    void append_lines(
         const std::filesystem::path& path,
         const std::string& header,
-        const std::string& payload) {
+        const std::string& payload,
+        const std::size_t line_count,
+        const std::size_t payload_bytes,
+        const bool queued_append) {
+        const auto start = std::chrono::steady_clock::now();
         if (path.empty()) {
             return;
         }
@@ -213,6 +291,23 @@ private:
             output << header;
         }
         output << payload;
+        const auto end = std::chrono::steady_clock::now();
+        const auto elapsed_us =
+            std::chrono::duration<double, std::micro>(end - start).count();
+        std::scoped_lock lock(mutex_);
+        auto& stats = path_stats_[path.string()];
+        if (queued_append && stats.backlog_appends > 0u) {
+            --stats.backlog_appends;
+        }
+        stats.backlog_rows = stats.backlog_rows > line_count
+                                 ? (stats.backlog_rows - line_count)
+                                 : 0u;
+        stats.backlog_bytes = stats.backlog_bytes > payload_bytes
+                                  ? (stats.backlog_bytes - static_cast<std::uint64_t>(payload_bytes))
+                                  : 0u;
+        ++stats.flush_count;
+        stats.last_flush_latency_us = elapsed_us;
+        stats.max_flush_latency_us = std::max(stats.max_flush_latency_us, elapsed_us);
     }
 
     void queue_pending_append_locked(std::string key) {
@@ -222,8 +317,18 @@ private:
         }
         auto pending = std::move(it->second);
         pending_appends_.erase(it);
-        tasks_.push_back([pending = std::move(pending)]() {
-            append_lines(pending.path, pending.header, pending.payload);
+        auto& stats = path_stats_[key];
+        ++stats.backlog_appends;
+        stats.backlog_rows += pending.line_count;
+        stats.backlog_bytes += pending.payload_bytes;
+        tasks_.push_back([this, pending = std::move(pending)]() mutable {
+            append_lines(
+                pending.path,
+                pending.header,
+                pending.payload,
+                pending.line_count,
+                pending.payload_bytes,
+                true);
         });
     }
 
@@ -251,10 +356,11 @@ private:
         }
     }
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<std::function<void()>> tasks_;
     std::unordered_map<std::string, PendingAppend> pending_appends_;
+    std::unordered_map<std::string, PathStats> path_stats_;
     std::thread worker_;
     bool stopping_ = false;
 };
@@ -266,6 +372,46 @@ AsyncFileWriter& telemetry_writer() {
 
 std::shared_mutex g_telemetry_budget_cache_mutex;
 std::unordered_map<std::string, TelemetryBudgetCacheState> g_telemetry_budget_cache;
+
+struct BudgetCompactionSnapshot {
+    std::uint32_t completed_compactions = 0u;
+    std::uint32_t pending_compactions = 0u;
+    double last_compaction_latency_us = 0.0;
+    double max_compaction_latency_us = 0.0;
+};
+
+void record_budget_snapshot_compaction_complete(
+    const std::filesystem::path& telemetry_path,
+    const double latency_us) {
+    if (telemetry_path.empty()) {
+        return;
+    }
+    std::unique_lock lock(g_telemetry_budget_cache_mutex);
+    auto& state = g_telemetry_budget_cache[telemetry_path.string()];
+    state.pending_snapshot_compactions =
+        state.pending_snapshot_compactions > 0u ? (state.pending_snapshot_compactions - 1u) : 0u;
+    ++state.completed_snapshot_compactions;
+    state.last_snapshot_compaction_latency_us = latency_us;
+    state.max_snapshot_compaction_latency_us =
+        std::max(state.max_snapshot_compaction_latency_us, latency_us);
+}
+
+[[nodiscard]] BudgetCompactionSnapshot budget_compaction_snapshot_for(
+    const std::filesystem::path& telemetry_path) {
+    if (telemetry_path.empty()) {
+        return {};
+    }
+    std::shared_lock lock(g_telemetry_budget_cache_mutex);
+    const auto it = g_telemetry_budget_cache.find(telemetry_path.string());
+    if (it == g_telemetry_budget_cache.end()) {
+        return {};
+    }
+    return BudgetCompactionSnapshot{
+        it->second.completed_snapshot_compactions,
+        it->second.pending_snapshot_compactions,
+        it->second.last_snapshot_compaction_latency_us,
+        it->second.max_snapshot_compaction_latency_us};
+}
 
 bool is_host_graph(const HardwareGraph& graph) {
     return graph.probe == "host";
@@ -311,30 +457,78 @@ std::filesystem::path env_path(const char* name) {
     return std::filesystem::path(value);
 }
 
+bool ensure_runtime_root_writable(const std::filesystem::path& root) {
+    if (root.empty()) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    if (ec) {
+        return false;
+    }
+
+    const auto probe_path = root / ".jakal-write-probe";
+    {
+        std::ofstream output(probe_path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open()) {
+            return false;
+        }
+        output.put('\0');
+        if (!output.good()) {
+            return false;
+        }
+    }
+
+    std::filesystem::remove(probe_path, ec);
+    return true;
+}
+
 std::filesystem::path choose_writable_runtime_root() {
+    const auto use_if_writable = [](const std::filesystem::path& candidate) {
+        return ensure_runtime_root_writable(candidate) ? candidate : std::filesystem::path{};
+    };
+
     if (const auto override_root = env_path("JAKAL_RUNTIME_HOME"); !override_root.empty()) {
-        return override_root;
+        if (const auto writable_root = use_if_writable(override_root); !writable_root.empty()) {
+            return writable_root;
+        }
     }
 #if defined(_WIN32)
     if (const auto local_app_data = env_path("LOCALAPPDATA"); !local_app_data.empty()) {
-        return local_app_data / "Jakal-Core";
+        if (const auto writable_root = use_if_writable(local_app_data / "Jakal-Core");
+            !writable_root.empty()) {
+            return writable_root;
+        }
     }
     if (const auto app_data = env_path("APPDATA"); !app_data.empty()) {
-        return app_data / "Jakal-Core";
+        if (const auto writable_root = use_if_writable(app_data / "Jakal-Core");
+            !writable_root.empty()) {
+            return writable_root;
+        }
     }
 #else
     if (const auto xdg_state = env_path("XDG_STATE_HOME"); !xdg_state.empty()) {
-        return xdg_state / "jakal-core";
+        if (const auto writable_root = use_if_writable(xdg_state / "jakal-core");
+            !writable_root.empty()) {
+            return writable_root;
+        }
     }
     if (const auto home = env_path("HOME"); !home.empty()) {
-        return home / ".local" / "state" / "jakal-core";
+        if (const auto writable_root = use_if_writable(home / ".local" / "state" / "jakal-core");
+            !writable_root.empty()) {
+            return writable_root;
+        }
     }
 #endif
     try {
-        return std::filesystem::temp_directory_path() / "jakal-core";
+        if (const auto writable_root = use_if_writable(std::filesystem::temp_directory_path() / "jakal-core");
+            !writable_root.empty()) {
+            return writable_root;
+        }
     } catch (const std::exception&) {
-        return std::filesystem::path("jakal-core-state");
     }
+    return std::filesystem::path("jakal-core-state");
 }
 
 std::filesystem::path choose_config_runtime_root() {
@@ -1164,6 +1358,7 @@ void update_runtime_budget_cache(
             snapshot_entries = state.entries;
             state.delta_rows = 0u;
             state.last_compaction = now;
+            ++state.pending_snapshot_compactions;
         }
     }
 
@@ -1186,7 +1381,12 @@ void update_runtime_budget_cache(
         telemetry_writer().enqueue_with_flushed_append(
             delta_path,
             [telemetry_path, snapshot_entries = std::move(snapshot_entries)]() mutable {
+                const auto start = std::chrono::steady_clock::now();
                 persist_budget_cache_snapshot_copy(telemetry_path, snapshot_entries);
+                const auto end = std::chrono::steady_clock::now();
+                record_budget_snapshot_compaction_complete(
+                    telemetry_path,
+                    std::chrono::duration<double, std::micro>(end - start).count());
             });
         return;
     }
@@ -1848,6 +2048,36 @@ bool selection_changed(const OptimizationReport& left, const OptimizationReport&
     return false;
 }
 
+bool is_host_device_uid(const std::string& uid) {
+    return uid == "host" || uid.rfind("host:", 0) == 0;
+}
+
+bool is_small_host_cached_decode_optimization(const OptimizationReport& optimization) {
+    if (!optimization.loaded_from_cache ||
+        optimization.workload_phase != WorkloadPhase::decode ||
+        optimization.operations.size() > 8u) {
+        return false;
+    }
+    return std::all_of(optimization.operations.begin(), optimization.operations.end(), [](const auto& optimized) {
+        if (!is_host_device_uid(optimized.config.primary_device_uid)) {
+            return false;
+        }
+        return std::all_of(
+            optimized.config.participating_devices.begin(),
+            optimized.config.participating_devices.end(),
+            [](const std::string& uid) { return is_host_device_uid(uid); });
+    });
+}
+
+bool is_small_host_cached_decode_execution(const DirectExecutionReport& report) {
+    if (!is_small_host_cached_decode_optimization(report.optimization)) {
+        return false;
+    }
+    return std::all_of(report.operations.begin(), report.operations.end(), [](const OperationExecutionRecord& operation) {
+        return operation.used_host;
+    });
+}
+
 double head_runtime_us(const WorkloadSpec& workload, const DirectExecutionReport& report) {
     if (report.operations.empty()) {
         return std::max(report.total_runtime_us, 0.0);
@@ -1865,6 +2095,77 @@ double head_runtime_us(const WorkloadSpec& workload, const DirectExecutionReport
         [](const double total, const OperationExecutionRecord& operation) {
             return total + std::max(operation.runtime_us, 0.0);
         });
+}
+
+std::string tuning_request_cache_suffix(const ExecutionTuningOverrides& tuning) {
+    std::ostringstream stream;
+    stream << "rewrite=" << std::max(tuning.graph_rewrite_level, 1u) << '|';
+    if (tuning.graph_optimization_passes_override.has_value()) {
+        stream << "passes=" << *tuning.graph_optimization_passes_override;
+    } else {
+        stream << "passes=auto";
+    }
+    stream << '|';
+    if (tuning.optimizer_wall_time_budget_ms.has_value()) {
+        stream << "budget=" << *tuning.optimizer_wall_time_budget_ms << "ms";
+    } else {
+        stream << "budget=auto";
+    }
+    stream << '|'
+           << "validation=" << static_cast<int>(tuning.validation_tier) << '|';
+    if (!tuning.initial_state_override.has_value()) {
+        stream << "state=auto";
+        return stream.str();
+    }
+
+    const auto& state = *tuning.initial_state_override;
+    stream << std::fixed << std::setprecision(2)
+           << "state=" << state.queue_depth_raw << ','
+           << state.stage_raw << ','
+           << state.tile_raw << ','
+           << state.overlap_raw << ','
+           << state.partition_raw << ','
+           << state.precision_raw << ','
+           << state.single_device_logit << ','
+           << state.sharded_logit << ','
+           << state.streaming_logit << ','
+           << state.overlapped_logit;
+    return stream.str();
+}
+
+std::string runtime_optimization_request_key(
+    const WorkloadSpec& workload,
+    const WorkloadGraph& workload_graph,
+    const ExecutionTuningOverrides& tuning,
+    const std::vector<HardwareGraph>& devices) {
+    const auto compiled = compile_workload_graph(workload_graph);
+    std::ostringstream stream;
+    stream << workload.name << '|'
+           << to_string(workload.kind) << '|'
+           << workload.dataset_tag << '|'
+           << workload.working_set_bytes << '|'
+           << workload.host_exchange_bytes << '|'
+           << std::fixed << std::setprecision(3) << workload.estimated_flops << '|'
+           << workload.batch_size << '|'
+           << (workload.latency_sensitive ? '1' : '0') << '|'
+           << (workload.prefer_unified_memory ? '1' : '0') << '|'
+           << (workload.matrix_friendly ? '1' : '0') << '|'
+           << to_string(workload.partition_strategy) << '|'
+           << to_string(canonical_workload_phase(workload)) << '|'
+           << canonical_workload_shape_bucket(workload) << '|'
+           << (workload.heuristic_partition_hint.has_value() ? to_string(*workload.heuristic_partition_hint) : "none") << '|'
+           << std::setprecision(2) << workload.heuristic_partition_hint_confidence << '|'
+           << workload.heuristic_partition_hint_reason << '|'
+           << (workload.disable_heuristic_partition_hint ? '1' : '0') << '|'
+           << (workload.disable_automatic_execution_tuning ? '1' : '0') << '|'
+           << (workload.disable_strategy_exploration ? '1' : '0') << '|'
+           << compiled.signature << '|'
+           << tuning_request_cache_suffix(tuning) << '|'
+           << devices.size();
+    for (const auto& graph : devices) {
+        stream << '|' << graph.probe << ':' << graph.uid;
+    }
+    return stream.str();
 }
 
 struct LayoutCacheDescriptor {
@@ -2707,6 +3008,8 @@ void Runtime::rebuild_backend_statuses() {
 void Runtime::refresh_hardware() {
     devices_.clear();
     jakal_toolkit_index_.clear();
+    pending_optimization_request_key_.clear();
+    pending_optimization_.reset();
     std::vector<HardwareGraph> discovered;
 
     for (auto& probe : probes_) {
@@ -2779,6 +3082,8 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
 
     const auto workload_graph = default_workload_graph(workload);
     const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
+    const auto request_key =
+        runtime_optimization_request_key(context.effective_workload, workload_graph, context.execution_tuning, devices_);
     const auto placement = planner_.build_plan(context.effective_workload, devices_);
     auto report = execution_optimizer_.optimize(
         context.effective_workload,
@@ -2786,6 +3091,8 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
         devices_,
         &workload_graph,
         &context.execution_tuning);
+    pending_optimization_request_key_ = request_key;
+    pending_optimization_ = report;
     return report;
 }
 
@@ -2793,6 +3100,8 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload, const Workloa
     ensure_hardware_refreshed();
 
     const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
+    const auto request_key =
+        runtime_optimization_request_key(context.effective_workload, workload_graph, context.execution_tuning, devices_);
     const auto placement = planner_.build_plan(context.effective_workload, devices_);
     auto report = execution_optimizer_.optimize(
         context.effective_workload,
@@ -2800,6 +3109,8 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload, const Workloa
         devices_,
         &workload_graph,
         &context.execution_tuning);
+    pending_optimization_request_key_ = request_key;
+    pending_optimization_ = report;
     return report;
 }
 
@@ -2892,14 +3203,29 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
 
     auto planned = planner_.build_plan(effective_workload, devices_);
     update_planner_diagnostics(planned);
-    auto optimization = execution_optimizer_.optimize(
-        effective_workload,
-        planned,
-        devices_,
-        &workload_graph,
-        &context.execution_tuning);
+    const auto request_key =
+        runtime_optimization_request_key(effective_workload, workload_graph, context.execution_tuning, devices_);
+    OptimizationReport optimization;
+    if (pending_optimization_.has_value() && pending_optimization_request_key_ == request_key) {
+        optimization = *pending_optimization_;
+        pending_optimization_.reset();
+        pending_optimization_request_key_.clear();
+    } else {
+        optimization = execution_optimizer_.optimize(
+            effective_workload,
+            planned,
+            devices_,
+            &workload_graph,
+            &context.execution_tuning);
+    }
     auto use_detailed_diagnostics = [&](const bool after_execution) {
         if (options_.product.performance.diagnostics_mode == RuntimeDiagnosticsMode::summary_only) {
+            return false;
+        }
+        if (after_execution &&
+            optimization.loaded_from_cache &&
+            optimization.workload_phase == WorkloadPhase::decode &&
+            optimization.operations.size() <= 8u) {
             return false;
         }
         if (after_execution &&
@@ -2967,16 +3293,22 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             std::max(managed.safety.persisted_worst_slowdown, summary.worst_slowdown_vs_reference);
     };
     managed.safety.selected_strategy = optimization.partition_strategy;
+    const bool skip_preexecution_bookkeeping = is_small_host_cached_decode_optimization(optimization);
     managed.memory_preflight = build_memory_preflight(optimization);
-    refresh_execution_reports(nullptr, false);
+    if (!skip_preexecution_bookkeeping) {
+        refresh_execution_reports(nullptr, false);
+    }
     refresh_regression_summary();
-    managed.safety.planner_risk_score = planner_risk_score(
-        effective_workload,
-        managed.planning,
-        optimization,
-        managed.memory_preflight,
-        managed.kernel_coverage,
-        managed.residency_sequence);
+    managed.safety.planner_risk_score =
+        skip_preexecution_bookkeeping
+            ? 0.0
+            : planner_risk_score(
+                  effective_workload,
+                  managed.planning,
+                  optimization,
+                  managed.memory_preflight,
+                  managed.kernel_coverage,
+                  managed.residency_sequence);
 
     auto force_auto_if_needed = [&](const char* reason) {
         if (optimization.partition_strategy == PartitionStrategy::auto_balanced) {
@@ -3066,6 +3398,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         safety_summary << managed.memory_preflight.summary;
         managed.safety.summary = safety_summary.str();
         persist_telemetry(requested_workload, managed);
+        managed.observability = build_runtime_observability(managed.telemetry_path);
         return managed;
     }
 
@@ -3074,6 +3407,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
     refresh_execution_reports(&managed.execution, true);
     refresh_regression_summary();
     managed.safety.final_strategy = managed.execution.optimization.partition_strategy;
+    const bool skip_postrun_bookkeeping = is_small_host_cached_decode_execution(managed.execution);
     auto planner_feedback = make_strategy_feedback_sample(
         effective_workload,
         managed.execution,
@@ -3144,7 +3478,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         record_strategy_success(requested_workload, managed.execution.optimization.partition_strategy);
     }
 
-    if (managed.executed) {
+    if (managed.executed && !skip_postrun_bookkeeping) {
         record_partition_strategy_feedback(planner_, requested_workload, devices_, planner_feedback);
     }
 
@@ -3199,7 +3533,13 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         safety_summary << managed.executed_residency_movements.summary;
     }
     managed.safety.summary = safety_summary.str();
-    persist_telemetry(requested_workload, managed);
+    if (skip_postrun_bookkeeping) {
+        managed.observability = {};
+        managed.observability.summary = "postrun-bookkeeping-skipped:small-host-cached-decode";
+    } else {
+        persist_telemetry(requested_workload, managed);
+        managed.observability = build_runtime_observability(managed.telemetry_path);
+    }
     return managed;
 }
 
@@ -3218,6 +3558,7 @@ ManagedExecutionReport Runtime::execute_manifest(const std::filesystem::path& ma
             report.asset_prefetch.missing_required_assets = true;
             report.safety.summary = "required asset missing: " + missing_required->id;
             persist_telemetry(manifest.workload, report);
+            report.observability = build_runtime_observability(report.telemetry_path);
             return report;
         }
     }
@@ -4086,6 +4427,31 @@ ExecutedResidencyMovementReport Runtime::build_executed_residency_movements(
     return report;
 }
 
+RuntimeObservabilityReport Runtime::build_runtime_observability(
+    const std::filesystem::path& telemetry_path) const {
+    RuntimeObservabilityReport report;
+    const auto writer_snapshot = telemetry_writer().snapshot_for_path(telemetry_path);
+    const auto budget_snapshot = budget_compaction_snapshot_for(telemetry_path);
+    report.telemetry_backlog_tasks = writer_snapshot.backlog_tasks;
+    report.telemetry_backlog_appends = writer_snapshot.backlog_appends;
+    report.telemetry_backlog_rows = writer_snapshot.backlog_rows;
+    report.telemetry_backlog_bytes = writer_snapshot.backlog_bytes;
+    report.telemetry_flush_count = writer_snapshot.flush_count;
+    report.telemetry_last_flush_latency_us = writer_snapshot.last_flush_latency_us;
+    report.telemetry_max_flush_latency_us = writer_snapshot.max_flush_latency_us;
+    report.budget_snapshot_compaction_count = budget_snapshot.completed_compactions;
+    report.budget_pending_snapshot_compactions = budget_snapshot.pending_compactions;
+    report.budget_last_snapshot_compaction_latency_us = budget_snapshot.last_compaction_latency_us;
+    report.budget_max_snapshot_compaction_latency_us = budget_snapshot.max_compaction_latency_us;
+    std::ostringstream summary;
+    summary << "telemetry_backlog_rows=" << report.telemetry_backlog_rows
+            << " flushes=" << report.telemetry_flush_count
+            << " budget_compactions=" << report.budget_snapshot_compaction_count
+            << " pending_budget_compactions=" << report.budget_pending_snapshot_compactions;
+    report.summary = summary.str();
+    return report;
+}
+
 KernelCoverageReport Runtime::build_kernel_coverage(const OptimizationReport& optimization) const {
     KernelCoverageReport report;
     std::ostringstream summary;
@@ -4412,8 +4778,9 @@ void Runtime::persist_telemetry(
     }
 
     const auto path = telemetry_path();
+    const auto observability = build_runtime_observability(path);
     const std::string header =
-        "# telemetry_schema_version\tepoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tregression_gate_forced_auto\tpersisted_regression_events\tpersisted_worst_slowdown\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tcopy_runtime_us\tcompute_runtime_us\tcopy_overlap_ratio\ttransfer_us\toverlapped_transfer_us\ttransfer_overlap_gain_us\ttransfer_overlap_ratio\toptimizer_budget_ms\tbudget_exhausted\tallocator_peak_live_bytes\tallocator_peak_reserved_bytes\tallocator_reuse_count\tspill_artifact_bytes\treload_artifact_bytes\tbackend_owned_peak_bytes\tbackend_resource_reuse_hits\texecuted_h2d_bytes\texecuted_d2h_bytes\texecuted_spill_bytes\texecuted_reload_bytes\texecuted_transfer_us\tsummary\n";
+        "# telemetry_schema_version\tepoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tregression_gate_forced_auto\tpersisted_regression_events\tpersisted_worst_slowdown\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tcopy_runtime_us\tcompute_runtime_us\tcopy_overlap_ratio\ttransfer_us\toverlapped_transfer_us\ttransfer_overlap_gain_us\ttransfer_overlap_ratio\toptimizer_budget_ms\tbudget_exhausted\tallocator_peak_live_bytes\tallocator_peak_reserved_bytes\tallocator_reuse_count\tspill_artifact_bytes\treload_artifact_bytes\tbackend_owned_peak_bytes\tbackend_resource_reuse_hits\texecuted_h2d_bytes\texecuted_d2h_bytes\texecuted_spill_bytes\texecuted_reload_bytes\texecuted_transfer_us\ttelemetry_backlog_tasks\ttelemetry_backlog_appends\ttelemetry_backlog_rows\ttelemetry_backlog_bytes\ttelemetry_flush_count\ttelemetry_last_flush_us\ttelemetry_max_flush_us\tbudget_snapshot_compactions\tbudget_pending_compactions\tbudget_last_compaction_us\tbudget_max_compaction_us\tsummary\n";
 
     std::ostringstream line;
     line << kRuntimeTelemetrySchemaVersion << '\t'
@@ -4466,6 +4833,17 @@ void Runtime::persist_telemetry(
          << report.executed_residency_movements.executed_spill_bytes << '\t'
          << report.executed_residency_movements.executed_reload_bytes << '\t'
          << report.executed_residency_movements.total_transfer_runtime_us << '\t'
+         << observability.telemetry_backlog_tasks << '\t'
+         << observability.telemetry_backlog_appends << '\t'
+         << observability.telemetry_backlog_rows << '\t'
+         << observability.telemetry_backlog_bytes << '\t'
+         << observability.telemetry_flush_count << '\t'
+         << observability.telemetry_last_flush_latency_us << '\t'
+         << observability.telemetry_max_flush_latency_us << '\t'
+         << observability.budget_snapshot_compaction_count << '\t'
+         << observability.budget_pending_snapshot_compactions << '\t'
+         << observability.budget_last_snapshot_compaction_latency_us << '\t'
+         << observability.budget_max_snapshot_compaction_latency_us << '\t'
          << report.safety.summary << '\n';
 
     if (options_.product.observability.async_telemetry_flush) {

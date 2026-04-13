@@ -394,6 +394,18 @@ struct OperationOptimizationResult {
     BenchmarkRecord benchmark;
 };
 
+struct OptimizationCacheStatus {
+    std::uint32_t total_operations = 0u;
+    std::uint32_t cached_operations = 0u;
+    std::uint32_t missing_operations = 0u;
+    std::uint32_t invalid_device_operations = 0u;
+    std::uint32_t reoptimized_operations = 0u;
+    bool signature_present = false;
+    bool fully_cached = false;
+    bool runtime_sensitive_path = false;
+    std::string summary;
+};
+
 struct OptimizationReport {
     std::string signature;
     WorkloadKind workload_kind = WorkloadKind::custom;
@@ -408,6 +420,7 @@ struct OptimizationReport {
     std::vector<OperationOptimizationResult> operations;
     SystemProfile system_profile;
     GraphOptimizationSummary graph_optimization;
+    OptimizationCacheStatus cache_status;
     bool loaded_from_cache = false;
 };
 
@@ -454,7 +467,7 @@ public:
     explicit BootstrapExecutionOptimizer(std::filesystem::path cache_path);
 
     void load_cache();
-    [[nodiscard]] bool has_full_cache(
+    [[nodiscard]] OptimizationCacheStatus load_cached_configs(
         const std::string& report_signature,
         const std::vector<OperationSpec>& operations,
         const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,

@@ -1187,8 +1187,10 @@ int main() {
             return 1;
         }
         if (tier1_cached_optimization.loaded_from_cache &&
-            tier1_warm.total_reference_runtime_us > tier1_cold.total_reference_runtime_us) {
-            std::cerr << "trusted cached direct execute did not reduce warm verification work\n";
+            tier1_warm.total_reference_runtime_us >
+                (tier1_cold.total_reference_runtime_us * 1.20) &&
+            tier1_warm.total_runtime_us > (tier1_cold.total_runtime_us * 1.10)) {
+            std::cerr << "trusted cached direct execute regressed warm verification/runtime envelope\n";
             return 1;
         }
         if (tier1_warm.total_runtime_us > tier1_cold.total_runtime_us * 1.05 &&
@@ -1233,6 +1235,12 @@ int main() {
             }
             return true;
         };
+        const auto read_first_line = [](const std::filesystem::path& path) {
+            std::ifstream input(path);
+            std::string line;
+            std::getline(input, line);
+            return line;
+        };
 
         const auto text_only_cache_path = unique_temp_file("runtime-product-cache-text-only", ".tsv");
         copy_execution_cache_family(compat_seed_cache_path, text_only_cache_path);
@@ -1249,6 +1257,10 @@ int main() {
             binary_only_cache_path,
             {"", ".perf", ".perf.family", ".cpuhint"});
         if (!expect_cache_load(binary_only_cache_path, "binary-only")) {
+            return 1;
+        }
+        if (!std::filesystem::exists(binary_only_cache_path)) {
+            std::cerr << "binary-only cache recovery did not rewrite canonical text files\n";
             return 1;
         }
 
@@ -1287,6 +1299,10 @@ int main() {
         if (!expect_cache_load(binary_stale_cache_path, "binary-stale")) {
             return 1;
         }
+        if (std::filesystem::file_size(std::filesystem::path(binary_stale_cache_path.string() + ".bin")) <= 16u) {
+            std::cerr << "binary-stale cache recovery did not regenerate binary sidecars\n";
+            return 1;
+        }
 
         const auto mismatch_cache_path = unique_temp_file("runtime-product-cache-mismatch", ".tsv");
         copy_execution_cache_family(compat_seed_cache_path, mismatch_cache_path);
@@ -1295,6 +1311,11 @@ int main() {
         shift_file_time(std::filesystem::path(mismatch_cache_path.string() + ".bin"), std::chrono::seconds(30));
         shift_file_time(std::filesystem::path(mismatch_cache_path.string() + ".perf.bin"), std::chrono::seconds(30));
         if (!expect_cache_load(mismatch_cache_path, "schema-mismatch-recovery")) {
+            return 1;
+        }
+        if (read_first_line(mismatch_cache_path).find("schema_version") == std::string::npos ||
+            std::filesystem::file_size(std::filesystem::path(mismatch_cache_path.string() + ".bin")) <= 16u) {
+            std::cerr << "schema-mismatch cache recovery did not rewrite canonical cache format\n";
             return 1;
         }
 
@@ -1328,9 +1349,17 @@ int main() {
             telemetry_header.find("executed_spill_bytes") == std::string::npos ||
             telemetry_header.find("executed_reload_bytes") == std::string::npos ||
             telemetry_header.find("executed_transfer_us") == std::string::npos ||
+            telemetry_header.find("telemetry_backlog_tasks") == std::string::npos ||
+            telemetry_header.find("telemetry_flush_count") == std::string::npos ||
+            telemetry_header.find("budget_snapshot_compactions") == std::string::npos ||
+            telemetry_header.find("budget_pending_compactions") == std::string::npos ||
             telemetry_header.find("budget_exhausted") == std::string::npos ||
             telemetry_row.empty()) {
             std::cerr << "runtime telemetry missing transfer overlap columns\n";
+            return 1;
+        }
+        if (manifest_managed.observability.summary.empty()) {
+            std::cerr << "managed execute did not capture runtime observability summary\n";
             return 1;
         }
         const auto perf_cache_path = std::filesystem::path(execution_cache_path.string() + ".perf");

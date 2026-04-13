@@ -1285,6 +1285,10 @@ bool try_run_host_native_low_precision_matmul(
         effective_tile_k_value,
         effective_tile_n_value,
         operation.cpu_pack_budget_bytes);
+    if (rows <= 2u && rhs_transposed) {
+        run_fp16_matmul_rows(lhs, rhs, columns, depth, true, 0u, rows, output);
+        return true;
+    }
 
     const auto run_blocked = [&](const std::size_t begin, const std::size_t end) {
         const auto row_start = static_cast<std::uint32_t>(begin);

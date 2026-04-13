@@ -16,7 +16,7 @@
 
 namespace jakal {
 
-constexpr std::uint32_t kRuntimeTelemetrySchemaVersion = 2u;
+constexpr std::uint32_t kRuntimeTelemetrySchemaVersion = 3u;
 constexpr std::uint32_t kRuntimeTelemetryBudgetSchemaVersion = 1u;
 
 struct RuntimeMemoryPolicy {
@@ -348,6 +348,21 @@ struct ExecutedResidencyMovementReport {
     std::string summary;
 };
 
+struct RuntimeObservabilityReport {
+    std::uint32_t telemetry_backlog_tasks = 0;
+    std::uint32_t telemetry_backlog_appends = 0;
+    std::uint64_t telemetry_backlog_rows = 0;
+    std::uint64_t telemetry_backlog_bytes = 0;
+    std::uint64_t telemetry_flush_count = 0;
+    double telemetry_last_flush_latency_us = 0.0;
+    double telemetry_max_flush_latency_us = 0.0;
+    std::uint32_t budget_snapshot_compaction_count = 0;
+    std::uint32_t budget_pending_snapshot_compactions = 0;
+    double budget_last_snapshot_compaction_latency_us = 0.0;
+    double budget_max_snapshot_compaction_latency_us = 0.0;
+    std::string summary;
+};
+
 struct ManagedExecutionReport {
     ExecutionPlan planning;
     DirectExecutionReport execution;
@@ -360,6 +375,7 @@ struct ManagedExecutionReport {
     SpillArtifactReport spill_artifacts;
     BackendBufferBindingReport backend_buffer_bindings;
     ExecutedResidencyMovementReport executed_residency_movements;
+    RuntimeObservabilityReport observability;
     std::filesystem::path telemetry_path;
     bool executed = false;
 };
@@ -414,6 +430,8 @@ private:
         const DirectExecutionReport* execution,
         const ResidencySequenceReport& residency_sequence,
         const SpillArtifactReport& spill_artifacts) const;
+    [[nodiscard]] RuntimeObservabilityReport build_runtime_observability(
+        const std::filesystem::path& telemetry_path) const;
     [[nodiscard]] DirectExecutionReport execute_with_feedback(
         const WorkloadSpec& workload,
         const OptimizationReport& optimization,
@@ -437,6 +455,8 @@ private:
     std::uint64_t execution_epoch_ = 0;
     std::unordered_map<std::string, std::uint32_t> strategy_failure_counts_;
     std::unordered_map<std::string, std::uint64_t> strategy_blacklist_until_epoch_;
+    std::string pending_optimization_request_key_;
+    std::optional<OptimizationReport> pending_optimization_;
 };
 
 [[nodiscard]] std::string runtime_backend_name_for_graph(const HardwareGraph& graph);
