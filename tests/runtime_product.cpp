@@ -1,4 +1,5 @@
 #include "jakal/runtime.hpp"
+#include "jakal/executor.hpp"
 #include "jakal/workloads.hpp"
 
 #include <algorithm>
@@ -15,6 +16,40 @@ namespace {
 std::filesystem::path unique_temp_file(const std::string& stem, const std::string& extension) {
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
     return std::filesystem::temp_directory_path() / (stem + "-" + std::to_string(nonce) + extension);
+}
+
+jakal::HardwareGraph make_synthetic_level_zero_graph() {
+    jakal::HardwareGraph graph;
+    graph.uid = "level-zero:synthetic:0";
+    graph.probe = "level-zero";
+    graph.presentation_name = "Synthetic Level Zero";
+    graph.nodes.push_back({"root", "root", "", jakal::HardwareObjectDomain::control, jakal::HardwareObjectRole::root});
+    graph.nodes.push_back({"queue", "queue", "root", jakal::HardwareObjectDomain::control, jakal::HardwareObjectRole::queue});
+    graph.nodes.back().control.supports_asynchronous_dispatch = true;
+    graph.nodes.push_back({"cluster", "cluster", "root", jakal::HardwareObjectDomain::compute, jakal::HardwareObjectRole::cluster});
+    graph.nodes.back().compute.execution_width = 256;
+    graph.nodes.back().compute.clock_mhz = 1700;
+    graph.nodes.back().compute.matrix_engines = 16;
+    graph.nodes.back().compute.supports_fp16 = true;
+    graph.nodes.back().compute.supports_int8 = true;
+    graph.nodes.push_back({"memory", "memory", "root", jakal::HardwareObjectDomain::storage, jakal::HardwareObjectRole::global_memory});
+    graph.nodes.back().storage.capacity_bytes = 8ull * 1024ull * 1024ull * 1024ull;
+    graph.nodes.back().storage.unified_address_space = true;
+    graph.nodes.back().storage.coherent_with_host = true;
+    graph.nodes.back().storage.shared_host_bytes = graph.nodes.back().storage.capacity_bytes;
+    graph.nodes.push_back({"host-link", "host-link", "root", jakal::HardwareObjectDomain::transfer, jakal::HardwareObjectRole::transfer_link});
+    graph.nodes.back().transfer.read_bandwidth_gbps = 96.0;
+    graph.nodes.back().transfer.write_bandwidth_gbps = 96.0;
+    graph.nodes.back().transfer.dispatch_latency_us = 5.0;
+    graph.nodes.back().transfer.synchronization_latency_us = 4.0;
+    graph.edges.push_back({"root", "queue", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "cluster", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "memory", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "host-link", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"queue", "cluster", jakal::GraphEdgeSemantics::dispatches, true, 1.0, 0.0, 5.0});
+    graph.edges.push_back({"host-link", "memory", jakal::GraphEdgeSemantics::transfers_to, true, 1.0, 96.0, 4.0});
+    jakal::materialize_graph_costs(graph);
+    return graph;
 }
 
 void write_manifest(
@@ -97,6 +132,201 @@ void write_manifest(
     output << "parallelizable=true\n";
     output << "reduction_like=true\n";
     output << "inputs=hidden\n";
+    output << "outputs=score-out\n";
+}
+
+void write_allocator_manifest(const std::filesystem::path& path, const std::uint64_t tensor_bytes) {
+    std::ofstream output(path, std::ios::trunc);
+    output << "[workload]\n";
+    output << "name=manifest-allocator\n";
+    output << "kind=inference\n";
+    output << "dataset_tag=manifest-allocator-lite\n";
+    output << "phase=decode\n";
+    output << "working_set_bytes=4194304\n";
+    output << "host_exchange_bytes=524288\n";
+    output << "estimated_flops=24000000\n";
+    output << "batch_size=1\n";
+    output << "latency_sensitive=true\n";
+    output << "prefer_unified_memory=true\n\n";
+
+    output << "[tensor]\n";
+    output << "id=input-a\n";
+    output << "bytes=" << tensor_bytes << "\n";
+    output << "consumers=normalize-a\n";
+    output << "host_visible=true\n\n";
+
+    output << "[tensor]\n";
+    output << "id=hidden-a\n";
+    output << "bytes=" << tensor_bytes << "\n";
+    output << "producer=normalize-a\n";
+    output << "consumers=score-a\n\n";
+
+    output << "[tensor]\n";
+    output << "id=score-a-out\n";
+    output << "bytes=4\n";
+    output << "producer=score-a\n\n";
+
+    output << "[tensor]\n";
+    output << "id=input-b\n";
+    output << "bytes=" << tensor_bytes << "\n";
+    output << "consumers=normalize-b\n";
+    output << "host_visible=true\n\n";
+
+    output << "[tensor]\n";
+    output << "id=hidden-b\n";
+    output << "bytes=" << tensor_bytes << "\n";
+    output << "producer=normalize-b\n";
+    output << "consumers=score-b\n\n";
+
+    output << "[tensor]\n";
+    output << "id=score-b-out\n";
+    output << "bytes=4\n";
+    output << "producer=score-b\n\n";
+
+    output << "[operation]\n";
+    output << "name=normalize-a\n";
+    output << "class=elementwise_map\n";
+    output << "extents=2048\n";
+    output << "input_bytes=" << tensor_bytes << "\n";
+    output << "output_bytes=" << tensor_bytes << "\n";
+    output << "estimated_flops=4096\n";
+    output << "parallelizable=true\n";
+    output << "streaming_friendly=true\n";
+    output << "inputs=input-a\n";
+    output << "outputs=hidden-a\n\n";
+
+    output << "[operation]\n";
+    output << "name=score-a\n";
+    output << "class=reduction\n";
+    output << "extents=2048\n";
+    output << "input_bytes=" << tensor_bytes << "\n";
+    output << "output_bytes=4\n";
+    output << "estimated_flops=2048\n";
+    output << "parallelizable=true\n";
+    output << "reduction_like=true\n";
+    output << "inputs=hidden-a\n";
+    output << "outputs=score-a-out\n\n";
+
+    output << "[operation]\n";
+    output << "name=normalize-b\n";
+    output << "class=elementwise_map\n";
+    output << "extents=2048\n";
+    output << "input_bytes=" << tensor_bytes << "\n";
+    output << "output_bytes=" << tensor_bytes << "\n";
+    output << "estimated_flops=4096\n";
+    output << "parallelizable=true\n";
+    output << "streaming_friendly=true\n";
+    output << "inputs=input-b\n";
+    output << "outputs=hidden-b\n\n";
+
+    output << "[operation]\n";
+    output << "name=score-b\n";
+    output << "class=reduction\n";
+    output << "extents=2048\n";
+    output << "input_bytes=" << tensor_bytes << "\n";
+    output << "output_bytes=4\n";
+    output << "estimated_flops=2048\n";
+    output << "parallelizable=true\n";
+    output << "reduction_like=true\n";
+    output << "inputs=hidden-b\n";
+    output << "outputs=score-b-out\n";
+}
+
+void write_spill_reload_manifest(const std::filesystem::path& path, const std::uint64_t tensor_bytes) {
+    std::ofstream output(path, std::ios::trunc);
+    output << "[workload]\n";
+    output << "name=manifest-spill-reload\n";
+    output << "kind=inference\n";
+    output << "dataset_tag=manifest-spill-reload-lite\n";
+    output << "phase=decode\n";
+    output << "working_set_bytes=33554432\n";
+    output << "host_exchange_bytes=1048576\n";
+    output << "estimated_flops=36000000\n";
+    output << "batch_size=1\n";
+    output << "latency_sensitive=true\n";
+    output << "prefer_unified_memory=true\n\n";
+
+    output << "[tensor]\n";
+    output << "id=input\n";
+    output << "bytes=" << tensor_bytes << "\n";
+    output << "consumers=carry\n";
+    output << "host_visible=true\n\n";
+
+    output << "[tensor]\n";
+    output << "id=input-burst\n";
+    output << "bytes=" << tensor_bytes << "\n";
+    output << "consumers=burst\n";
+    output << "host_visible=true\n\n";
+
+    output << "[tensor]\n";
+    output << "id=carry-state\n";
+    output << "bytes=" << tensor_bytes << "\n";
+    output << "producer=carry\n";
+    output << "consumers=merge\n\n";
+
+    output << "[tensor]\n";
+    output << "id=burst-state\n";
+    output << "bytes=" << tensor_bytes << "\n";
+    output << "producer=burst\n";
+    output << "consumers=merge\n\n";
+
+    output << "[tensor]\n";
+    output << "id=merged\n";
+    output << "bytes=" << tensor_bytes << "\n";
+    output << "producer=merge\n";
+    output << "consumers=score\n\n";
+
+    output << "[tensor]\n";
+    output << "id=score-out\n";
+    output << "bytes=4\n";
+    output << "producer=score\n\n";
+
+    output << "[operation]\n";
+    output << "name=carry\n";
+    output << "class=elementwise_map\n";
+    output << "extents=2048\n";
+    output << "input_bytes=" << tensor_bytes << "\n";
+    output << "output_bytes=" << tensor_bytes << "\n";
+    output << "estimated_flops=4096\n";
+    output << "parallelizable=true\n";
+    output << "streaming_friendly=true\n";
+    output << "inputs=input\n";
+    output << "outputs=carry-state\n\n";
+
+    output << "[operation]\n";
+    output << "name=burst\n";
+    output << "class=elementwise_map\n";
+    output << "extents=2048\n";
+    output << "input_bytes=" << tensor_bytes << "\n";
+    output << "output_bytes=" << tensor_bytes << "\n";
+    output << "estimated_flops=4096\n";
+    output << "parallelizable=true\n";
+    output << "streaming_friendly=true\n";
+    output << "inputs=input-burst\n";
+    output << "outputs=burst-state\n\n";
+
+    output << "[operation]\n";
+    output << "name=merge\n";
+    output << "class=elementwise_map\n";
+    output << "extents=2048\n";
+    output << "input_bytes=" << (tensor_bytes * 2ull) << "\n";
+    output << "output_bytes=" << tensor_bytes << "\n";
+    output << "estimated_flops=4096\n";
+    output << "parallelizable=true\n";
+    output << "streaming_friendly=true\n";
+    output << "inputs=carry-state,burst-state\n";
+    output << "outputs=merged\n\n";
+
+    output << "[operation]\n";
+    output << "name=score\n";
+    output << "class=reduction\n";
+    output << "extents=2048\n";
+    output << "input_bytes=" << tensor_bytes << "\n";
+    output << "output_bytes=4\n";
+    output << "estimated_flops=2048\n";
+    output << "parallelizable=true\n";
+    output << "reduction_like=true\n";
+    output << "inputs=merged\n";
     output << "outputs=score-out\n";
 }
 
@@ -387,6 +617,8 @@ int main() {
         const auto runtime_manifest_path = unique_temp_file("runtime-product-runtime", ".workload");
         const auto blocked_manifest_path = unique_temp_file("runtime-product-blocked", ".workload");
         const auto missing_asset_manifest_path = unique_temp_file("runtime-product-missing-asset", ".workload");
+        const auto allocator_manifest_path = unique_temp_file("runtime-product-allocator", ".workload");
+        const auto spill_reload_manifest_path = unique_temp_file("runtime-product-spill-reload", ".workload");
         const auto spatial_manifest_path = unique_temp_file("runtime-product-spatial", ".workload");
         const auto matmul_manifest_path = unique_temp_file("runtime-product-matmul", ".workload");
         const auto weight_asset_path = unique_temp_file("runtime-product-weights", ".bin");
@@ -405,6 +637,8 @@ int main() {
         write_manifest(runtime_manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, false);
         write_manifest(blocked_manifest_path, 1ull << 50u, 4ull * 1024ull * 1024ull * 1024ull, true);
         write_manifest(missing_asset_manifest_path, 8ull * 1024ull * 1024ull, 16ull * 1024ull, true, missing_weight_asset_path);
+        write_allocator_manifest(allocator_manifest_path, 8ull * 1024ull);
+        write_spill_reload_manifest(spill_reload_manifest_path, 12ull * 1024ull * 1024ull);
         write_spatial_manifest(spatial_manifest_path, weight_asset_path);
         write_matmul_manifest(matmul_manifest_path, weight_asset_path);
 
@@ -495,6 +729,33 @@ int main() {
             std::cerr << "managed execute did not index residency sequence metadata\n";
             return 1;
         }
+        if (manifest_managed.tensor_allocator.events.empty() ||
+            manifest_managed.tensor_allocator.indexed_tensors.empty() ||
+            manifest_managed.tensor_allocator.indexed_devices.empty() ||
+            manifest_managed.tensor_allocator.indexed_operations.empty() ||
+            manifest_managed.tensor_allocator.peak_live_bytes == 0u ||
+            manifest_managed.tensor_allocator.peak_reserved_bytes < manifest_managed.tensor_allocator.peak_live_bytes) {
+            std::cerr << "managed execute did not materialize tensor allocator state\n";
+            return 1;
+        }
+        if (manifest_managed.backend_buffer_bindings.entries.empty()) {
+            std::cerr << "managed execute did not summarize backend buffer bindings\n";
+            return 1;
+        }
+        const auto managed_host_buffer_binding = std::find_if(
+            manifest_managed.backend_buffer_bindings.entries.begin(),
+            manifest_managed.backend_buffer_bindings.entries.end(),
+            [](const jakal::BackendBufferBindingEntry& entry) {
+                return entry.backend_name == "host-native";
+            });
+        if (managed_host_buffer_binding == manifest_managed.backend_buffer_bindings.entries.end() ||
+            managed_host_buffer_binding->ownership_scope != "host-shared" ||
+            managed_host_buffer_binding->planned_peak_bytes == 0u ||
+            managed_host_buffer_binding->reserved_bytes == 0u ||
+            managed_host_buffer_binding->pool_id.empty()) {
+            std::cerr << "managed execute emitted invalid host buffer binding summary\n";
+            return 1;
+        }
         for (const auto& action : manifest_managed.residency_sequence.actions) {
             if (action.tensor_index >= manifest_managed.residency_sequence.indexed_tensors.size() ||
                 manifest_managed.residency_sequence.indexed_tensors[action.tensor_index] != action.tensor_id ||
@@ -504,6 +765,18 @@ int main() {
                 manifest_managed.residency_sequence.indexed_operations[action.operation_index] !=
                     action.trigger_operation_name) {
                 std::cerr << "managed execute emitted invalid residency action indices\n";
+                return 1;
+            }
+        }
+        for (const auto& event : manifest_managed.tensor_allocator.events) {
+            if (event.tensor_index >= manifest_managed.tensor_allocator.indexed_tensors.size() ||
+                manifest_managed.tensor_allocator.indexed_tensors[event.tensor_index] != event.tensor_id ||
+                event.device_index >= manifest_managed.tensor_allocator.indexed_devices.size() ||
+                manifest_managed.tensor_allocator.indexed_devices[event.device_index] != event.device_uid ||
+                event.operation_index >= manifest_managed.tensor_allocator.indexed_operations.size() ||
+                manifest_managed.tensor_allocator.indexed_operations[event.operation_index] !=
+                    event.trigger_operation_name) {
+                std::cerr << "managed execute emitted invalid tensor allocator indices\n";
                 return 1;
             }
         }
@@ -553,6 +826,27 @@ int main() {
             std::cerr << "blocked managed path did not index residency metadata\n";
             return 1;
         }
+        if (blocked.tensor_allocator.events.empty() || blocked.tensor_allocator.peak_live_bytes == 0u) {
+            std::cerr << "blocked managed path did not materialize tensor allocator state\n";
+            return 1;
+        }
+        if (blocked.backend_buffer_bindings.entries.empty()) {
+            std::cerr << "blocked managed path did not summarize backend buffer bindings\n";
+            return 1;
+        }
+        if (!blocked.spill_artifacts.entries.empty()) {
+            const auto blocked_spill_artifact = std::find_if(
+                blocked.spill_artifacts.entries.begin(),
+                blocked.spill_artifacts.entries.end(),
+                [](const jakal::SpillArtifactEntry& entry) {
+                    return entry.kind == jakal::ResidencyActionKind::spill && entry.exists_on_disk;
+                });
+            if (blocked_spill_artifact == blocked.spill_artifacts.entries.end() ||
+                !std::filesystem::exists(blocked_spill_artifact->path)) {
+                std::cerr << "blocked managed path emitted invalid spill artifact state\n";
+                return 1;
+            }
+        }
         if (blocked.memory_preflight.predicted_spill_bytes != blocked.residency_sequence.spill_bytes ||
             blocked.memory_preflight.predicted_reload_bytes != blocked.residency_sequence.reload_bytes ||
             blocked.memory_preflight.forced_spill_count != blocked.residency_sequence.forced_spill_count) {
@@ -573,6 +867,74 @@ int main() {
         const auto spatial = runtime.execute_manifest(spatial_manifest_path);
         if (!spatial.executed) {
             std::cerr << "spatial manifest did not execute\n";
+            return 1;
+        }
+        const auto allocator_managed = runtime.execute_manifest(allocator_manifest_path);
+        if (!allocator_managed.executed || allocator_managed.tensor_allocator.reuse_count == 0u) {
+            std::cerr << "allocator manifest did not reuse released tensor blocks\n";
+            return 1;
+        }
+        const auto released_block = std::find_if(
+            allocator_managed.tensor_allocator.events.begin(),
+            allocator_managed.tensor_allocator.events.end(),
+            [](const jakal::TensorAllocationEvent& event) {
+                return event.kind == jakal::TensorAllocationEventKind::release && event.bytes == 8ull * 1024ull;
+            });
+        if (released_block == allocator_managed.tensor_allocator.events.end()) {
+            std::cerr << "allocator manifest did not release any intermediate tensor block\n";
+            return 1;
+        }
+        const auto reused_block = std::find_if(
+            std::next(released_block),
+            allocator_managed.tensor_allocator.events.end(),
+            [&](const jakal::TensorAllocationEvent& event) {
+                return event.kind == jakal::TensorAllocationEventKind::reuse &&
+                       event.block_id == released_block->block_id &&
+                       event.offset_bytes == released_block->offset_bytes;
+            });
+        if (reused_block == allocator_managed.tensor_allocator.events.end()) {
+            std::cerr << "allocator manifest did not reuse the released tensor block\n";
+            return 1;
+        }
+        jakal::RuntimeOptions spill_reload_options = options;
+        spill_reload_options.product.memory.max_pressure_ratio = 0.001;
+        spill_reload_options.product.memory.enforce_preflight = true;
+        spill_reload_options.product.observability.telemetry_path = unique_temp_file("runtime-product-spill-reload", ".telemetry.tsv");
+        jakal::Runtime spill_reload_runtime(spill_reload_options);
+        const auto spill_reload_managed = spill_reload_runtime.execute_manifest(spill_reload_manifest_path);
+        if (spill_reload_managed.executed || !spill_reload_managed.safety.blocked_by_memory ||
+            spill_reload_managed.spill_artifacts.entries.empty()) {
+            std::cerr << "spill/reload manifest did not produce spill artifacts on blocked path\n";
+            return 1;
+        }
+        const auto spill_it = std::find_if(
+            spill_reload_managed.spill_artifacts.entries.begin(),
+            spill_reload_managed.spill_artifacts.entries.end(),
+            [](const jakal::SpillArtifactEntry& entry) {
+                return entry.kind == jakal::ResidencyActionKind::spill && entry.exists_on_disk;
+            });
+        const auto reload_it = std::find_if(
+            spill_reload_managed.spill_artifacts.entries.begin(),
+            spill_reload_managed.spill_artifacts.entries.end(),
+            [](const jakal::SpillArtifactEntry& entry) {
+                return entry.kind == jakal::ResidencyActionKind::reload && entry.exists_on_disk;
+            });
+        if (spill_it == spill_reload_managed.spill_artifacts.entries.end() ||
+            reload_it == spill_reload_managed.spill_artifacts.entries.end() ||
+            spill_it->path != reload_it->path) {
+            std::cerr << "spill/reload manifest did not bind reload to spill artifact path\n";
+            return 1;
+        }
+        const auto spill_binding_it = std::find_if(
+            spill_reload_managed.backend_buffer_bindings.entries.begin(),
+            spill_reload_managed.backend_buffer_bindings.entries.end(),
+            [](const jakal::BackendBufferBindingEntry& entry) {
+                return entry.uses_runtime_spill_artifacts;
+            });
+        if (spill_binding_it == spill_reload_managed.backend_buffer_bindings.entries.end() ||
+            spill_binding_it->materialized_spill_bytes == 0u ||
+            spill_binding_it->materialized_reload_bytes == 0u) {
+            std::cerr << "spill/reload manifest did not surface runtime spill ownership in buffer bindings\n";
             return 1;
         }
         if (spatial.asset_prefetch.total_layout_cache_bytes == 0u) {
@@ -637,6 +999,47 @@ int main() {
             return 1;
         }
 
+        const auto host_graph_it = std::find_if(
+            runtime.devices().begin(),
+            runtime.devices().end(),
+            [](const jakal::HardwareGraph& graph) {
+                return graph.probe == "host";
+            });
+        if (host_graph_it == runtime.devices().end()) {
+            std::cerr << "runtime product missing host graph for tier1 validation\n";
+            return 1;
+        }
+        const auto tier1_graphs = std::vector<jakal::HardwareGraph>{*host_graph_it, make_synthetic_level_zero_graph()};
+        jakal::ExecutionPlan tier1_plan;
+        tier1_plan.signature = "runtime-product-tier1-l0";
+        tier1_plan.allocations.push_back({tier1_graphs.back(), 1.0, 2.0});
+        const auto tier1_manifest = jakal::load_workload_manifest(matmul_manifest_path);
+        const auto tier1_cache_path = unique_temp_file("runtime-product-tier1", ".tsv");
+        jakal::ExecutionOptimizer tier1_optimizer(tier1_cache_path);
+        const auto tier1_optimization = tier1_optimizer.optimize(
+            tier1_manifest.workload,
+            tier1_plan,
+            tier1_graphs,
+            &tier1_manifest.graph);
+        jakal::JakalToolkit tier1_toolkit;
+        const auto tier1_index = tier1_toolkit.build_index(tier1_graphs);
+        jakal::DirectExecutor tier1_executor;
+        const auto tier1_cold = tier1_executor.execute(tier1_optimization, tier1_graphs, tier1_index);
+        const auto tier1_warm = tier1_executor.execute(tier1_optimization, tier1_graphs, tier1_index);
+        if (!tier1_cold.all_succeeded || !tier1_warm.all_succeeded) {
+            std::cerr << "tier1 direct execution did not succeed across repeated runs\n";
+            return 1;
+        }
+        if (tier1_warm.total_runtime_us > tier1_cold.total_runtime_us * 1.05 &&
+            tier1_warm.total_persistent_resource_reuse_hits == 0u) {
+            std::cerr << "tier1 direct execution did not retain warm backend state\n";
+            return 1;
+        }
+        std::error_code tier1_ec;
+        std::filesystem::remove(tier1_cache_path, tier1_ec);
+        std::filesystem::remove(tier1_cache_path.string() + ".perf", tier1_ec);
+        std::filesystem::remove(tier1_cache_path.string() + ".perf.family", tier1_ec);
+
         std::ifstream telemetry(manifest_managed.telemetry_path);
         std::string telemetry_header;
         std::string telemetry_row;
@@ -650,6 +1053,18 @@ int main() {
             telemetry_header.find("overlapped_transfer_us") == std::string::npos ||
             telemetry_header.find("transfer_overlap_ratio") == std::string::npos ||
             telemetry_header.find("optimizer_budget_ms") == std::string::npos ||
+            telemetry_header.find("allocator_peak_live_bytes") == std::string::npos ||
+            telemetry_header.find("allocator_peak_reserved_bytes") == std::string::npos ||
+            telemetry_header.find("allocator_reuse_count") == std::string::npos ||
+            telemetry_header.find("spill_artifact_bytes") == std::string::npos ||
+            telemetry_header.find("reload_artifact_bytes") == std::string::npos ||
+            telemetry_header.find("backend_owned_peak_bytes") == std::string::npos ||
+            telemetry_header.find("backend_resource_reuse_hits") == std::string::npos ||
+            telemetry_header.find("executed_h2d_bytes") == std::string::npos ||
+            telemetry_header.find("executed_d2h_bytes") == std::string::npos ||
+            telemetry_header.find("executed_spill_bytes") == std::string::npos ||
+            telemetry_header.find("executed_reload_bytes") == std::string::npos ||
+            telemetry_header.find("executed_transfer_us") == std::string::npos ||
             telemetry_header.find("budget_exhausted") == std::string::npos ||
             telemetry_row.empty()) {
             std::cerr << "runtime telemetry missing transfer overlap columns\n";
@@ -721,21 +1136,32 @@ int main() {
         std::filesystem::remove(runtime_manifest_path, ec);
         std::filesystem::remove(blocked_manifest_path, ec);
         std::filesystem::remove(missing_asset_manifest_path, ec);
+        std::filesystem::remove(allocator_manifest_path, ec);
+        std::filesystem::remove(spill_reload_manifest_path, ec);
         std::filesystem::remove(spatial_manifest_path, ec);
         std::filesystem::remove(matmul_manifest_path, ec);
         std::filesystem::remove(weight_asset_path, ec);
+        std::filesystem::remove(missing_weight_asset_path, ec);
         std::filesystem::remove(cache_path, ec);
         std::filesystem::remove(execution_cache_path, ec);
         std::filesystem::remove(execution_cache_path.string() + ".perf", ec);
         std::filesystem::remove(execution_cache_path.string() + ".perf.family", ec);
         const auto packed_root = cache_path.parent_path() / (cache_path.stem().string() + "-packed-layouts");
+        const auto spill_root = runtime.install_paths().cache_dir / "spill-artifacts";
         std::filesystem::remove_all(packed_root, ec);
+        std::filesystem::remove_all(spill_root, ec);
         std::filesystem::remove(manifest_managed.telemetry_path, ec);
         std::filesystem::remove(telemetry_budget_cache_path(manifest_managed.telemetry_path), ec);
         std::filesystem::remove(telemetry_budget_delta_path(manifest_managed.telemetry_path), ec);
         std::filesystem::remove(runtime_managed.telemetry_path, ec);
         std::filesystem::remove(telemetry_budget_cache_path(runtime_managed.telemetry_path), ec);
         std::filesystem::remove(telemetry_budget_delta_path(runtime_managed.telemetry_path), ec);
+        std::filesystem::remove(allocator_managed.telemetry_path, ec);
+        std::filesystem::remove(telemetry_budget_cache_path(allocator_managed.telemetry_path), ec);
+        std::filesystem::remove(telemetry_budget_delta_path(allocator_managed.telemetry_path), ec);
+        std::filesystem::remove(spill_reload_managed.telemetry_path, ec);
+        std::filesystem::remove(telemetry_budget_cache_path(spill_reload_managed.telemetry_path), ec);
+        std::filesystem::remove(telemetry_budget_delta_path(spill_reload_managed.telemetry_path), ec);
         std::filesystem::remove(adaptive_telemetry_path, ec);
         std::filesystem::remove(telemetry_budget_cache_path(adaptive_telemetry_path), ec);
         std::filesystem::remove(telemetry_budget_delta_path(adaptive_telemetry_path), ec);

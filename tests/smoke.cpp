@@ -1,4 +1,3 @@
-#include "jakal/c_api.h"
 #include "jakal/device.hpp"
 #include "jakal/runtime.hpp"
 #include "jakal/workloads.hpp"
@@ -217,61 +216,6 @@ int main() {
         }
         return 1;
     }
-
-    jakal_core_runtime_t* c_runtime = jakal_core_runtime_create();
-    if (c_runtime == nullptr) {
-        std::cerr << "Failed to create C runtime.\n";
-        return 1;
-    }
-
-    const jakal_core_workload_spec c_workload{
-        "llm-prefill-context-lite",
-        "inference",
-        "llm-prefill-context-lite",
-        "prefill",
-        "b1",
-        896ull * 1024ull * 1024ull,
-        48ull * 1024ull,
-        2.8e11,
-        1,
-        0,
-        0,
-        1};
-
-    jakal_core_optimization_info optimization_info{};
-    jakal_core_operation_optimization_info optimization_ops[8]{};
-    size_t optimization_count = 0;
-    if (jakal_core_runtime_optimize(
-            c_runtime,
-            &c_workload,
-            &optimization_info,
-            optimization_ops,
-            std::size(optimization_ops),
-            &optimization_count) != 0 ||
-        optimization_count == 0) {
-        std::cerr << "C API optimize failed.\n";
-        jakal_core_runtime_destroy(c_runtime);
-        return 1;
-    }
-
-    jakal_core_execution_info execution_info{};
-    jakal_core_execution_operation_info execution_ops[8]{};
-    size_t execution_count = 0;
-    if (jakal_core_runtime_execute(
-            c_runtime,
-            &c_workload,
-            &execution_info,
-            execution_ops,
-            std::size(execution_ops),
-            &execution_count) != 0 ||
-        execution_count == 0 ||
-        execution_info.all_succeeded == 0) {
-        std::cerr << "C API execute failed.\n";
-        jakal_core_runtime_destroy(c_runtime);
-        return 1;
-    }
-
-    jakal_core_runtime_destroy(c_runtime);
 
     std::cout << "Graphs=" << runtime.devices().size()
               << " allocations=" << plan.allocations.size()

@@ -22,6 +22,7 @@ The workflow will:
 
 - build the ZIP package
 - build the NSIS installer
+- run a packaged-layout smoke test against the generated ZIP
 - generate `.sha256` sidecars for both assets
 - create a draft GitHub release with generated release notes
 

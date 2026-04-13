@@ -671,6 +671,13 @@ protected:
         std::string revision;
         std::uint32_t hits = 0;
         std::uint64_t last_used = 0;
+        std::uint64_t reserved_bytes = 0;
+    };
+
+    struct ResourceCacheSnapshot {
+        std::string pool_id;
+        std::uint32_t reuse_hits = 0;
+        std::uint64_t reserved_bytes = 0;
     };
 
     [[nodiscard]] BackendRunResult failure(std::string error) const { BackendRunResult result; result.error = std::move(error); return result; }
@@ -701,11 +708,12 @@ protected:
         return reuse_hits;
     }
 
-    [[nodiscard]] std::uint32_t record_persistent_resource_reuse(
+    [[nodiscard]] ResourceCacheSnapshot touch_persistent_resource_pool(
         const HardwareGraph& graph,
-        const std::string_view resource_tag) const {
+        const std::string_view resource_tag,
+        const std::uint64_t reserved_bytes) const {
         if (resource_tag.empty()) {
-            return 0u;
+            return {};
         }
         const std::string key = graph.uid + "|resource|" + std::string(resource_tag);
         const auto revision = structural_fingerprint(graph);
@@ -715,6 +723,7 @@ protected:
             entry = ResourceCacheEntry{revision};
         }
         entry.last_used = ++persistent_resource_tick_;
+        entry.reserved_bytes = std::max(entry.reserved_bytes, reserved_bytes);
         const auto reuse_hits = entry.hits;
         ++entry.hits;
         if (persistent_resource_cache_.size() > kMaxPersistentResourceEntries) {
@@ -728,7 +737,7 @@ protected:
                 persistent_resource_cache_.erase(oldest);
             }
         }
-        return reuse_hits;
+        return ResourceCacheSnapshot{key, reuse_hits, entry.reserved_bytes};
     }
 
     [[nodiscard]] std::uint32_t preferred_stream_groups(
@@ -797,7 +806,11 @@ protected:
             result.synchronize_runtime_us = std::max(0.0, result.runtime_us - result.submit_runtime_us);
         }
         const auto reuse_hits = record_persistent_dispatch_reuse(graph, kernel_tag);
-        const auto resource_hits = record_persistent_resource_reuse(graph, resource_tag);
+        const auto resource_snapshot = touch_persistent_resource_pool(
+            graph,
+            resource_tag,
+            static_cast<std::uint64_t>(input_bytes + output_bytes));
+        const auto resource_hits = resource_snapshot.reuse_hits;
         const auto stream_groups =
             preferred_stream_groups(graph, kernel_tag, input_bytes, output_bytes);
         const double overlap_hint = preferred_overlap_with_policy(
@@ -851,6 +864,41 @@ protected:
                 ? std::clamp(0.24 + (0.08 * static_cast<double>(stream_groups - 1u)) + result.copy_overlap_ratio, 0.0, 1.0)
                 : 0.0;
         result.persistent_resource_reuse_hits = resource_hits;
+        if (!resource_snapshot.pool_id.empty()) {
+            result.buffer_pool_bindings.push_back(BackendBufferPoolBinding{
+                graph.uid,
+                name(),
+                resource_snapshot.pool_id,
+                std::string(resource_tag),
+                resource_snapshot.reserved_bytes,
+                resource_snapshot.reuse_hits});
+        }
+        if (input_bytes > 0u) {
+            const auto copy_in_us =
+                result.copy_runtime_us * (static_cast<double>(input_bytes) / static_cast<double>(std::max<std::size_t>(input_bytes + output_bytes, 1u)));
+            result.transfer_records.push_back(TransferExecutionRecord{
+                graph.uid,
+                name(),
+                "h2d",
+                resource_snapshot.pool_id,
+                std::string(resource_tag),
+                static_cast<std::uint64_t>(input_bytes),
+                copy_in_us,
+                resource_snapshot.reuse_hits});
+        }
+        if (output_bytes > 0u) {
+            const auto copy_out_us =
+                result.copy_runtime_us * (static_cast<double>(output_bytes) / static_cast<double>(std::max<std::size_t>(input_bytes + output_bytes, 1u)));
+            result.transfer_records.push_back(TransferExecutionRecord{
+                graph.uid,
+                name(),
+                "d2h",
+                resource_snapshot.pool_id,
+                std::string(resource_tag),
+                static_cast<std::uint64_t>(output_bytes),
+                copy_out_us,
+                resource_snapshot.reuse_hits});
+        }
         result.runtime_us = result.submit_runtime_us + result.synchronize_runtime_us;
         return result;
     }

@@ -1041,6 +1041,13 @@ private:
         std::string revision;
         std::uint32_t hits = 0;
         std::uint64_t last_used = 0;
+        std::uint64_t reserved_bytes = 0;
+    };
+
+    struct ResourceCacheSnapshot {
+        std::string pool_id;
+        std::uint32_t reuse_hits = 0;
+        std::uint64_t reserved_bytes = 0;
     };
 
     [[nodiscard]] std::uint32_t record_persistent_dispatch_reuse(
@@ -1070,11 +1077,12 @@ private:
         return reuse_hits;
     }
 
-    [[nodiscard]] std::uint32_t record_persistent_resource_reuse(
+    [[nodiscard]] ResourceCacheSnapshot touch_persistent_resource_pool(
         const HardwareGraph& graph,
-        const std::string_view resource_tag) const {
+        const std::string_view resource_tag,
+        const std::uint64_t reserved_bytes) const {
         if (resource_tag.empty()) {
-            return 0u;
+            return {};
         }
         const std::string key = graph.uid + "|resource|" + std::string(resource_tag);
         const auto revision = structural_fingerprint(graph);
@@ -1084,6 +1092,7 @@ private:
             entry = ResourceCacheEntry{revision};
         }
         entry.last_used = ++resource_cache_tick_;
+        entry.reserved_bytes = std::max(entry.reserved_bytes, reserved_bytes);
         const auto reuse_hits = entry.hits;
         ++entry.hits;
         if (persistent_resource_cache_.size() > kMaxPersistentResourceEntries) {
@@ -1097,7 +1106,7 @@ private:
                 persistent_resource_cache_.erase(oldest);
             }
         }
-        return reuse_hits;
+        return ResourceCacheSnapshot{key, reuse_hits, entry.reserved_bytes};
     }
 
     BackendRunResult finalize(
@@ -1115,7 +1124,11 @@ private:
         result.used_host = false;
         result.used_opencl = false;
         const auto reuse_hits = record_persistent_dispatch_reuse(graph, op_class);
-        const auto resource_hits = record_persistent_resource_reuse(graph, resource_tag);
+        const auto resource_snapshot = touch_persistent_resource_pool(
+            graph,
+            resource_tag,
+            static_cast<std::uint64_t>(input_bytes + output_bytes));
+        const auto resource_hits = resource_snapshot.reuse_hits;
         const double warm_submit_scale = reuse_hits == 0u ? 1.0 : std::max(0.55, 0.84 - (0.08 * reuse_hits));
         const double warm_compute_scale = reuse_hits == 0u ? 1.0 : std::max(0.90, 0.98 - (0.02 * reuse_hits));
         const double resource_submit_scale =
@@ -1147,6 +1160,41 @@ private:
             result.compute_runtime_us + (result.copy_runtime_us * (1.0 - result.copy_overlap_ratio));
         result.runtime_us = result.submit_runtime_us + result.synchronize_runtime_us;
         result.persistent_resource_reuse_hits = resource_hits;
+        if (!resource_snapshot.pool_id.empty()) {
+            result.buffer_pool_bindings.push_back(BackendBufferPoolBinding{
+                graph.uid,
+                name(),
+                resource_snapshot.pool_id,
+                std::string(resource_tag),
+                resource_snapshot.reserved_bytes,
+                resource_snapshot.reuse_hits});
+        }
+        if (input_bytes > 0u) {
+            const auto copy_in_us =
+                result.copy_runtime_us * (static_cast<double>(input_bytes) / static_cast<double>(std::max<std::size_t>(input_bytes + output_bytes, 1u)));
+            result.transfer_records.push_back(TransferExecutionRecord{
+                graph.uid,
+                name(),
+                "h2d",
+                resource_snapshot.pool_id,
+                std::string(resource_tag),
+                static_cast<std::uint64_t>(input_bytes),
+                copy_in_us,
+                resource_snapshot.reuse_hits});
+        }
+        if (output_bytes > 0u) {
+            const auto copy_out_us =
+                result.copy_runtime_us * (static_cast<double>(output_bytes) / static_cast<double>(std::max<std::size_t>(input_bytes + output_bytes, 1u)));
+            result.transfer_records.push_back(TransferExecutionRecord{
+                graph.uid,
+                name(),
+                "d2h",
+                resource_snapshot.pool_id,
+                std::string(resource_tag),
+                static_cast<std::uint64_t>(output_bytes),
+                copy_out_us,
+                resource_snapshot.reuse_hits});
+        }
         result.async_dispatch_capable = supports_async_dispatch(graph);
         result.success = true;
         return result;

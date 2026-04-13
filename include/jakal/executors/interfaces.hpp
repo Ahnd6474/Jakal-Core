@@ -36,6 +36,26 @@ struct OperationData {
     std::string gpu_rhs_layout = "native";
 };
 
+struct BackendBufferPoolBinding {
+    std::string device_uid;
+    std::string backend_name;
+    std::string pool_id;
+    std::string resource_tag;
+    std::uint64_t reserved_bytes = 0;
+    std::uint32_t reuse_hits = 0;
+};
+
+struct TransferExecutionRecord {
+    std::string device_uid;
+    std::string backend_name;
+    std::string movement_kind;
+    std::string pool_id;
+    std::string resource_tag;
+    std::uint64_t bytes = 0;
+    double runtime_us = 0.0;
+    std::uint32_t reuse_hits = 0;
+};
+
 struct BackendRunResult {
     std::vector<float> output;
     double scalar_output = 0.0;
@@ -50,6 +70,8 @@ struct BackendRunResult {
     std::uint32_t copy_queue_count = 0;
     std::uint32_t compute_queue_count = 0;
     std::uint32_t event_wait_count = 0;
+    std::vector<BackendBufferPoolBinding> buffer_pool_bindings;
+    std::vector<TransferExecutionRecord> transfer_records;
     bool success = false;
     bool used_host = true;
     bool used_opencl = false;

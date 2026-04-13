@@ -255,19 +255,18 @@ This is where the repository stands today:
 - Discovery can use host, OpenCL, Level Zero, Vulkan, CUDA, and ROCm probes when the matching runtime libraries are present.
 - Planning and optimization work across those discovered graphs.
 - The direct executor can run host kernels, OpenCL kernels, Vulkan direct kernels, and some native Level Zero, CUDA, and ROCm kernels.
-- The managed execution layer can run native workload manifests, do memory preflight checks, emit residency and asset-prefetch plans, and write TSV telemetry.
+- The managed execution layer can run native workload manifests, do memory preflight checks, materialize residency and tensor-allocation traces, summarize backend buffer ownership and persistent resource reuse, correlate executed residency movement with direct-execution transfers, emit asset-prefetch plans, and write TSV telemetry.
 - `load_workload_source(...)` can build workload graphs from native manifests and imported model descriptions such as ONNX and GGUF.
-- `jakal_runtime` exposes the runtime through a smaller C ABI, and `jakal_core_cli` exposes install-path and backend-health diagnostics for packaged runtime scenarios.
+- `jakal_runtime` exposes the runtime through a smaller C ABI, including managed-execution buffer-binding and residency-movement summaries after manifest execution, and `jakal_core_cli` exposes install-path and backend-health diagnostics for packaged runtime scenarios.
 - The Python helpers under [`python/`](./python/) wrap the C ABI for lightweight `doctor`, `paths`, `optimize-smoke`, and `run-manifest` flows.
 
 Known gaps in the current tree:
 
-- `jakal_workload_import_adapters` is currently failing on the ONNX external-data asset-prefetch path, so imported ONNX coverage is broad but not fully regression-free yet.
 - The repository contains packaging and installer flows, but they are still documented and tested as source-first/developer flows rather than a finished production runtime release train.
 
 What is still missing:
 
-- real tensor allocators and residency movement beyond the current planning and diagnostics layer
+- backend-owned tensor allocators and residency movement beyond the current runtime-local allocation, spill-artifact, and backend buffer-binding diagnostics layer
 - framework bridges for PyTorch, TensorFlow, or similar runtimes beyond the small export helper in `scripts/`
 - fully validated production packaging, update, and silent-install flows across clean machines
 - a stable production execution stack with mature native backend coverage across every supported accelerator path

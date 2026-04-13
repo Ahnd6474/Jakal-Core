@@ -11,6 +11,22 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Resolve-ArtifactHelperPath {
+    $candidates = @(
+        (Join-Path $PSScriptRoot "sign-and-verify-artifact.ps1"),
+        (Join-Path $PSScriptRoot "..\\update\\sign-and-verify-artifact.ps1")
+    )
+
+    foreach ($candidate in $candidates) {
+        $resolved = Resolve-Path -Path $candidate -ErrorAction SilentlyContinue
+        if ($null -ne $resolved) {
+            return $resolved.Path
+        }
+    }
+
+    throw "Artifact signing helper not found next to packaging script."
+}
+
 if ([string]::IsNullOrWhiteSpace($MakensisPath)) {
     $candidate = Join-Path $PSScriptRoot "..\tools\nsis\portable\nsis-3.11\makensis.exe"
     $resolvedCandidate = Resolve-Path -Path $candidate -ErrorAction SilentlyContinue
@@ -29,7 +45,7 @@ $buildRoot = Resolve-Path -Path $BuildDir -ErrorAction Stop
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path $buildRoot.Path "dist-nsis"
 }
-$artifactScript = Join-Path $PSScriptRoot "sign-and-verify-artifact.ps1"
+$artifactScript = Resolve-ArtifactHelperPath
 
 $env:NSISDIR = $nsisRoot
 $env:Path = "$nsisRoot;$nsisRoot\Bin;$env:Path"
@@ -61,10 +77,6 @@ if ($LASTEXITCODE -ne 0) {
 & cpack --config (Join-Path $buildRoot.Path "CPackConfig.cmake") -G NSIS -B $OutputDir
 if ($LASTEXITCODE -ne 0) {
     throw "CPack NSIS generation failed."
-}
-
-if (-not (Test-Path -Path $artifactScript)) {
-    throw "Artifact signing helper not found: $artifactScript"
 }
 
 $packagedArtifacts = @(

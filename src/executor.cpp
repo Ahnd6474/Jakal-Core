@@ -1004,6 +1004,7 @@ private:
             cl_mem memory = nullptr;
             size_t capacity = 0;
             cl_mem_flags flags = 0;
+            std::uint32_t hits = 0;
         };
         cl_context context = nullptr;
         cl_command_queue queue = nullptr;
@@ -1169,9 +1170,18 @@ private:
         const std::shared_ptr<DeviceContext>& context,
         const std::string& key,
         const cl_mem_flags flags,
-        const size_t bytes) const {
+        const size_t bytes,
+        std::uint32_t* reuse_hits = nullptr,
+        std::uint64_t* reserved_bytes = nullptr) const {
         auto& entry = context->buffers[key];
         if (entry.memory != nullptr && entry.capacity >= bytes && entry.flags == flags) {
+            if (reuse_hits != nullptr) {
+                *reuse_hits = entry.hits;
+            }
+            if (reserved_bytes != nullptr) {
+                *reserved_bytes = static_cast<std::uint64_t>(entry.capacity);
+            }
+            ++entry.hits;
             return entry.memory;
         }
 
@@ -1179,6 +1189,7 @@ private:
             api_.release_mem_object()(entry.memory);
             entry.memory = nullptr;
             entry.capacity = 0;
+            entry.hits = 0;
         }
 
         entry.memory = create_buffer_or_null(context, flags, bytes);
@@ -1187,6 +1198,13 @@ private:
         }
         entry.capacity = bytes;
         entry.flags = flags;
+        entry.hits = 1u;
+        if (reuse_hits != nullptr) {
+            *reuse_hits = 0u;
+        }
+        if (reserved_bytes != nullptr) {
+            *reserved_bytes = static_cast<std::uint64_t>(entry.capacity);
+        }
         return entry.memory;
     }
 
@@ -1222,6 +1240,41 @@ private:
                    nullptr) == CL_SUCCESS;
     }
 
+    void append_buffer_binding(
+        BackendRunResult& result,
+        const HardwareGraph& graph,
+        const std::string& key,
+        const std::uint64_t reserved_bytes,
+        const std::uint32_t reuse_hits) const {
+        result.buffer_pool_bindings.push_back(executors::BackendBufferPoolBinding{
+            graph.uid,
+            "opencl-direct",
+            graph.uid + "|opencl-buffer|" + key,
+            key,
+            reserved_bytes,
+            reuse_hits});
+        result.persistent_resource_reuse_hits += reuse_hits;
+    }
+
+    void append_transfer(
+        BackendRunResult& result,
+        const HardwareGraph& graph,
+        const std::string& key,
+        const char* movement_kind,
+        const std::uint64_t bytes,
+        const double runtime_us,
+        const std::uint32_t reuse_hits) const {
+        result.transfer_records.push_back(executors::TransferExecutionRecord{
+            graph.uid,
+            "opencl-direct",
+            movement_kind,
+            graph.uid + "|opencl-buffer|" + key,
+            key,
+            bytes,
+            runtime_us,
+            reuse_hits});
+    }
+
     BackendRunResult failure(std::string message) const {
         BackendRunResult result;
         result.error = std::move(message);
@@ -1255,9 +1308,21 @@ public:
                 return;
             }
 
-            cl_mem lhs_buffer = acquire_buffer(context, "elementwise.lhs", CL_MEM_READ_ONLY, lhs.size_bytes());
-            cl_mem rhs_buffer = acquire_buffer(context, "elementwise.rhs", CL_MEM_READ_ONLY, rhs.size_bytes());
-            cl_mem out_buffer = acquire_buffer(context, "elementwise.out", CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
+            std::uint32_t lhs_hits = 0u;
+            std::uint32_t rhs_hits = 0u;
+            std::uint32_t out_hits = 0u;
+            std::uint64_t lhs_reserved = 0u;
+            std::uint64_t rhs_reserved = 0u;
+            std::uint64_t out_reserved = 0u;
+            cl_mem lhs_buffer = acquire_buffer(context, "elementwise.lhs", CL_MEM_READ_ONLY, lhs.size_bytes(), &lhs_hits, &lhs_reserved);
+            cl_mem rhs_buffer = acquire_buffer(context, "elementwise.rhs", CL_MEM_READ_ONLY, rhs.size_bytes(), &rhs_hits, &rhs_reserved);
+            cl_mem out_buffer = acquire_buffer(
+                context,
+                "elementwise.out",
+                CL_MEM_WRITE_ONLY,
+                result.output.size() * sizeof(float),
+                &out_hits,
+                &out_reserved);
             if (lhs_buffer == nullptr || rhs_buffer == nullptr || out_buffer == nullptr) {
                 return;
             }
@@ -1280,6 +1345,19 @@ public:
             if (!read_buffer(context, out_buffer, std::span<float>(result.output))) {
                 return;
             }
+            append_buffer_binding(result, graph, "elementwise.lhs", lhs_reserved, lhs_hits);
+            append_buffer_binding(result, graph, "elementwise.rhs", rhs_reserved, rhs_hits);
+            append_buffer_binding(result, graph, "elementwise.out", out_reserved, out_hits);
+            append_transfer(result, graph, "elementwise.lhs", "h2d", static_cast<std::uint64_t>(lhs.size_bytes()), result.runtime_us * 0.25, lhs_hits);
+            append_transfer(result, graph, "elementwise.rhs", "h2d", static_cast<std::uint64_t>(rhs.size_bytes()), result.runtime_us * 0.25, rhs_hits);
+            append_transfer(
+                result,
+                graph,
+                "elementwise.out",
+                "d2h",
+                static_cast<std::uint64_t>(result.output.size() * sizeof(float)),
+                result.runtime_us * 0.15,
+                out_hits);
             result.success = true;
             result.used_host = false;
             result.used_opencl = true;
@@ -1317,9 +1395,19 @@ public:
             const size_t groups = global / local;
             std::vector<float> partials(groups, 0.0f);
 
-            cl_mem in_buffer = acquire_buffer(context, "reduction.in", CL_MEM_READ_ONLY, input.size_bytes());
+            std::uint32_t in_hits = 0u;
+            std::uint32_t partial_hits = 0u;
+            std::uint64_t in_reserved = 0u;
+            std::uint64_t partial_reserved = 0u;
+            cl_mem in_buffer = acquire_buffer(context, "reduction.in", CL_MEM_READ_ONLY, input.size_bytes(), &in_hits, &in_reserved);
             cl_mem partial_buffer =
-                acquire_buffer(context, "reduction.partial", CL_MEM_WRITE_ONLY, partials.size() * sizeof(float));
+                acquire_buffer(
+                    context,
+                    "reduction.partial",
+                    CL_MEM_WRITE_ONLY,
+                    partials.size() * sizeof(float),
+                    &partial_hits,
+                    &partial_reserved);
             if (in_buffer == nullptr || partial_buffer == nullptr) {
                 return;
             }
@@ -1344,6 +1432,17 @@ public:
                 total = quantize_value(total + value, low_precision);
             }
             result.scalar_output = total;
+            append_buffer_binding(result, graph, "reduction.in", in_reserved, in_hits);
+            append_buffer_binding(result, graph, "reduction.partial", partial_reserved, partial_hits);
+            append_transfer(result, graph, "reduction.in", "h2d", static_cast<std::uint64_t>(input.size_bytes()), result.runtime_us * 0.25, in_hits);
+            append_transfer(
+                result,
+                graph,
+                "reduction.partial",
+                "d2h",
+                static_cast<std::uint64_t>(partials.size() * sizeof(float)),
+                result.runtime_us * 0.10,
+                partial_hits);
             result.success = true;
             result.used_host = false;
             result.used_opencl = true;
@@ -1382,9 +1481,21 @@ public:
                 return;
             }
 
-            cl_mem lhs_buffer = acquire_buffer(context, "matmul.lhs", CL_MEM_READ_ONLY, lhs.size_bytes());
-            cl_mem rhs_buffer = acquire_buffer(context, "matmul.rhs", CL_MEM_READ_ONLY, rhs.size_bytes());
-            cl_mem out_buffer = acquire_buffer(context, "matmul.out", CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
+            std::uint32_t lhs_hits = 0u;
+            std::uint32_t rhs_hits = 0u;
+            std::uint32_t out_hits = 0u;
+            std::uint64_t lhs_reserved = 0u;
+            std::uint64_t rhs_reserved = 0u;
+            std::uint64_t out_reserved = 0u;
+            cl_mem lhs_buffer = acquire_buffer(context, "matmul.lhs", CL_MEM_READ_ONLY, lhs.size_bytes(), &lhs_hits, &lhs_reserved);
+            cl_mem rhs_buffer = acquire_buffer(context, "matmul.rhs", CL_MEM_READ_ONLY, rhs.size_bytes(), &rhs_hits, &rhs_reserved);
+            cl_mem out_buffer = acquire_buffer(
+                context,
+                "matmul.out",
+                CL_MEM_WRITE_ONLY,
+                result.output.size() * sizeof(float),
+                &out_hits,
+                &out_reserved);
             if (lhs_buffer == nullptr || rhs_buffer == nullptr || out_buffer == nullptr) {
                 return;
             }
@@ -1416,6 +1527,19 @@ public:
             if (!read_buffer(context, out_buffer, std::span<float>(result.output))) {
                 return;
             }
+            append_buffer_binding(result, graph, "matmul.lhs", lhs_reserved, lhs_hits);
+            append_buffer_binding(result, graph, "matmul.rhs", rhs_reserved, rhs_hits);
+            append_buffer_binding(result, graph, "matmul.out", out_reserved, out_hits);
+            append_transfer(result, graph, "matmul.lhs", "h2d", static_cast<std::uint64_t>(lhs.size_bytes()), result.runtime_us * 0.20, lhs_hits);
+            append_transfer(result, graph, "matmul.rhs", "h2d", static_cast<std::uint64_t>(rhs.size_bytes()), result.runtime_us * 0.20, rhs_hits);
+            append_transfer(
+                result,
+                graph,
+                "matmul.out",
+                "d2h",
+                static_cast<std::uint64_t>(result.output.size() * sizeof(float)),
+                result.runtime_us * 0.12,
+                out_hits);
             result.success = true;
             result.used_host = false;
             result.used_opencl = true;
@@ -1454,8 +1578,18 @@ public:
                 return;
             }
 
-            cl_mem in_buffer = acquire_buffer(context, "conv.in", CL_MEM_READ_ONLY, input.size_bytes());
-            cl_mem out_buffer = acquire_buffer(context, "conv.out", CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
+            std::uint32_t in_hits = 0u;
+            std::uint32_t out_hits = 0u;
+            std::uint64_t in_reserved = 0u;
+            std::uint64_t out_reserved = 0u;
+            cl_mem in_buffer = acquire_buffer(context, "conv.in", CL_MEM_READ_ONLY, input.size_bytes(), &in_hits, &in_reserved);
+            cl_mem out_buffer = acquire_buffer(
+                context,
+                "conv.out",
+                CL_MEM_WRITE_ONLY,
+                result.output.size() * sizeof(float),
+                &out_hits,
+                &out_reserved);
             if (in_buffer == nullptr || out_buffer == nullptr) {
                 return;
             }
@@ -1480,6 +1614,17 @@ public:
             if (!read_buffer(context, out_buffer, std::span<float>(result.output))) {
                 return;
             }
+            append_buffer_binding(result, graph, "conv.in", in_reserved, in_hits);
+            append_buffer_binding(result, graph, "conv.out", out_reserved, out_hits);
+            append_transfer(result, graph, "conv.in", "h2d", static_cast<std::uint64_t>(input.size_bytes()), result.runtime_us * 0.18, in_hits);
+            append_transfer(
+                result,
+                graph,
+                "conv.out",
+                "d2h",
+                static_cast<std::uint64_t>(result.output.size() * sizeof(float)),
+                result.runtime_us * 0.10,
+                out_hits);
             result.success = true;
             result.used_host = false;
             result.used_opencl = true;
@@ -1520,9 +1665,19 @@ public:
                 return;
             }
 
-            cl_mem in_buffer = acquire_buffer(context, "resample.in", CL_MEM_READ_ONLY, input.size_bytes());
+            std::uint32_t in_hits = 0u;
+            std::uint32_t out_hits = 0u;
+            std::uint64_t in_reserved = 0u;
+            std::uint64_t out_reserved = 0u;
+            cl_mem in_buffer = acquire_buffer(context, "resample.in", CL_MEM_READ_ONLY, input.size_bytes(), &in_hits, &in_reserved);
             cl_mem out_buffer =
-                acquire_buffer(context, "resample.out", CL_MEM_WRITE_ONLY, result.output.size() * sizeof(float));
+                acquire_buffer(
+                    context,
+                    "resample.out",
+                    CL_MEM_WRITE_ONLY,
+                    result.output.size() * sizeof(float),
+                    &out_hits,
+                    &out_reserved);
             if (in_buffer == nullptr || out_buffer == nullptr) {
                 return;
             }
@@ -1555,6 +1710,17 @@ public:
             if (!read_buffer(context, out_buffer, std::span<float>(result.output))) {
                 return;
             }
+            append_buffer_binding(result, graph, "resample.in", in_reserved, in_hits);
+            append_buffer_binding(result, graph, "resample.out", out_reserved, out_hits);
+            append_transfer(result, graph, "resample.in", "h2d", static_cast<std::uint64_t>(input.size_bytes()), result.runtime_us * 0.18, in_hits);
+            append_transfer(
+                result,
+                graph,
+                "resample.out",
+                "d2h",
+                static_cast<std::uint64_t>(result.output.size() * sizeof(float)),
+                result.runtime_us * 0.10,
+                out_hits);
             result.success = true;
             result.used_host = false;
             result.used_opencl = true;
@@ -1960,12 +2126,12 @@ DirectExecutionReport DirectExecutor::execute(
     const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index) const {
     DirectExecutionReport report;
     report.optimization = optimization;
-    auto host_backend = executors::make_host_kernel_backend();
-    OpenClDirectBackend opencl_backend;
-    auto level_zero_backend = executors::make_level_zero_kernel_backend();
-    auto cuda_backend = executors::make_cuda_kernel_backend();
-    auto rocm_backend = executors::make_rocm_kernel_backend();
-    auto vulkan_backend = executors::make_vulkan_kernel_backend();
+    static auto host_backend = executors::make_host_kernel_backend();
+    static OpenClDirectBackend opencl_backend;
+    static auto level_zero_backend = executors::make_level_zero_kernel_backend();
+    static auto cuda_backend = executors::make_cuda_kernel_backend();
+    static auto rocm_backend = executors::make_rocm_kernel_backend();
+    static auto vulkan_backend = executors::make_vulkan_kernel_backend();
     executors::DefaultIntraDeviceScheduler scheduler;
     const HardwareGraph empty_graph{};
     const auto host_graph_it = std::find_if(graphs.begin(), graphs.end(), [](const HardwareGraph& graph) {
@@ -2183,6 +2349,15 @@ DirectExecutionReport DirectExecutor::execute(
                     record.synchronize_runtime_us += shard.synchronize_runtime_us;
                     record.copy_runtime_us += shard.copy_runtime_us;
                     record.compute_runtime_us += shard.compute_runtime_us;
+                    record.persistent_resource_reuse_hits += shard.persistent_resource_reuse_hits;
+                    record.buffer_pool_bindings.insert(
+                        record.buffer_pool_bindings.end(),
+                        shard.buffer_pool_bindings.begin(),
+                        shard.buffer_pool_bindings.end());
+                    record.transfer_records.insert(
+                        record.transfer_records.end(),
+                        shard.transfer_records.begin(),
+                        shard.transfer_records.end());
                     record.queue_separation_ratio = std::max(record.queue_separation_ratio, shard.queue_separation_ratio);
                     record.dispatch_count += 1u;
                     record.copy_queue_count += shard.copy_queue_count;
@@ -2395,6 +2570,7 @@ DirectExecutionReport DirectExecutor::execute(
             report.total_copy_runtime_us += record.copy_runtime_us;
             report.total_compute_runtime_us += record.compute_runtime_us;
             report.total_dispatch_count += record.dispatch_count;
+            report.total_persistent_resource_reuse_hits += record.persistent_resource_reuse_hits;
             report.total_copy_queue_count += record.copy_queue_count;
             report.total_compute_queue_count += record.compute_queue_count;
             report.total_event_wait_count += record.event_wait_count;

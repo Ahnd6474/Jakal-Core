@@ -1,6 +1,7 @@
 #pragma once
 
 #include "jakal/execution.hpp"
+#include "jakal/executors/interfaces.hpp"
 #include "jakal/jakal_toolkit.hpp"
 
 #include <string>
@@ -30,9 +31,12 @@ struct OperationExecutionRecord {
     double speedup_vs_reference = 1.0;
     double relative_error = 0.0;
     std::uint32_t dispatch_count = 0;
+    std::uint32_t persistent_resource_reuse_hits = 0;
     std::uint32_t copy_queue_count = 0;
     std::uint32_t compute_queue_count = 0;
     std::uint32_t event_wait_count = 0;
+    std::vector<executors::BackendBufferPoolBinding> buffer_pool_bindings;
+    std::vector<executors::TransferExecutionRecord> transfer_records;
     bool verified = false;
     bool used_host = false;
     bool used_opencl = false;
@@ -57,6 +61,7 @@ struct DirectExecutionReport {
     double transfer_overlap_ratio = 0.0;
     double speedup_vs_reference = 1.0;
     std::uint32_t total_dispatch_count = 0;
+    std::uint32_t total_persistent_resource_reuse_hits = 0;
     std::uint32_t total_copy_queue_count = 0;
     std::uint32_t total_compute_queue_count = 0;
     std::uint32_t total_event_wait_count = 0;

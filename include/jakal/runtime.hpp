@@ -221,6 +221,110 @@ struct ResidencySequenceReport {
     std::string summary;
 };
 
+enum class TensorAllocationEventKind {
+    allocate,
+    reuse,
+    release
+};
+
+struct TensorAllocationEvent {
+    TensorAllocationEventKind kind = TensorAllocationEventKind::allocate;
+    ResidencyActionKind residency_cause = ResidencyActionKind::prefetch;
+    std::string tensor_id;
+    std::string device_uid;
+    std::string trigger_operation_name;
+    std::uint32_t tensor_index = kInvalidExecutionIndex;
+    std::uint32_t device_index = kInvalidExecutionIndex;
+    std::uint32_t operation_index = 0;
+    std::uint32_t block_id = 0;
+    std::uint64_t offset_bytes = 0;
+    std::uint64_t bytes = 0;
+    bool persistent = false;
+};
+
+struct TensorAllocatorReport {
+    std::vector<TensorAllocationEvent> events;
+    std::vector<std::string> indexed_tensors;
+    std::vector<std::string> indexed_devices;
+    std::vector<std::string> indexed_operations;
+    std::uint64_t peak_live_bytes = 0;
+    std::uint64_t peak_reserved_bytes = 0;
+    std::uint32_t allocation_count = 0;
+    std::uint32_t reuse_count = 0;
+    std::string summary;
+};
+
+struct SpillArtifactEntry {
+    ResidencyActionKind kind = ResidencyActionKind::spill;
+    std::string tensor_id;
+    std::string device_uid;
+    std::string trigger_operation_name;
+    std::filesystem::path path;
+    std::uint32_t tensor_index = kInvalidExecutionIndex;
+    std::uint32_t device_index = kInvalidExecutionIndex;
+    std::uint32_t operation_index = 0;
+    std::uint64_t bytes = 0;
+    bool exists_on_disk = false;
+};
+
+struct SpillArtifactReport {
+    std::vector<SpillArtifactEntry> entries;
+    std::uint64_t materialized_spill_bytes = 0;
+    std::uint64_t materialized_reload_bytes = 0;
+    std::string summary;
+};
+
+struct BackendBufferBindingEntry {
+    std::string device_uid;
+    std::string backend_name;
+    std::string ownership_scope = "runtime-local";
+    std::string pool_id;
+    std::string resource_tag;
+    std::uint64_t planned_peak_bytes = 0;
+    std::uint64_t reserved_bytes = 0;
+    std::uint64_t spill_bytes = 0;
+    std::uint64_t reload_bytes = 0;
+    std::uint64_t materialized_spill_bytes = 0;
+    std::uint64_t materialized_reload_bytes = 0;
+    std::uint32_t direct_execution_operation_count = 0;
+    std::uint32_t persistent_resource_reuse_hits = 0;
+    bool direct_execution_active = false;
+    bool uses_runtime_spill_artifacts = false;
+};
+
+struct BackendBufferBindingReport {
+    std::vector<BackendBufferBindingEntry> entries;
+    std::uint64_t backend_owned_peak_bytes = 0;
+    std::uint64_t runtime_local_peak_bytes = 0;
+    std::uint32_t total_persistent_resource_reuse_hits = 0;
+    std::string summary;
+};
+
+struct ExecutedResidencyMovementEntry {
+    std::string kind;
+    std::string tensor_id;
+    std::string device_uid;
+    std::string backend_name;
+    std::string trigger_operation_name;
+    std::string pool_id;
+    std::filesystem::path spill_artifact_path;
+    std::uint32_t operation_index = 0;
+    std::uint64_t bytes = 0;
+    double runtime_us = 0.0;
+    bool from_direct_execution = false;
+    bool from_spill_artifact = false;
+};
+
+struct ExecutedResidencyMovementReport {
+    std::vector<ExecutedResidencyMovementEntry> entries;
+    std::uint64_t executed_h2d_bytes = 0;
+    std::uint64_t executed_d2h_bytes = 0;
+    std::uint64_t executed_spill_bytes = 0;
+    std::uint64_t executed_reload_bytes = 0;
+    double total_transfer_runtime_us = 0.0;
+    std::string summary;
+};
+
 struct ManagedExecutionReport {
     ExecutionPlan planning;
     DirectExecutionReport execution;
@@ -229,6 +333,10 @@ struct ManagedExecutionReport {
     KernelCoverageReport kernel_coverage;
     AssetPrefetchReport asset_prefetch;
     ResidencySequenceReport residency_sequence;
+    TensorAllocatorReport tensor_allocator;
+    SpillArtifactReport spill_artifacts;
+    BackendBufferBindingReport backend_buffer_bindings;
+    ExecutedResidencyMovementReport executed_residency_movements;
     std::filesystem::path telemetry_path;
     bool executed = false;
 };
@@ -270,6 +378,19 @@ private:
         const WorkloadManifest& manifest,
         const OptimizationReport& optimization) const;
     [[nodiscard]] ResidencySequenceReport build_residency_sequence(const OptimizationReport& optimization) const;
+    [[nodiscard]] TensorAllocatorReport build_tensor_allocator(
+        const ResidencySequenceReport& residency_sequence) const;
+    [[nodiscard]] SpillArtifactReport materialize_spill_artifacts(
+        const ResidencySequenceReport& residency_sequence) const;
+    [[nodiscard]] BackendBufferBindingReport build_backend_buffer_bindings(
+        const DirectExecutionReport* execution,
+        const TensorAllocatorReport& tensor_allocator,
+        const ResidencySequenceReport& residency_sequence,
+        const SpillArtifactReport& spill_artifacts) const;
+    [[nodiscard]] ExecutedResidencyMovementReport build_executed_residency_movements(
+        const DirectExecutionReport* execution,
+        const ResidencySequenceReport& residency_sequence,
+        const SpillArtifactReport& spill_artifacts) const;
     [[nodiscard]] DirectExecutionReport execute_with_feedback(
         const WorkloadSpec& workload,
         const OptimizationReport& optimization,

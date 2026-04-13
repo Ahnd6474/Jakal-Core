@@ -6,11 +6,13 @@
 #include <cstddef>
 #include <cstring>
 #include <new>
+#include <optional>
 #include <string>
 
 struct jakal_core_runtime {
     jakal::Runtime runtime;
     std::string last_error;
+    std::optional<jakal::ManagedExecutionReport> last_managed_execution;
 };
 
 namespace {
@@ -199,6 +201,55 @@ void fill_execution_operation_info(
     out_operation->used_opencl = operation.used_opencl ? 1 : 0;
     out_operation->used_multiple_devices = operation.used_multiple_devices ? 1 : 0;
     out_operation->logical_partitions_used = operation.logical_partitions_used;
+}
+
+void fill_backend_buffer_binding_info(
+    const jakal::BackendBufferBindingEntry& binding,
+    jakal_core_backend_buffer_binding_info* out_binding) {
+    if (out_binding == nullptr) {
+        return;
+    }
+
+    copy_string(binding.device_uid, out_binding->device_uid, sizeof(out_binding->device_uid));
+    copy_string(binding.backend_name, out_binding->backend_name, sizeof(out_binding->backend_name));
+    copy_string(binding.ownership_scope, out_binding->ownership_scope, sizeof(out_binding->ownership_scope));
+    copy_string(binding.pool_id, out_binding->pool_id, sizeof(out_binding->pool_id));
+    copy_string(binding.resource_tag, out_binding->resource_tag, sizeof(out_binding->resource_tag));
+    out_binding->planned_peak_bytes = binding.planned_peak_bytes;
+    out_binding->reserved_bytes = binding.reserved_bytes;
+    out_binding->spill_bytes = binding.spill_bytes;
+    out_binding->reload_bytes = binding.reload_bytes;
+    out_binding->direct_execution_operation_count = binding.direct_execution_operation_count;
+    out_binding->persistent_resource_reuse_hits = binding.persistent_resource_reuse_hits;
+    out_binding->direct_execution_active = binding.direct_execution_active ? 1 : 0;
+    out_binding->uses_runtime_spill_artifacts = binding.uses_runtime_spill_artifacts ? 1 : 0;
+}
+
+void fill_residency_movement_info(
+    const jakal::ExecutedResidencyMovementEntry& movement,
+    jakal_core_residency_movement_info* out_movement) {
+    if (out_movement == nullptr) {
+        return;
+    }
+
+    copy_string(movement.kind, out_movement->kind, sizeof(out_movement->kind));
+    copy_string(movement.tensor_id, out_movement->tensor_id, sizeof(out_movement->tensor_id));
+    copy_string(movement.device_uid, out_movement->device_uid, sizeof(out_movement->device_uid));
+    copy_string(movement.backend_name, out_movement->backend_name, sizeof(out_movement->backend_name));
+    copy_string(
+        movement.trigger_operation_name,
+        out_movement->trigger_operation_name,
+        sizeof(out_movement->trigger_operation_name));
+    copy_string(movement.pool_id, out_movement->pool_id, sizeof(out_movement->pool_id));
+    copy_string(
+        movement.spill_artifact_path.string(),
+        out_movement->spill_artifact_path,
+        sizeof(out_movement->spill_artifact_path));
+    out_movement->operation_index = movement.operation_index;
+    out_movement->bytes = movement.bytes;
+    out_movement->runtime_us = movement.runtime_us;
+    out_movement->from_direct_execution = movement.from_direct_execution ? 1 : 0;
+    out_movement->from_spill_artifact = movement.from_spill_artifact ? 1 : 0;
 }
 
 void fill_runtime_paths(
@@ -552,6 +603,7 @@ int jakal_core_runtime_optimize(
 
     try {
         clear_last_error(runtime);
+        runtime->last_managed_execution.reset();
         const auto report = runtime->runtime.optimize(convert_workload(*workload));
         *out_count = report.operations.size();
         fill_optimization_info(report, out_optimization);
@@ -583,6 +635,7 @@ int jakal_core_runtime_execute(
 
     try {
         clear_last_error(runtime);
+        runtime->last_managed_execution.reset();
         const auto report = runtime->runtime.execute(convert_workload(*workload));
         *out_count = report.operations.size();
         fill_execution_info(report, out_execution);
@@ -596,6 +649,7 @@ int jakal_core_runtime_execute(
         }
         return 0;
     } catch (const std::exception& error) {
+        runtime->last_managed_execution.reset();
         set_last_error(runtime, error.what());
         return -3;
     }
@@ -614,7 +668,8 @@ int jakal_core_runtime_execute_manifest(
 
     try {
         clear_last_error(runtime);
-        const auto report = runtime->runtime.execute_manifest(manifest_path);
+        runtime->last_managed_execution = runtime->runtime.execute_manifest(manifest_path);
+        const auto& report = *runtime->last_managed_execution;
         *out_count = report.execution.operations.size();
         fill_execution_info(report.execution, out_execution);
 
@@ -627,9 +682,60 @@ int jakal_core_runtime_execute_manifest(
         }
         return 0;
     } catch (const std::exception& error) {
+        runtime->last_managed_execution.reset();
         set_last_error(runtime, error.what());
         return -3;
     }
+}
+
+size_t jakal_core_runtime_last_backend_buffer_binding_count(const jakal_core_runtime_t* runtime) {
+    if (runtime == nullptr || !runtime->last_managed_execution.has_value()) {
+        return 0u;
+    }
+    return runtime->last_managed_execution->backend_buffer_bindings.entries.size();
+}
+
+int jakal_core_runtime_get_last_backend_buffer_binding(
+    const jakal_core_runtime_t* runtime,
+    size_t index,
+    jakal_core_backend_buffer_binding_info* out_binding) {
+    if (runtime == nullptr || out_binding == nullptr) {
+        return -1;
+    }
+    if (!runtime->last_managed_execution.has_value()) {
+        return -2;
+    }
+    const auto& entries = runtime->last_managed_execution->backend_buffer_bindings.entries;
+    if (index >= entries.size()) {
+        return -3;
+    }
+    fill_backend_buffer_binding_info(entries[index], out_binding);
+    return 0;
+}
+
+size_t jakal_core_runtime_last_residency_movement_count(const jakal_core_runtime_t* runtime) {
+    if (runtime == nullptr || !runtime->last_managed_execution.has_value()) {
+        return 0u;
+    }
+    return runtime->last_managed_execution->executed_residency_movements.entries.size();
+}
+
+int jakal_core_runtime_get_last_residency_movement(
+    const jakal_core_runtime_t* runtime,
+    size_t index,
+    jakal_core_residency_movement_info* out_movement) {
+    if (runtime == nullptr || out_movement == nullptr) {
+        return -1;
+    }
+    if (!runtime->last_managed_execution.has_value()) {
+        return -2;
+    }
+    const auto& entries = runtime->last_managed_execution->executed_residency_movements.entries;
+    if (index >= entries.size()) {
+        return -3;
+    }
+    fill_residency_movement_info(entries[index], out_movement);
+    return 0;
 }
 
 

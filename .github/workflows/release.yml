@@ -50,6 +50,11 @@ jobs:
             -OutputDir .\build_ninja\dist-nsis `
             -MakensisPath $makensis
 
+      - name: Smoke packaged layout
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\packaging\package-smoke.ps1 `
+            -BuildDir build_ninja
+
       - name: Collect release assets
         run: |
           New-Item -ItemType Directory -Force -Path .\release-assets | Out-Null

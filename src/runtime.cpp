@@ -1707,6 +1707,16 @@ struct PackedLayoutBlobHeader {
     std::int64_t source_mtime_ticks = 0;
 };
 
+struct SpillArtifactHeader {
+    std::array<char, 8> magic{'J', 'A', 'K', 'S', 'P', 'I', 'L', 'L'};
+    std::uint32_t version = 1u;
+    std::uint32_t tensor_hash = 0u;
+    std::uint32_t device_hash = 0u;
+    std::uint32_t operation_hash = 0u;
+    std::uint64_t declared_bytes = 0u;
+    std::uint64_t operation_index = 0u;
+};
+
 std::uint32_t stable_text_hash(const std::string& text) {
     std::uint32_t hash = 2166136261u;
     for (const unsigned char ch : text) {
@@ -1916,6 +1926,10 @@ std::filesystem::path runtime_layout_cache_root(const RuntimeOptions& options) {
     return base / "packed-layouts";
 }
 
+std::filesystem::path runtime_spill_artifact_root(const RuntimeInstallPaths& paths) {
+    return paths.cache_dir / "spill-artifacts";
+}
+
 std::filesystem::path packed_layout_blob_path(
     const std::filesystem::path& root,
     const AssetPrefetchEntry& entry) {
@@ -1978,6 +1992,50 @@ bool should_persist_packed_layout_blob(const AssetPrefetchEntry& entry) {
     }
     return entry.materialization_kind.find("packed-rhs") != std::string::npos ||
            entry.materialization_kind.find("conv-patch9") != std::string::npos;
+}
+
+std::filesystem::path spill_artifact_path(
+    const std::filesystem::path& root,
+    const ResidencyAction& action) {
+    return root /
+           (sanitize_cache_component(action.tensor_id.empty() ? "tensor" : action.tensor_id) + "-" +
+            sanitize_cache_component(action.device_uid.empty() ? "host" : action.device_uid) + "-" +
+            std::to_string(action.operation_index) + ".jspill");
+}
+
+bool spill_artifact_matches(const std::filesystem::path& path, const ResidencyAction& action) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) {
+        return false;
+    }
+    SpillArtifactHeader header;
+    input.read(reinterpret_cast<char*>(&header), static_cast<std::streamsize>(sizeof(header)));
+    if (input.gcount() != static_cast<std::streamsize>(sizeof(header))) {
+        return false;
+    }
+    return header.magic == SpillArtifactHeader{}.magic &&
+           header.version == 1u &&
+           header.tensor_hash == stable_text_hash(action.tensor_id) &&
+           header.device_hash == stable_text_hash(action.device_uid) &&
+           header.operation_hash == stable_text_hash(action.trigger_operation_name) &&
+           header.declared_bytes == action.bytes &&
+           header.operation_index == action.operation_index;
+}
+
+bool write_spill_artifact(const std::filesystem::path& path, const ResidencyAction& action) {
+    SpillArtifactHeader header;
+    header.tensor_hash = stable_text_hash(action.tensor_id);
+    header.device_hash = stable_text_hash(action.device_uid);
+    header.operation_hash = stable_text_hash(action.trigger_operation_name);
+    header.declared_bytes = action.bytes;
+    header.operation_index = action.operation_index;
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) {
+        return false;
+    }
+    output.write(reinterpret_cast<const char*>(&header), static_cast<std::streamsize>(sizeof(header)));
+    return output.good();
 }
 
 void materialize_packed_layout_blobs(
@@ -2647,15 +2705,29 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         devices_,
         &workload_graph,
         &context.execution_tuning);
+    auto refresh_execution_reports = [&](const DirectExecutionReport* execution_report) {
+        managed.kernel_coverage = build_kernel_coverage(optimization);
+        managed.residency_sequence = build_residency_sequence(optimization);
+        managed.tensor_allocator = build_tensor_allocator(managed.residency_sequence);
+        managed.spill_artifacts = materialize_spill_artifacts(managed.residency_sequence);
+        managed.backend_buffer_bindings = build_backend_buffer_bindings(
+            execution_report,
+            managed.tensor_allocator,
+            managed.residency_sequence,
+            managed.spill_artifacts);
+        managed.executed_residency_movements = build_executed_residency_movements(
+            execution_report,
+            managed.residency_sequence,
+            managed.spill_artifacts);
+        managed.memory_preflight.predicted_spill_bytes = managed.residency_sequence.spill_bytes;
+        managed.memory_preflight.predicted_reload_bytes = managed.residency_sequence.reload_bytes;
+        managed.memory_preflight.forced_spill_count = managed.residency_sequence.forced_spill_count;
+        managed.memory_preflight.requires_spill =
+            managed.memory_preflight.requires_spill || managed.residency_sequence.spill_bytes > 0u;
+    };
     managed.safety.selected_strategy = optimization.partition_strategy;
     managed.memory_preflight = build_memory_preflight(optimization);
-    managed.kernel_coverage = build_kernel_coverage(optimization);
-    managed.residency_sequence = build_residency_sequence(optimization);
-    managed.memory_preflight.predicted_spill_bytes = managed.residency_sequence.spill_bytes;
-    managed.memory_preflight.predicted_reload_bytes = managed.residency_sequence.reload_bytes;
-    managed.memory_preflight.forced_spill_count = managed.residency_sequence.forced_spill_count;
-    managed.memory_preflight.requires_spill =
-        managed.memory_preflight.requires_spill || managed.residency_sequence.spill_bytes > 0u;
+    refresh_execution_reports(nullptr);
     managed.safety.planner_risk_score = planner_risk_score(
         effective_workload,
         managed.planning,
@@ -2690,13 +2762,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             update_planner_diagnostics(planned);
             optimization = std::move(fallback_optimization);
             managed.memory_preflight = std::move(fallback_memory);
-            managed.kernel_coverage = build_kernel_coverage(optimization);
-            managed.residency_sequence = build_residency_sequence(optimization);
-            managed.memory_preflight.predicted_spill_bytes = managed.residency_sequence.spill_bytes;
-            managed.memory_preflight.predicted_reload_bytes = managed.residency_sequence.reload_bytes;
-            managed.memory_preflight.forced_spill_count = managed.residency_sequence.forced_spill_count;
-            managed.memory_preflight.requires_spill =
-                managed.memory_preflight.requires_spill || managed.residency_sequence.spill_bytes > 0u;
+            refresh_execution_reports(nullptr);
             managed.safety.planner_risk_score = planner_risk_score(
                 effective_workload,
                 managed.planning,
@@ -2747,6 +2813,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
 
     managed.execution = execute_with_feedback(effective_workload, optimization, &workload_graph);
     managed.executed = true;
+    refresh_execution_reports(&managed.execution);
     managed.safety.final_strategy = managed.execution.optimization.partition_strategy;
     auto planner_feedback = make_strategy_feedback_sample(
         effective_workload,
@@ -2778,15 +2845,31 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             fallback_workload.disable_heuristic_partition_hint = true;
             fallback_workload.disable_automatic_execution_tuning = true;
             fallback_workload.disable_strategy_exploration = true;
-            auto fallback_optimization = optimize(fallback_workload, workload_graph);
+            auto fallback_plan = planner_.build_plan(fallback_workload, devices_);
+            auto fallback_optimization = execution_optimizer_.optimize(
+                fallback_workload,
+                fallback_plan,
+                devices_,
+                &workload_graph,
+                &context.execution_tuning);
             auto fallback_memory = build_memory_preflight(fallback_optimization);
             if (fallback_memory.safe_to_run || !options_.product.memory.enforce_preflight) {
                 auto fallback_execution = execute_with_feedback(fallback_workload, fallback_optimization, &workload_graph);
                 if (fallback_execution.all_succeeded &&
                     (!managed.execution.all_succeeded ||
                      total_runtime_us(fallback_execution) <= total_runtime_us(managed.execution))) {
+                    update_planner_diagnostics(fallback_plan);
                     managed.execution = std::move(fallback_execution);
                     managed.memory_preflight = std::move(fallback_memory);
+                    optimization = std::move(fallback_optimization);
+                    refresh_execution_reports(&managed.execution);
+                    managed.safety.planner_risk_score = planner_risk_score(
+                        fallback_workload,
+                        managed.planning,
+                        optimization,
+                        managed.memory_preflight,
+                        managed.kernel_coverage,
+                        managed.residency_sequence);
                     managed.safety.rolled_back_to_auto = true;
                     planner_feedback.rolled_back_to_auto = true;
                     managed.safety.final_strategy = managed.execution.optimization.partition_strategy;
@@ -2830,6 +2913,30 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             safety_summary << "; ";
         }
         safety_summary << managed.residency_sequence.summary;
+    }
+    if (!managed.tensor_allocator.summary.empty()) {
+        if (safety_summary.tellp() > 0) {
+            safety_summary << "; ";
+        }
+        safety_summary << managed.tensor_allocator.summary;
+    }
+    if (!managed.spill_artifacts.summary.empty()) {
+        if (safety_summary.tellp() > 0) {
+            safety_summary << "; ";
+        }
+        safety_summary << managed.spill_artifacts.summary;
+    }
+    if (!managed.backend_buffer_bindings.summary.empty()) {
+        if (safety_summary.tellp() > 0) {
+            safety_summary << "; ";
+        }
+        safety_summary << managed.backend_buffer_bindings.summary;
+    }
+    if (!managed.executed_residency_movements.summary.empty()) {
+        if (safety_summary.tellp() > 0) {
+            safety_summary << "; ";
+        }
+        safety_summary << managed.executed_residency_movements.summary;
     }
     managed.safety.summary = safety_summary.str();
     persist_telemetry(requested_workload, managed);
@@ -3227,6 +3334,498 @@ ResidencySequenceReport Runtime::build_residency_sequence(const OptimizationRepo
     return report;
 }
 
+TensorAllocatorReport Runtime::build_tensor_allocator(const ResidencySequenceReport& residency_sequence) const {
+    struct FreeBlock {
+        std::uint32_t block_id = 0u;
+        std::uint64_t offset_bytes = 0u;
+        std::uint64_t bytes = 0u;
+    };
+    struct LiveBlock {
+        std::uint32_t block_id = 0u;
+        std::uint64_t offset_bytes = 0u;
+        std::uint64_t bytes = 0u;
+        bool persistent = false;
+    };
+    struct DeviceAllocatorState {
+        std::vector<FreeBlock> free_blocks;
+        std::unordered_map<std::string, LiveBlock> live_blocks;
+        std::uint64_t next_offset_bytes = 0u;
+        std::uint64_t live_bytes = 0u;
+        std::uint32_t next_block_id = 1u;
+    };
+
+    TensorAllocatorReport report;
+    report.indexed_tensors = residency_sequence.indexed_tensors;
+    report.indexed_devices = residency_sequence.indexed_devices;
+    report.indexed_operations = residency_sequence.indexed_operations;
+    if (residency_sequence.actions.empty()) {
+        return report;
+    }
+
+    std::unordered_map<std::string, DeviceAllocatorState> states;
+    const auto coalesce_free_blocks = [](std::vector<FreeBlock>& free_blocks) {
+        if (free_blocks.size() < 2u) {
+            return;
+        }
+        std::sort(free_blocks.begin(), free_blocks.end(), [](const FreeBlock& left, const FreeBlock& right) {
+            if (left.offset_bytes != right.offset_bytes) {
+                return left.offset_bytes < right.offset_bytes;
+            }
+            return left.block_id < right.block_id;
+        });
+        std::vector<FreeBlock> merged;
+        merged.reserve(free_blocks.size());
+        merged.push_back(free_blocks.front());
+        for (std::size_t index = 1; index < free_blocks.size(); ++index) {
+            auto& current = merged.back();
+            const auto& next = free_blocks[index];
+            if (current.offset_bytes + current.bytes == next.offset_bytes) {
+                current.bytes += next.bytes;
+                current.block_id = std::min(current.block_id, next.block_id);
+                continue;
+            }
+            merged.push_back(next);
+        }
+        free_blocks = std::move(merged);
+    };
+
+    for (const auto& action : residency_sequence.actions) {
+        auto& state = states[action.device_uid];
+        switch (action.kind) {
+        case ResidencyActionKind::prefetch:
+        case ResidencyActionKind::reload: {
+            if (state.live_blocks.find(action.tensor_id) != state.live_blocks.end()) {
+                break;
+            }
+
+            auto best_fit = state.free_blocks.end();
+            for (auto it = state.free_blocks.begin(); it != state.free_blocks.end(); ++it) {
+                if (it->bytes < action.bytes) {
+                    continue;
+                }
+                if (best_fit == state.free_blocks.end() || it->bytes < best_fit->bytes) {
+                    best_fit = it;
+                }
+            }
+
+            TensorAllocationEvent event;
+            event.kind =
+                best_fit == state.free_blocks.end() ? TensorAllocationEventKind::allocate : TensorAllocationEventKind::reuse;
+            event.residency_cause = action.kind;
+            event.tensor_id = action.tensor_id;
+            event.device_uid = action.device_uid;
+            event.trigger_operation_name = action.trigger_operation_name;
+            event.tensor_index = action.tensor_index;
+            event.device_index = action.device_index;
+            event.operation_index = action.operation_index;
+            event.bytes = action.bytes;
+            event.persistent = action.persistent;
+
+            if (best_fit == state.free_blocks.end()) {
+                event.block_id = state.next_block_id++;
+                event.offset_bytes = state.next_offset_bytes;
+                state.next_offset_bytes += action.bytes;
+                report.peak_reserved_bytes = std::max(report.peak_reserved_bytes, state.next_offset_bytes);
+                ++report.allocation_count;
+            } else {
+                const auto reused = *best_fit;
+                state.free_blocks.erase(best_fit);
+                event.block_id = reused.block_id;
+                event.offset_bytes = reused.offset_bytes;
+                if (reused.bytes > action.bytes) {
+                    state.free_blocks.push_back(FreeBlock{
+                        state.next_block_id++,
+                        reused.offset_bytes + action.bytes,
+                        reused.bytes - action.bytes});
+                    coalesce_free_blocks(state.free_blocks);
+                }
+                ++report.reuse_count;
+            }
+
+            state.live_blocks.emplace(
+                action.tensor_id,
+                LiveBlock{event.block_id, event.offset_bytes, action.bytes, action.persistent});
+            state.live_bytes += action.bytes;
+            report.peak_live_bytes = std::max(report.peak_live_bytes, state.live_bytes);
+            report.events.push_back(std::move(event));
+            break;
+        }
+        case ResidencyActionKind::spill:
+        case ResidencyActionKind::evict: {
+            const auto live_it = state.live_blocks.find(action.tensor_id);
+            if (live_it == state.live_blocks.end()) {
+                break;
+            }
+
+            report.events.push_back(TensorAllocationEvent{
+                TensorAllocationEventKind::release,
+                action.kind,
+                action.tensor_id,
+                action.device_uid,
+                action.trigger_operation_name,
+                action.tensor_index,
+                action.device_index,
+                action.operation_index,
+                live_it->second.block_id,
+                live_it->second.offset_bytes,
+                live_it->second.bytes,
+                live_it->second.persistent});
+            state.live_bytes -= live_it->second.bytes;
+            state.free_blocks.push_back(FreeBlock{
+                live_it->second.block_id,
+                live_it->second.offset_bytes,
+                live_it->second.bytes});
+            state.live_blocks.erase(live_it);
+            coalesce_free_blocks(state.free_blocks);
+            break;
+        }
+        }
+    }
+
+    if (!report.events.empty()) {
+        std::ostringstream summary;
+        summary << "allocator peak_live=" << report.peak_live_bytes
+                << " peak_reserved=" << report.peak_reserved_bytes
+                << " allocations=" << report.allocation_count
+                << " reuse=" << report.reuse_count;
+        report.summary = summary.str();
+    }
+    return report;
+}
+
+SpillArtifactReport Runtime::materialize_spill_artifacts(const ResidencySequenceReport& residency_sequence) const {
+    SpillArtifactReport report;
+    if (residency_sequence.actions.empty()) {
+        return report;
+    }
+
+    const auto root = runtime_spill_artifact_root(install_paths_);
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+
+    std::unordered_map<std::string, std::filesystem::path> latest_spill_by_tensor_device;
+    latest_spill_by_tensor_device.reserve(residency_sequence.actions.size());
+    const auto tensor_device_key = [](const ResidencyAction& action) {
+        return action.tensor_id + "|" + action.device_uid;
+    };
+
+    for (const auto& action : residency_sequence.actions) {
+        if (action.kind != ResidencyActionKind::spill && action.kind != ResidencyActionKind::reload) {
+            continue;
+        }
+
+        SpillArtifactEntry entry;
+        entry.kind = action.kind;
+        entry.tensor_id = action.tensor_id;
+        entry.device_uid = action.device_uid;
+        entry.trigger_operation_name = action.trigger_operation_name;
+        entry.tensor_index = action.tensor_index;
+        entry.device_index = action.device_index;
+        entry.operation_index = action.operation_index;
+        entry.bytes = action.bytes;
+
+        const auto key = tensor_device_key(action);
+        if (action.kind == ResidencyActionKind::spill) {
+            const auto path = spill_artifact_path(root, action);
+            if (spill_artifact_matches(path, action) || write_spill_artifact(path, action)) {
+                entry.path = path;
+                entry.exists_on_disk = true;
+                report.materialized_spill_bytes += action.bytes;
+                latest_spill_by_tensor_device[key] = path;
+            }
+        } else if (const auto it = latest_spill_by_tensor_device.find(key); it != latest_spill_by_tensor_device.end()) {
+            entry.path = it->second;
+            entry.exists_on_disk = std::filesystem::exists(entry.path, ec);
+            if (entry.exists_on_disk) {
+                report.materialized_reload_bytes += action.bytes;
+            }
+        }
+        report.entries.push_back(std::move(entry));
+    }
+
+    if (!report.entries.empty()) {
+        std::ostringstream summary;
+        summary << "spill_artifacts=" << report.materialized_spill_bytes
+                << " reload_refs=" << report.materialized_reload_bytes;
+        report.summary = summary.str();
+    }
+    return report;
+}
+
+BackendBufferBindingReport Runtime::build_backend_buffer_bindings(
+    const DirectExecutionReport* execution,
+    const TensorAllocatorReport& tensor_allocator,
+    const ResidencySequenceReport& residency_sequence,
+    const SpillArtifactReport& spill_artifacts) const {
+    BackendBufferBindingReport report;
+    std::unordered_map<std::string, BackendBufferBindingEntry> entries_by_key;
+    entries_by_key.reserve(std::max<std::size_t>(residency_sequence.indexed_devices.size(), 1u));
+
+    const auto make_key = [](const std::string& device_uid, const std::string& pool_id) {
+        return device_uid + "|" + (pool_id.empty() ? std::string("runtime-local") : pool_id);
+    };
+
+    const auto ensure_entry = [&](const std::string& device_uid, const std::string& pool_id = std::string()) -> BackendBufferBindingEntry& {
+        const auto key = make_key(device_uid, pool_id);
+        auto [it, inserted] = entries_by_key.try_emplace(key);
+        auto& entry = it->second;
+        if (inserted) {
+            entry.device_uid = device_uid;
+            entry.pool_id = pool_id;
+            if (const auto* graph = find_graph_by_uid(devices_, device_uid); graph != nullptr) {
+                entry.backend_name = backend_name_for_graph(*graph);
+                entry.ownership_scope = graph->probe == "host" ? "host-shared" : "runtime-local";
+            } else {
+                entry.backend_name = "runtime-local";
+            }
+            if (entry.pool_id.empty()) {
+                entry.pool_id = "runtime-local:" + device_uid;
+            }
+        }
+        return entry;
+    };
+
+    for (const auto& device_uid : residency_sequence.indexed_devices) {
+        ensure_entry(device_uid);
+    }
+
+    std::unordered_map<std::string, std::uint64_t> live_bytes_by_device;
+    for (const auto& event : tensor_allocator.events) {
+        auto& entry = ensure_entry(event.device_uid);
+        auto& live_bytes = live_bytes_by_device[event.device_uid];
+        switch (event.kind) {
+        case TensorAllocationEventKind::allocate:
+        case TensorAllocationEventKind::reuse:
+            live_bytes += event.bytes;
+            entry.planned_peak_bytes = std::max(entry.planned_peak_bytes, live_bytes);
+            entry.reserved_bytes = std::max(entry.reserved_bytes, entry.planned_peak_bytes);
+            break;
+        case TensorAllocationEventKind::release:
+            live_bytes = live_bytes > event.bytes ? (live_bytes - event.bytes) : 0u;
+            break;
+        }
+    }
+
+    for (const auto& action : residency_sequence.actions) {
+        auto& entry = ensure_entry(action.device_uid);
+        if (action.kind == ResidencyActionKind::spill) {
+            entry.spill_bytes += action.bytes;
+        } else if (action.kind == ResidencyActionKind::reload) {
+            entry.reload_bytes += action.bytes;
+        }
+    }
+
+    for (const auto& artifact : spill_artifacts.entries) {
+        auto& entry = ensure_entry(artifact.device_uid);
+        if (artifact.kind == ResidencyActionKind::spill && artifact.exists_on_disk) {
+            entry.materialized_spill_bytes += artifact.bytes;
+            entry.uses_runtime_spill_artifacts = true;
+        } else if (artifact.kind == ResidencyActionKind::reload && artifact.exists_on_disk) {
+            entry.materialized_reload_bytes += artifact.bytes;
+            entry.uses_runtime_spill_artifacts = true;
+        }
+    }
+
+    if (execution != nullptr) {
+        for (const auto& operation : execution->operations) {
+            for (const auto& device_uid : operation.participating_devices) {
+                auto& entry = ensure_entry(device_uid);
+                entry.direct_execution_operation_count += 1u;
+                entry.direct_execution_active = true;
+            }
+            for (const auto& binding : operation.buffer_pool_bindings) {
+                auto& entry = ensure_entry(binding.device_uid, binding.pool_id);
+                entry.backend_name = binding.backend_name;
+                entry.ownership_scope = binding.backend_name.rfind("host", 0) == 0 ? "host-shared" : "backend-owned";
+                entry.resource_tag = binding.resource_tag;
+                entry.reserved_bytes = std::max(entry.reserved_bytes, binding.reserved_bytes);
+                entry.persistent_resource_reuse_hits =
+                    std::max(entry.persistent_resource_reuse_hits, binding.reuse_hits);
+                entry.direct_execution_operation_count += 1u;
+                entry.direct_execution_active = true;
+                auto& fallback_entry = ensure_entry(binding.device_uid);
+                fallback_entry.direct_execution_active = true;
+                fallback_entry.direct_execution_operation_count += 1u;
+            }
+            if (operation.buffer_pool_bindings.empty() && operation.backend_name.rfind("host-native", 0) != 0) {
+                for (const auto& device_uid : operation.participating_devices) {
+                    auto& entry = ensure_entry(device_uid);
+                    entry.persistent_resource_reuse_hits += operation.persistent_resource_reuse_hits;
+                    if (entry.ownership_scope != "host-shared") {
+                        entry.ownership_scope = "backend-owned";
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<std::string> ordered_keys;
+    ordered_keys.reserve(entries_by_key.size());
+    for (const auto& [key, _] : entries_by_key) {
+        ordered_keys.push_back(key);
+    }
+    std::sort(ordered_keys.begin(), ordered_keys.end());
+
+    std::ostringstream summary;
+    for (const auto& key : ordered_keys) {
+        auto entry = std::move(entries_by_key.at(key));
+        if (entry.ownership_scope == "backend-owned") {
+            report.backend_owned_peak_bytes += std::max(entry.reserved_bytes, entry.planned_peak_bytes);
+        } else {
+            report.runtime_local_peak_bytes += std::max(entry.reserved_bytes, entry.planned_peak_bytes);
+        }
+        report.total_persistent_resource_reuse_hits += entry.persistent_resource_reuse_hits;
+        if (summary.tellp() > 0) {
+            summary << "; ";
+        }
+        summary << entry.device_uid
+                << " owner=" << entry.ownership_scope
+                << " reserved=" << entry.reserved_bytes
+                << " reuse=" << entry.persistent_resource_reuse_hits;
+        if (!entry.pool_id.empty()) {
+            summary << " pool=" << entry.pool_id;
+        }
+        if (entry.uses_runtime_spill_artifacts) {
+            summary << " spill-artifacts";
+        }
+        report.entries.push_back(std::move(entry));
+    }
+    report.summary = summary.str();
+    return report;
+}
+
+ExecutedResidencyMovementReport Runtime::build_executed_residency_movements(
+    const DirectExecutionReport* execution,
+    const ResidencySequenceReport& residency_sequence,
+    const SpillArtifactReport& spill_artifacts) const {
+    ExecutedResidencyMovementReport report;
+    if (execution == nullptr) {
+        return report;
+    }
+
+    std::unordered_map<std::string, std::uint32_t> operation_index_by_name;
+    operation_index_by_name.reserve(residency_sequence.indexed_operations.size());
+    for (std::uint32_t index = 0u; index < residency_sequence.indexed_operations.size(); ++index) {
+        operation_index_by_name.emplace(residency_sequence.indexed_operations[index], index);
+    }
+
+    std::vector<bool> action_consumed(residency_sequence.actions.size(), false);
+    const auto find_matching_action = [&](const std::string& operation_name,
+                                          const std::string& device_uid,
+                                          const std::string& movement_kind) -> const ResidencyAction* {
+        for (std::size_t index = 0; index < residency_sequence.actions.size(); ++index) {
+            const auto& action = residency_sequence.actions[index];
+            if (action_consumed[index] ||
+                action.trigger_operation_name != operation_name ||
+                action.device_uid != device_uid) {
+                continue;
+            }
+            const bool h2d_match =
+                movement_kind == "h2d" &&
+                (action.kind == ResidencyActionKind::prefetch || action.kind == ResidencyActionKind::reload);
+            const bool d2h_match =
+                movement_kind == "d2h" &&
+                (action.kind == ResidencyActionKind::spill || action.kind == ResidencyActionKind::evict);
+            if (!h2d_match && !d2h_match) {
+                continue;
+            }
+            action_consumed[index] = true;
+            return &action;
+        }
+        return nullptr;
+    };
+
+    const auto find_spill_artifact = [&](const ResidencyAction* action) -> const SpillArtifactEntry* {
+        if (action == nullptr) {
+            return nullptr;
+        }
+        return std::find_if(
+            spill_artifacts.entries.begin(),
+            spill_artifacts.entries.end(),
+            [&](const SpillArtifactEntry& artifact) {
+                return artifact.kind == action->kind &&
+                       artifact.device_uid == action->device_uid &&
+                       artifact.trigger_operation_name == action->trigger_operation_name &&
+                       artifact.tensor_id == action->tensor_id &&
+                       artifact.exists_on_disk;
+            }) == spill_artifacts.entries.end()
+                   ? nullptr
+                   : &(*std::find_if(
+                         spill_artifacts.entries.begin(),
+                         spill_artifacts.entries.end(),
+                         [&](const SpillArtifactEntry& artifact) {
+                             return artifact.kind == action->kind &&
+                                    artifact.device_uid == action->device_uid &&
+                                    artifact.trigger_operation_name == action->trigger_operation_name &&
+                                    artifact.tensor_id == action->tensor_id &&
+                                    artifact.exists_on_disk;
+                         }));
+    };
+
+    for (const auto& operation : execution->operations) {
+        const auto operation_index_it = operation_index_by_name.find(operation.operation_name);
+        const auto operation_index =
+            operation_index_it == operation_index_by_name.end() ? 0u : operation_index_it->second;
+        for (const auto& transfer : operation.transfer_records) {
+            auto entry = ExecutedResidencyMovementEntry{};
+            entry.kind = transfer.movement_kind;
+            entry.device_uid = transfer.device_uid;
+            entry.backend_name = transfer.backend_name;
+            entry.trigger_operation_name = operation.operation_name;
+            entry.pool_id = transfer.pool_id;
+            entry.operation_index = operation_index;
+            entry.bytes = transfer.bytes;
+            entry.runtime_us = transfer.runtime_us;
+            entry.from_direct_execution = true;
+
+            const auto* action = find_matching_action(operation.operation_name, transfer.device_uid, transfer.movement_kind);
+            if (action != nullptr) {
+                switch (action->kind) {
+                case ResidencyActionKind::prefetch:
+                    entry.kind = "prefetch";
+                    report.executed_h2d_bytes += transfer.bytes;
+                    break;
+                case ResidencyActionKind::reload:
+                    entry.kind = "reload";
+                    report.executed_reload_bytes += transfer.bytes;
+                    break;
+                case ResidencyActionKind::spill:
+                    entry.kind = "spill";
+                    report.executed_spill_bytes += transfer.bytes;
+                    break;
+                case ResidencyActionKind::evict:
+                    entry.kind = "evict";
+                    report.executed_d2h_bytes += transfer.bytes;
+                    break;
+                }
+                entry.tensor_id = action->tensor_id;
+                if (const auto* artifact = find_spill_artifact(action); artifact != nullptr) {
+                    entry.spill_artifact_path = artifact->path;
+                    entry.from_spill_artifact = true;
+                }
+            } else if (transfer.movement_kind == "h2d") {
+                report.executed_h2d_bytes += transfer.bytes;
+            } else if (transfer.movement_kind == "d2h") {
+                report.executed_d2h_bytes += transfer.bytes;
+            }
+
+            report.total_transfer_runtime_us += transfer.runtime_us;
+            report.entries.push_back(std::move(entry));
+        }
+    }
+
+    if (!report.entries.empty()) {
+        std::ostringstream summary;
+        summary << "executed_h2d=" << report.executed_h2d_bytes
+                << " executed_d2h=" << report.executed_d2h_bytes
+                << " executed_spill=" << report.executed_spill_bytes
+                << " executed_reload=" << report.executed_reload_bytes
+                << " transfer_us=" << report.total_transfer_runtime_us;
+        report.summary = summary.str();
+    }
+    return report;
+}
+
 KernelCoverageReport Runtime::build_kernel_coverage(const OptimizationReport& optimization) const {
     KernelCoverageReport report;
     std::ostringstream summary;
@@ -3554,7 +4153,7 @@ void Runtime::persist_telemetry(
 
     const auto path = telemetry_path();
     const std::string header =
-        "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tcopy_runtime_us\tcompute_runtime_us\tcopy_overlap_ratio\ttransfer_us\toverlapped_transfer_us\ttransfer_overlap_gain_us\ttransfer_overlap_ratio\toptimizer_budget_ms\tbudget_exhausted\tsummary\n";
+        "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tcopy_runtime_us\tcompute_runtime_us\tcopy_overlap_ratio\ttransfer_us\toverlapped_transfer_us\ttransfer_overlap_gain_us\ttransfer_overlap_ratio\toptimizer_budget_ms\tbudget_exhausted\tallocator_peak_live_bytes\tallocator_peak_reserved_bytes\tallocator_reuse_count\tspill_artifact_bytes\treload_artifact_bytes\tbackend_owned_peak_bytes\tbackend_resource_reuse_hits\texecuted_h2d_bytes\texecuted_d2h_bytes\texecuted_spill_bytes\texecuted_reload_bytes\texecuted_transfer_us\tsummary\n";
 
     std::ostringstream line;
     line << execution_epoch_ << '\t'
@@ -3591,6 +4190,18 @@ void Runtime::persist_telemetry(
          << (report.executed ? report.execution.transfer_overlap_ratio : 0.0) << '\t'
          << (report.executed ? report.execution.optimization.graph_optimization.time_budget_ms : 0u) << '\t'
          << (report.executed && report.execution.optimization.graph_optimization.budget_exhausted ? 1 : 0) << '\t'
+         << report.tensor_allocator.peak_live_bytes << '\t'
+         << report.tensor_allocator.peak_reserved_bytes << '\t'
+         << report.tensor_allocator.reuse_count << '\t'
+         << report.spill_artifacts.materialized_spill_bytes << '\t'
+         << report.spill_artifacts.materialized_reload_bytes << '\t'
+         << report.backend_buffer_bindings.backend_owned_peak_bytes << '\t'
+         << report.backend_buffer_bindings.total_persistent_resource_reuse_hits << '\t'
+         << report.executed_residency_movements.executed_h2d_bytes << '\t'
+         << report.executed_residency_movements.executed_d2h_bytes << '\t'
+         << report.executed_residency_movements.executed_spill_bytes << '\t'
+         << report.executed_residency_movements.executed_reload_bytes << '\t'
+         << report.executed_residency_movements.total_transfer_runtime_us << '\t'
          << report.safety.summary << '\n';
 
     if (options_.product.observability.async_telemetry_flush) {

@@ -10,8 +10,9 @@ Jakal-Core now supports local installs and package generation through CMake and 
 - `include/`: public headers
 - `share/jakal-core/branding/`: packaged branding assets generated from `Jakal_core_logo.png`
 - `share/jakal-core/install/`: install helper scripts and prerequisite manifest
+- `share/jakal-core/install/sign-and-verify-artifact.ps1`: checksum/signature helper used by install-time packaging utilities
 - `share/jakal-core/install/prereqs/`: optional bundled prerequisite installers
-- `share/jakal-core/update/`: update helper scripts
+- `share/jakal-core/update/`: update helper scripts, including checksum/signature verification
 - `share/jakal-core/remove/`: uninstall helper scripts
 - `share/doc/JakalCore/`: README, license, and distribution notes
 
@@ -98,4 +99,4 @@ To sign the NSIS installer itself, use `packaging/build-nsis-package.ps1` with `
 - verify the installer signature with `signtool verify /pa`
 - write an adjacent `<installer>.sha256` file and verify the checksum immediately
 
-`packaging/update-jakal-core.ps1` now verifies `.exe` and `.msi` installers before launching them, and it will also validate a `.sha256` sidecar when one is present. Pass `-RequireChecksum` if your automation must fail when the checksum file is missing.
+`packaging/update-jakal-core.ps1` now validates a `.sha256` sidecar when one is present and can require one with `-RequireChecksum`. Pass `-RequireSignature` or `-ExpectedSignerThumbprint` when your automation must enforce Authenticode validation for `.exe` or `.msi` installers.

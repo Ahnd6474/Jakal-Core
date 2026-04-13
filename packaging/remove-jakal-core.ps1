@@ -1,7 +1,11 @@
 param(
     [string]$InstallRoot = "",
-    [switch]$ForceRemove
+    [switch]$ForceRemove,
+    [switch]$Quiet
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
     $InstallRoot = Split-Path -Path $PSScriptRoot -Parent
@@ -11,7 +15,11 @@ if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
 $nsisUninstaller = Join-Path $InstallRoot "Uninstall.exe"
 
 if (Test-Path $nsisUninstaller) {
-    Start-Process -FilePath $nsisUninstaller -Wait
+    $arguments = @()
+    if ($Quiet) {
+        $arguments += "/S"
+    }
+    Start-Process -FilePath $nsisUninstaller -ArgumentList $arguments -Wait
     exit 0
 }
 

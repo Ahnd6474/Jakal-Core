@@ -211,6 +211,37 @@ typedef struct jakal_core_execution_operation_info {
     unsigned int logical_partitions_used;
 } jakal_core_execution_operation_info;
 
+typedef struct jakal_core_backend_buffer_binding_info {
+    char device_uid[128];
+    char backend_name[64];
+    char ownership_scope[32];
+    char pool_id[160];
+    char resource_tag[64];
+    unsigned long long planned_peak_bytes;
+    unsigned long long reserved_bytes;
+    unsigned long long spill_bytes;
+    unsigned long long reload_bytes;
+    unsigned int direct_execution_operation_count;
+    unsigned int persistent_resource_reuse_hits;
+    int direct_execution_active;
+    int uses_runtime_spill_artifacts;
+} jakal_core_backend_buffer_binding_info;
+
+typedef struct jakal_core_residency_movement_info {
+    char kind[32];
+    char tensor_id[128];
+    char device_uid[128];
+    char backend_name[64];
+    char trigger_operation_name[128];
+    char pool_id[160];
+    char spill_artifact_path[260];
+    unsigned int operation_index;
+    unsigned long long bytes;
+    double runtime_us;
+    int from_direct_execution;
+    int from_spill_artifact;
+} jakal_core_residency_movement_info;
+
 JAKAL_CORE_C_API jakal_core_runtime_t* jakal_core_runtime_create(void);
 JAKAL_CORE_C_API jakal_core_runtime_t* jakal_core_runtime_create_with_options(
     const jakal_core_runtime_options* options);
@@ -270,6 +301,18 @@ JAKAL_CORE_C_API int jakal_core_runtime_execute_manifest(
     jakal_core_execution_operation_info* operations,
     size_t capacity,
     size_t* out_count);
+JAKAL_CORE_C_API size_t jakal_core_runtime_last_backend_buffer_binding_count(
+    const jakal_core_runtime_t* runtime);
+JAKAL_CORE_C_API int jakal_core_runtime_get_last_backend_buffer_binding(
+    const jakal_core_runtime_t* runtime,
+    size_t index,
+    jakal_core_backend_buffer_binding_info* out_binding);
+JAKAL_CORE_C_API size_t jakal_core_runtime_last_residency_movement_count(
+    const jakal_core_runtime_t* runtime);
+JAKAL_CORE_C_API int jakal_core_runtime_get_last_residency_movement(
+    const jakal_core_runtime_t* runtime,
+    size_t index,
+    jakal_core_residency_movement_info* out_movement);
 
 #ifdef __cplusplus
 }

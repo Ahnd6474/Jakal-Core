@@ -271,6 +271,19 @@ if(JAKAL_CORE_BUILD_TESTS)
     target_link_libraries(jakal_runtime_install_smoke PRIVATE jakal::runtime)
     add_test(NAME jakal_runtime_install_smoke COMMAND jakal_runtime_install_smoke)
 
+    if(WIN32)
+        find_program(JAKAL_CORE_POWERSHELL_EXECUTABLE NAMES powershell pwsh REQUIRED)
+        add_test(
+            NAME jakal_package_smoke
+            COMMAND
+                "${JAKAL_CORE_POWERSHELL_EXECUTABLE}"
+                -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/packaging/package-smoke.ps1"
+                -BuildDir "${CMAKE_CURRENT_BINARY_DIR}"
+                -BuildConfig "$<CONFIG>")
+        set_tests_properties(jakal_package_smoke PROPERTIES TIMEOUT 900)
+    endif()
+
     add_executable(jakal_workload_bench tests/workload_bench.cpp)
     target_link_libraries(jakal_workload_bench PRIVATE jakal::core)
     add_test(NAME jakal_workload_bench COMMAND jakal_workload_bench --smoke --host-only)
@@ -312,6 +325,7 @@ install(
     FILES
         packaging/install-jakal-core.ps1
         packaging/build-nsis-package.ps1
+        packaging/sign-and-verify-artifact.ps1
         packaging/jakal-prerequisites.json
     DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/install
     COMPONENT maintenance)
@@ -325,6 +339,7 @@ install(
 install(
     FILES
         packaging/update-jakal-core.ps1
+        packaging/sign-and-verify-artifact.ps1
     DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/update
     COMPONENT maintenance)
 
