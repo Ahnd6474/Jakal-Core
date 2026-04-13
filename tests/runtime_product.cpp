@@ -696,6 +696,8 @@ int main() {
         const auto regression_gate_cache_path = unique_temp_file("runtime-product-regression-gate", ".tsv");
         const auto regression_gate_telemetry_path =
             unique_temp_file("runtime-product-regression-gate", ".telemetry.tsv");
+        const auto summary_only_telemetry_path =
+            unique_temp_file("runtime-product-summary-only", ".telemetry.tsv");
 
         {
             std::ofstream weights(weight_asset_path, std::ios::binary | std::ios::trunc);
@@ -865,6 +867,19 @@ int main() {
         }
         if (runtime_managed.execution.optimization.operations.empty()) {
             std::cerr << "spec-only manifest execute produced no optimized operations\n";
+            return 1;
+        }
+
+        jakal::RuntimeOptions summary_only_options = options;
+        summary_only_options.product.performance.diagnostics_mode = jakal::RuntimeDiagnosticsMode::summary_only;
+        summary_only_options.product.observability.telemetry_path = summary_only_telemetry_path;
+        jakal::Runtime summary_only_runtime(summary_only_options);
+        const auto summary_only_managed = summary_only_runtime.execute_manifest(runtime_manifest_path);
+        if (!summary_only_managed.executed ||
+            summary_only_managed.tensor_allocator.peak_live_bytes == 0u ||
+            !summary_only_managed.tensor_allocator.events.empty() ||
+            !summary_only_managed.spill_artifacts.entries.empty()) {
+            std::cerr << "summary-only diagnostics did not preserve counters while eliding detailed events\n";
             return 1;
         }
 
@@ -1091,13 +1106,31 @@ int main() {
             tier1_plan,
             tier1_graphs,
             &tier1_manifest.graph);
+        const auto tier1_cached_optimization = tier1_optimizer.optimize(
+            tier1_manifest.workload,
+            tier1_plan,
+            tier1_graphs,
+            &tier1_manifest.graph);
         jakal::JakalToolkit tier1_toolkit;
         const auto tier1_index = tier1_toolkit.build_index(tier1_graphs);
         jakal::DirectExecutor tier1_executor;
         const auto tier1_cold = tier1_executor.execute(tier1_optimization, tier1_graphs, tier1_index);
-        const auto tier1_warm = tier1_executor.execute(tier1_optimization, tier1_graphs, tier1_index);
+        jakal::DirectExecutionPolicy trusted_direct_policy;
+        trusted_direct_policy.enable_trusted_cached_validation = true;
+        trusted_direct_policy.trusted_verification_interval = 8u;
+        trusted_direct_policy.trusted_verification_sample_budget = 2u;
+        const auto tier1_warm = tier1_executor.execute(
+            tier1_cached_optimization,
+            tier1_graphs,
+            tier1_index,
+            trusted_direct_policy);
         if (!tier1_cold.all_succeeded || !tier1_warm.all_succeeded) {
             std::cerr << "tier1 direct execution did not succeed across repeated runs\n";
+            return 1;
+        }
+        if (tier1_cached_optimization.loaded_from_cache &&
+            tier1_warm.total_reference_runtime_us > tier1_cold.total_reference_runtime_us) {
+            std::cerr << "trusted cached direct execute did not reduce warm verification work\n";
             return 1;
         }
         if (tier1_warm.total_runtime_us > tier1_cold.total_runtime_us * 1.05 &&
@@ -1107,8 +1140,13 @@ int main() {
         }
         std::error_code tier1_ec;
         std::filesystem::remove(tier1_cache_path, tier1_ec);
+        std::filesystem::remove(tier1_cache_path.string() + ".bin", tier1_ec);
         std::filesystem::remove(tier1_cache_path.string() + ".perf", tier1_ec);
+        std::filesystem::remove(tier1_cache_path.string() + ".perf.bin", tier1_ec);
         std::filesystem::remove(tier1_cache_path.string() + ".perf.family", tier1_ec);
+        std::filesystem::remove(tier1_cache_path.string() + ".perf.family.bin", tier1_ec);
+        std::filesystem::remove(tier1_cache_path.string() + ".cpuhint", tier1_ec);
+        std::filesystem::remove(tier1_cache_path.string() + ".cpuhint.bin", tier1_ec);
 
         double repeated_managed_runtime_us = 0.0;
         std::ifstream telemetry(manifest_managed.telemetry_path);
@@ -1146,7 +1184,13 @@ int main() {
             return 1;
         }
         const auto perf_cache_path = std::filesystem::path(execution_cache_path.string() + ".perf");
-        if (!std::filesystem::exists(perf_cache_path)) {
+        const auto bootstrap_binary_cache_path = std::filesystem::path(execution_cache_path.string() + ".bin");
+        const auto perf_binary_cache_path = std::filesystem::path(execution_cache_path.string() + ".perf.bin");
+        const auto cpu_hint_binary_cache_path = std::filesystem::path(execution_cache_path.string() + ".cpuhint.bin");
+        if (!std::filesystem::exists(perf_cache_path) ||
+            !std::filesystem::exists(bootstrap_binary_cache_path) ||
+            !std::filesystem::exists(perf_binary_cache_path) ||
+            !std::filesystem::exists(cpu_hint_binary_cache_path)) {
             std::cerr << "runtime performance cache was not persisted\n";
             return 1;
         }
@@ -1334,11 +1378,21 @@ int main() {
         std::filesystem::remove(missing_weight_asset_path, ec);
         std::filesystem::remove(cache_path, ec);
         std::filesystem::remove(execution_cache_path, ec);
+        std::filesystem::remove(execution_cache_path.string() + ".bin", ec);
         std::filesystem::remove(execution_cache_path.string() + ".perf", ec);
+        std::filesystem::remove(execution_cache_path.string() + ".perf.bin", ec);
         std::filesystem::remove(execution_cache_path.string() + ".perf.family", ec);
+        std::filesystem::remove(execution_cache_path.string() + ".perf.family.bin", ec);
+        std::filesystem::remove(execution_cache_path.string() + ".cpuhint", ec);
+        std::filesystem::remove(execution_cache_path.string() + ".cpuhint.bin", ec);
         std::filesystem::remove(regression_gate_cache_path, ec);
+        std::filesystem::remove(regression_gate_cache_path.string() + ".bin", ec);
         std::filesystem::remove(regression_gate_cache_path.string() + ".perf", ec);
+        std::filesystem::remove(regression_gate_cache_path.string() + ".perf.bin", ec);
         std::filesystem::remove(regression_gate_cache_path.string() + ".perf.family", ec);
+        std::filesystem::remove(regression_gate_cache_path.string() + ".perf.family.bin", ec);
+        std::filesystem::remove(regression_gate_cache_path.string() + ".cpuhint", ec);
+        std::filesystem::remove(regression_gate_cache_path.string() + ".cpuhint.bin", ec);
         const auto packed_root = cache_path.parent_path() / (cache_path.stem().string() + "-packed-layouts");
         const auto spill_root = runtime.install_paths().cache_dir / "spill-artifacts";
         std::filesystem::remove_all(packed_root, ec);
@@ -1364,6 +1418,9 @@ int main() {
         std::filesystem::remove(regression_restart.telemetry_path, ec);
         std::filesystem::remove(telemetry_budget_cache_path(regression_restart.telemetry_path), ec);
         std::filesystem::remove(telemetry_budget_delta_path(regression_restart.telemetry_path), ec);
+        std::filesystem::remove(summary_only_telemetry_path, ec);
+        std::filesystem::remove(telemetry_budget_cache_path(summary_only_telemetry_path), ec);
+        std::filesystem::remove(telemetry_budget_delta_path(summary_only_telemetry_path), ec);
         std::filesystem::remove(family_only_telemetry_path, ec);
         std::filesystem::remove(telemetry_budget_cache_path(family_only_telemetry_path), ec);
         std::filesystem::remove(telemetry_budget_delta_path(family_only_telemetry_path), ec);

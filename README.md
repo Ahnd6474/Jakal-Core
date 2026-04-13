@@ -255,7 +255,8 @@ This is where the repository stands today:
 - Discovery can use host, OpenCL, Level Zero, Vulkan, CUDA, and ROCm probes when the matching runtime libraries are present.
 - Planning and optimization work across those discovered graphs.
 - The direct executor can run host kernels, OpenCL kernels, Vulkan direct kernels, and some native Level Zero, CUDA, and ROCm kernels.
-- The managed execution layer can run native workload manifests, do memory preflight checks, materialize residency and tensor-allocation traces, summarize backend buffer ownership and persistent resource reuse, correlate executed residency movement with direct-execution transfers, apply persisted-regression safety gates for explicit strategies, emit asset-prefetch plans, and write schema-versioned TSV telemetry.
+- The managed execution layer can run native workload manifests, do memory preflight checks, materialize residency and tensor-allocation traces, summarize backend buffer ownership and persistent resource reuse, correlate executed residency movement with direct-execution transfers, apply persisted-regression safety gates for explicit strategies, emit asset-prefetch plans, and write schema-versioned telemetry plus binary execution-cache sidecars for faster warm starts.
+- Installed/runtime-managed paths now default to lighter hot-path behavior on trusted cached runs: direct execution samples verification work instead of re-running every host reference, repeated shard dispatches inline small groups, and managed execution can collapse cached runs to summary-only diagnostics while still preserving safety counters and telemetry.
 - `load_workload_source(...)` can build workload graphs from native manifests and imported model descriptions such as ONNX and GGUF.
 - `jakal_runtime` exposes the runtime through a smaller C ABI, including ABI/schema version queries plus managed-execution buffer-binding and residency-movement summaries after manifest execution, and `jakal_core_cli` exposes install-path and backend-health diagnostics for packaged runtime scenarios.
 - The Python helpers under [`python/`](./python/) wrap the C ABI for lightweight `doctor`, `paths`, `optimize-smoke`, and `run-manifest` flows.
@@ -266,7 +267,7 @@ Known gaps in the current tree:
 
 What is still missing:
 
-- backend-owned tensor allocators and residency movement beyond the current runtime-local allocation, spill-artifact, and backend buffer-binding diagnostics layer
+- backend-owned tensor allocators and residency movement beyond the current runtime-local allocation, spill-artifact, backend buffer-binding, and cached packed-layout reuse layers
 - framework bridges for PyTorch, TensorFlow, or similar runtimes beyond the small export helper in `scripts/`
 - fully validated production packaging, update, and silent-install flows across clean machines
 - a stable production execution stack with mature native backend coverage across every supported accelerator path

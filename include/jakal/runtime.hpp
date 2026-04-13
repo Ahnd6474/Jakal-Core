@@ -44,13 +44,27 @@ struct RuntimeSafetyPolicy {
 struct RuntimeObservabilityOptions {
     bool persist_telemetry = true;
     bool async_telemetry_flush = true;
+    std::size_t telemetry_batch_line_count = 1u;
+    std::size_t telemetry_batch_bytes = 0u;
     std::filesystem::path telemetry_path;
+};
+
+enum class RuntimeDiagnosticsMode {
+    full,
+    summary_only
+};
+
+struct RuntimePerformanceOptions {
+    RuntimeDiagnosticsMode diagnostics_mode = RuntimeDiagnosticsMode::full;
+    bool use_summary_diagnostics_for_cached_runs = false;
+    DirectExecutionPolicy direct_execution;
 };
 
 struct RuntimeProductPolicy {
     RuntimeMemoryPolicy memory;
     RuntimeSafetyPolicy safety;
     RuntimeObservabilityOptions observability;
+    RuntimePerformanceOptions performance;
 };
 
 struct RuntimeOptimizationPolicy {

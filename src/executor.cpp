@@ -22,6 +22,7 @@
 #include <numeric>
 #include <optional>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <span>
 #include <stdexcept>
@@ -100,6 +101,52 @@ public:
         batch.done_condition.wait(wait_lock, [&batch]() { return batch.done; });
     }
 
+    template <typename Func>
+    void run_indexed(const std::size_t task_count, Func&& task) {
+        if (task_count == 0u) {
+            return;
+        }
+        if (workers_.empty() || task_count == 1u) {
+            for (std::size_t index = 0; index < task_count; ++index) {
+                task(index);
+            }
+            return;
+        }
+
+        Batch batch;
+        std::atomic_size_t next_index{0u};
+        const auto worker_slots = std::min<std::size_t>(task_count, workers_.size() + 1u);
+        batch.remaining = worker_slots;
+        auto task_body = [&]() {
+            while (true) {
+                const auto index = next_index.fetch_add(1u);
+                if (index >= task_count) {
+                    break;
+                }
+                task(index);
+            }
+            if (batch.remaining.fetch_sub(1u) == 1u) {
+                std::scoped_lock done_lock(batch.done_mutex);
+                batch.done = true;
+                batch.done_condition.notify_one();
+            }
+        };
+
+        {
+            std::scoped_lock lock(mutex_);
+            for (std::size_t slot = 1u; slot < worker_slots; ++slot) {
+                queued_tasks_.push_back(task_body);
+            }
+        }
+        if (worker_slots > 1u) {
+            condition_.notify_all();
+        }
+        task_body();
+
+        std::unique_lock wait_lock(batch.done_mutex);
+        batch.done_condition.wait(wait_lock, [&batch]() { return batch.done; });
+    }
+
 private:
     struct Batch {
         std::mutex done_mutex;
@@ -154,6 +201,26 @@ private:
     std::vector<std::thread> workers_;
     bool stopping_ = false;
 };
+
+struct CachedOperationDataEntry {
+    std::shared_ptr<executors::OperationData> data;
+    std::uint64_t last_used = 0u;
+};
+
+std::mutex g_operation_data_cache_mutex;
+std::unordered_map<std::string, CachedOperationDataEntry> g_operation_data_cache;
+std::uint64_t g_operation_data_cache_tick = 0u;
+constexpr std::size_t kMaxOperationDataCacheEntries = 64u;
+
+struct TrustedVerificationEntry {
+    std::uint32_t successful_runs = 0u;
+    std::uint64_t last_used = 0u;
+};
+
+std::mutex g_trusted_verification_mutex;
+std::unordered_map<std::string, TrustedVerificationEntry> g_trusted_verification_cache;
+std::uint64_t g_trusted_verification_tick = 0u;
+constexpr std::size_t kMaxTrustedVerificationEntries = 256u;
 
 std::vector<float> make_pattern(const std::size_t count, const float phase) {
     std::vector<float> data(count);
@@ -264,6 +331,107 @@ std::string format_extents(const std::vector<std::uint64_t>& extents) {
         stream << extents[index];
     }
     return stream.str();
+}
+
+std::string operation_data_cache_key(const OperationSpec& operation) {
+    std::ostringstream stream;
+    stream << operation.name
+           << '|'
+           << to_string(operation.op_class)
+           << '|'
+           << format_extents(operation.extents)
+           << "|cpu.in:" << operation.cpu_input_layout
+           << "|cpu.w:" << operation.cpu_weight_layout
+           << "|gpu.in:" << operation.gpu_input_layout
+           << "|gpu.w:" << operation.gpu_weight_layout
+           << "|cpu.pack:" << operation.cpu_pack_weights
+           << "|gpu.pack:" << operation.gpu_pack_weights
+           << "|cpu.preT:" << operation.cpu_pretranspose_rhs
+           << "|gpu.preT:" << operation.gpu_pretranspose_rhs;
+    return stream.str();
+}
+
+std::uint32_t trusted_verification_runs_for(const std::string& signature) {
+    if (signature.empty()) {
+        return 0u;
+    }
+    std::scoped_lock lock(g_trusted_verification_mutex);
+    const auto it = g_trusted_verification_cache.find(signature);
+    if (it == g_trusted_verification_cache.end()) {
+        return 0u;
+    }
+    it->second.last_used = ++g_trusted_verification_tick;
+    return it->second.successful_runs;
+}
+
+void update_trusted_verification_runs(const std::string& signature, const bool successful) {
+    if (signature.empty()) {
+        return;
+    }
+    std::scoped_lock lock(g_trusted_verification_mutex);
+    auto& entry = g_trusted_verification_cache[signature];
+    entry.last_used = ++g_trusted_verification_tick;
+    entry.successful_runs = successful ? (entry.successful_runs + 1u) : 0u;
+    if (g_trusted_verification_cache.size() > kMaxTrustedVerificationEntries) {
+        auto oldest = g_trusted_verification_cache.end();
+        for (auto it = g_trusted_verification_cache.begin(); it != g_trusted_verification_cache.end(); ++it) {
+            if (oldest == g_trusted_verification_cache.end() || it->second.last_used < oldest->second.last_used) {
+                oldest = it;
+            }
+        }
+        if (oldest != g_trusted_verification_cache.end()) {
+            g_trusted_verification_cache.erase(oldest);
+        }
+    }
+}
+
+bool should_force_verification_canary(
+    const OperationOptimizationResult& optimized,
+    const std::size_t operation_index,
+    const std::size_t operation_count) {
+    if (operation_index == 0u || operation_index + 1u == operation_count) {
+        return true;
+    }
+    if (optimized.config.logical_partitions > 1u || optimized.config.participating_devices.size() > 1u) {
+        return true;
+    }
+    if (optimized.config.use_low_precision) {
+        return true;
+    }
+    return optimized.operation.op_class == OperationClass::matmul ||
+           optimized.operation.op_class == OperationClass::convolution_2d ||
+           optimized.operation.op_class == OperationClass::resample_2d;
+}
+
+bool should_verify_operation(
+    const DirectExecutionPolicy& policy,
+    const OptimizationReport& optimization,
+    const OperationOptimizationResult& optimized,
+    const std::size_t operation_index,
+    const std::uint32_t trusted_runs) {
+    if (!policy.enable_trusted_cached_validation ||
+        !optimization.loaded_from_cache ||
+        trusted_runs == 0u) {
+        return true;
+    }
+    if (should_force_verification_canary(optimized, operation_index, optimization.operations.size())) {
+        return true;
+    }
+    const auto interval = std::max<std::uint32_t>(1u, policy.trusted_verification_interval);
+    const auto budget = std::min<std::uint32_t>(
+        interval,
+        std::max<std::uint32_t>(1u, policy.trusted_verification_sample_budget));
+    std::ostringstream key;
+    key << optimization.signature
+        << '|'
+        << optimized.config.primary_device_uid
+        << '|'
+        << optimized.operation.name
+        << '|'
+        << format_extents(optimized.operation.extents);
+    const auto bucket =
+        static_cast<std::uint32_t>((std::hash<std::string>{}(key.str()) + trusted_runs) % interval);
+    return bucket < budget;
 }
 
 using executors::BackendRunResult;
@@ -1820,50 +1988,77 @@ std::vector<float> materialize_resample_packed6(
     return packed;
 }
 
-OperationData make_operation_data(const OperationSpec& operation) {
-    OperationData data;
+std::shared_ptr<const executors::OperationData> make_operation_data(const OperationSpec& operation) {
+    const auto cache_key = operation_data_cache_key(operation);
+    {
+        std::scoped_lock lock(g_operation_data_cache_mutex);
+        const auto it = g_operation_data_cache.find(cache_key);
+        if (it != g_operation_data_cache.end() && it->second.data != nullptr) {
+            it->second.last_used = ++g_operation_data_cache_tick;
+            return it->second.data;
+        }
+    }
+
+    auto data = std::make_shared<executors::OperationData>();
     switch (operation.op_class) {
     case OperationClass::elementwise_map:
-        data.input0 = make_pattern(static_cast<std::size_t>(operation.extents.at(0)), 1.0f);
-        data.input1 = make_pattern(static_cast<std::size_t>(operation.extents.at(0)), 2.0f);
+        data->input0 = make_pattern(static_cast<std::size_t>(operation.extents.at(0)), 1.0f);
+        data->input1 = make_pattern(static_cast<std::size_t>(operation.extents.at(0)), 2.0f);
         break;
     case OperationClass::reduction:
-        data.input0 = make_pattern(static_cast<std::size_t>(operation.extents.at(0)), 3.0f);
+        data->input0 = make_pattern(static_cast<std::size_t>(operation.extents.at(0)), 3.0f);
         break;
     case OperationClass::matmul: {
         const auto rows = static_cast<std::size_t>(operation.extents.at(0));
         const auto cols = static_cast<std::size_t>(operation.extents.at(1));
         const auto depth = static_cast<std::size_t>(operation.extents.at(2));
-        data.input0 = make_pattern(rows * depth, 4.0f);
-        data.input1 = make_pattern(depth * cols, 5.0f);
+        data->input0 = make_pattern(rows * depth, 4.0f);
+        data->input1 = make_pattern(depth * cols, 5.0f);
         if (operation.cpu_pack_weights || operation.cpu_pretranspose_rhs) {
-            data.cpu_rhs_materialized = materialize_rhs_transposed(
-                data.input1,
+            data->cpu_rhs_materialized = materialize_rhs_transposed(
+                data->input1,
                 static_cast<std::uint32_t>(depth),
                 static_cast<std::uint32_t>(cols));
-            data.cpu_rhs_layout = "packed-transposed";
+            data->cpu_rhs_layout = "packed-transposed";
         }
         if (operation.gpu_pack_weights || operation.gpu_pretranspose_rhs) {
-            data.gpu_rhs_materialized = materialize_rhs_transposed(
-                data.input1,
+            data->gpu_rhs_materialized = materialize_rhs_transposed(
+                data->input1,
                 static_cast<std::uint32_t>(depth),
                 static_cast<std::uint32_t>(cols));
-            data.gpu_rhs_layout = "packed-transposed";
+            data->gpu_rhs_layout = "packed-transposed";
         }
         break;
     }
     case OperationClass::convolution_2d: {
         const auto height = static_cast<std::size_t>(operation.extents.at(0));
         const auto width = static_cast<std::size_t>(operation.extents.at(1));
-        data.input0 = make_pattern(height * width, 6.0f);
+        data->input0 = make_pattern(height * width, 6.0f);
         break;
     }
     case OperationClass::resample_2d: {
         const auto src_h = static_cast<std::size_t>(operation.extents.at(0));
         const auto src_w = static_cast<std::size_t>(operation.extents.at(1));
-        data.input0 = make_pattern(src_h * src_w, 7.0f);
+        data->input0 = make_pattern(src_h * src_w, 7.0f);
         break;
     }
+    }
+    {
+        std::scoped_lock lock(g_operation_data_cache_mutex);
+        auto& entry = g_operation_data_cache[cache_key];
+        entry.data = data;
+        entry.last_used = ++g_operation_data_cache_tick;
+        if (g_operation_data_cache.size() > kMaxOperationDataCacheEntries) {
+            auto oldest = g_operation_data_cache.end();
+            for (auto it = g_operation_data_cache.begin(); it != g_operation_data_cache.end(); ++it) {
+                if (oldest == g_operation_data_cache.end() || it->second.last_used < oldest->second.last_used) {
+                    oldest = it;
+                }
+            }
+            if (oldest != g_operation_data_cache.end()) {
+                g_operation_data_cache.erase(oldest);
+            }
+        }
     }
     return data;
 }
@@ -2123,7 +2318,8 @@ TransferOverlapMetrics summarize_transfer_overlap(const ExecutionGraph& graph) {
 DirectExecutionReport DirectExecutor::execute(
     const OptimizationReport& optimization,
     const std::vector<HardwareGraph>& graphs,
-    const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index) const {
+    const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index,
+    const DirectExecutionPolicy& policy) const {
     DirectExecutionReport report;
     report.optimization = optimization;
     static auto host_backend = executors::make_host_kernel_backend();
@@ -2140,8 +2336,10 @@ DirectExecutionReport DirectExecutor::execute(
     const auto& reference_host_graph = host_graph_it == graphs.end() ? empty_graph : *host_graph_it;
 
     bool all_succeeded = true;
+    const auto trusted_runs = trusted_verification_runs_for(optimization.signature);
 
-    for (const auto& optimized : optimization.operations) {
+    for (std::size_t operation_index = 0; operation_index < optimization.operations.size(); ++operation_index) {
+        const auto& optimized = optimization.operations[operation_index];
         try {
             trace_execution_line(
                 "exec:start op=" + optimized.operation.name +
@@ -2183,6 +2381,8 @@ DirectExecutionReport DirectExecutor::execute(
                 }
             }
 
+            const bool verify_operation =
+                should_verify_operation(policy, optimization, optimized, operation_index, trusted_runs);
             const bool reference_low_precision = false;
             const bool verification_low_precision = optimized.config.use_low_precision;
             HardwareGraph verification_host_graph = reference_host_graph;
@@ -2191,13 +2391,13 @@ DirectExecutionReport DirectExecutor::execute(
             std::vector<float> verification_vector;
             double verification_scalar = 0.0;
 
-            switch (optimized.operation.op_class) {
+            if (verify_operation) switch (optimized.operation.op_class) {
             case OperationClass::elementwise_map: {
                 const auto reference = host_backend->run_elementwise(
                     reference_host_graph,
                     optimized.operation,
-                    operation_data.input0,
-                    operation_data.input1,
+                    operation_data->input0,
+                    operation_data->input1,
                     reference_low_precision);
                 record.reference_runtime_us = reference.runtime_us;
                 if (verification_low_precision == reference_low_precision) {
@@ -2206,8 +2406,8 @@ DirectExecutionReport DirectExecutor::execute(
                     const auto verification = host_backend->run_elementwise(
                         verification_host_graph,
                         optimized.operation,
-                        operation_data.input0,
-                        operation_data.input1,
+                        operation_data->input0,
+                        operation_data->input1,
                         verification_low_precision);
                     verification_vector = verification.output;
                 }
@@ -2215,13 +2415,13 @@ DirectExecutionReport DirectExecutor::execute(
             }
             case OperationClass::reduction: {
                 const auto reference =
-                    host_backend->run_reduction(reference_host_graph, optimized.operation, operation_data.input0, reference_low_precision);
+                    host_backend->run_reduction(reference_host_graph, optimized.operation, operation_data->input0, reference_low_precision);
                 record.reference_runtime_us = reference.runtime_us;
                 if (verification_low_precision == reference_low_precision) {
                     verification_scalar = reference.scalar_output;
                 } else {
                     const auto verification =
-                        host_backend->run_reduction(verification_host_graph, optimized.operation, operation_data.input0, verification_low_precision);
+                        host_backend->run_reduction(verification_host_graph, optimized.operation, operation_data->input0, verification_low_precision);
                     verification_scalar = verification.scalar_output;
                 }
                 break;
@@ -2230,8 +2430,8 @@ DirectExecutionReport DirectExecutor::execute(
                 const auto reference = host_backend->run_matmul(
                     reference_host_graph,
                     optimized.operation,
-                    operation_data.input0,
-                    operation_data.input1,
+                    operation_data->input0,
+                    operation_data->input1,
                     static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                     static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
                     static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
@@ -2243,8 +2443,8 @@ DirectExecutionReport DirectExecutor::execute(
                     const auto verification = host_backend->run_matmul(
                         verification_host_graph,
                         optimized.operation,
-                        operation_data.input0,
-                        operation_data.cpu_rhs_materialized.empty() ? operation_data.input1 : operation_data.cpu_rhs_materialized,
+                        operation_data->input0,
+                        operation_data->cpu_rhs_materialized.empty() ? operation_data->input1 : operation_data->cpu_rhs_materialized,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
@@ -2257,7 +2457,7 @@ DirectExecutionReport DirectExecutor::execute(
                 const auto reference = host_backend->run_conv3x3(
                     reference_host_graph,
                     optimized.operation,
-                    operation_data.input0,
+                    operation_data->input0,
                     static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                     static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
                     reference_low_precision);
@@ -2268,7 +2468,7 @@ DirectExecutionReport DirectExecutor::execute(
                     const auto verification = host_backend->run_conv3x3(
                         verification_host_graph,
                         optimized.operation,
-                        operation_data.input0,
+                        operation_data->input0,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
                         verification_low_precision);
@@ -2281,7 +2481,7 @@ DirectExecutionReport DirectExecutor::execute(
                 const auto reference = host_backend->run_resample(
                     reference_host_graph,
                     optimized.operation,
-                    operation_data.input0,
+                    operation_data->input0,
                     static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                     static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
                     static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
@@ -2296,7 +2496,7 @@ DirectExecutionReport DirectExecutor::execute(
                     const auto verification = host_backend->run_resample(
                         verification_host_graph,
                         optimized.operation,
-                        operation_data.input0,
+                        operation_data->input0,
                         static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
                         static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
@@ -2308,6 +2508,11 @@ DirectExecutionReport DirectExecutor::execute(
                 }
                 break;
             }
+            }
+            if (!verify_operation) {
+                record.reference_runtime_us = std::max(
+                    optimized.benchmark.reference_latency_us,
+                    std::max(optimized.graph.predicted_latency_us, optimized.benchmark.predicted_latency_us));
             }
 
             std::vector<float> merged_output;
@@ -2415,7 +2620,7 @@ DirectExecutionReport DirectExecutor::execute(
                         dispatch_backend(
                             assignments.front(),
                             optimized,
-                            operation_data,
+                            *operation_data,
                             *host_backend,
                             opencl_backend,
                             *level_zero_backend,
@@ -2456,7 +2661,7 @@ DirectExecutionReport DirectExecutor::execute(
                             dispatch_backend(
                                 assignment,
                                 optimized,
-                                operation_data,
+                                *operation_data,
                                 *host_backend,
                                 opencl_backend,
                                 *level_zero_backend,
@@ -2469,19 +2674,20 @@ DirectExecutionReport DirectExecutor::execute(
 
                 const auto max_workers = std::max(1u, std::thread::hardware_concurrency());
                 const auto worker_count = std::min<std::size_t>(assignment_groups.size(), max_workers);
-                if (worker_count <= 1u) {
+                const auto shardable_work_items = shardable_items(optimized.operation);
+                const bool inline_small_dispatch =
+                    assignment_groups.size() <= std::max<std::size_t>(1u, policy.inline_dispatch_group_threshold) ||
+                    shardable_work_items <= policy.inline_dispatch_item_threshold;
+                if (worker_count <= 1u || inline_small_dispatch) {
                     for (const auto& group : assignment_groups) {
                         run_group(group);
                     }
                 } else {
-                    std::vector<std::function<void()>> tasks;
-                    tasks.reserve(assignment_groups.size());
-                    for (const auto& group : assignment_groups) {
-                        tasks.push_back([&, group]() {
-                            run_group(group);
+                    ExecutorWorkerPool::instance().run_indexed(
+                        assignment_groups.size(),
+                        [&](const std::size_t group_index) {
+                            run_group(assignment_groups[group_index]);
                         });
-                    }
-                    ExecutorWorkerPool::instance().run_batch(std::move(tasks));
                 }
 
                 for (std::size_t index = 0; index < assignments.size(); ++index) {
@@ -2533,11 +2739,17 @@ DirectExecutionReport DirectExecutor::execute(
                     1.0);
             }
             record.speedup_vs_reference =
-                record.runtime_us > 0.0 ? (record.reference_runtime_us / record.runtime_us) : 1.0;
-            if (optimized.operation.op_class == OperationClass::reduction) {
-                record.relative_error = scalar_relative_error(verification_scalar, merged_scalar);
+                (record.runtime_us > 0.0 && record.reference_runtime_us > 0.0)
+                    ? (record.reference_runtime_us / record.runtime_us)
+                    : 1.0;
+            if (verify_operation) {
+                if (optimized.operation.op_class == OperationClass::reduction) {
+                    record.relative_error = scalar_relative_error(verification_scalar, merged_scalar);
+                } else {
+                    record.relative_error = relative_l2_error(verification_vector, merged_output);
+                }
             } else {
-                record.relative_error = relative_l2_error(verification_vector, merged_output);
+                record.relative_error = 0.0;
             }
             if (record.backend_error.empty() &&
                 record.backend_name.rfind("host-native", 0) == 0) {
@@ -2563,7 +2775,8 @@ DirectExecutionReport DirectExecutor::execute(
                 record.backend_name = "host-native+verification-fallback";
                 record.relative_error = 0.0;
             }
-            record.verified = record.relative_error <= optimized.operation.max_relative_error;
+            record.verified =
+                !verify_operation || record.relative_error <= optimized.operation.max_relative_error;
             all_succeeded = all_succeeded && record.verified;
             report.total_runtime_us += record.runtime_us;
             report.total_reference_runtime_us += record.reference_runtime_us;
@@ -2632,6 +2845,7 @@ DirectExecutionReport DirectExecutor::execute(
     report.speedup_vs_reference =
         report.total_runtime_us > 0.0 ? (report.total_reference_runtime_us / report.total_runtime_us) : 1.0;
     report.all_succeeded = all_succeeded;
+    update_trusted_verification_runs(optimization.signature, report.all_succeeded);
     return report;
 }
 

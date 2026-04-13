@@ -136,13 +136,96 @@ public:
         condition_.notify_one();
     }
 
+    void enqueue_append(
+        const std::filesystem::path& path,
+        const std::string& header,
+        const std::string& payload,
+        const std::size_t flush_line_count,
+        const std::size_t flush_bytes) {
+        if (path.empty()) {
+            return;
+        }
+        if (flush_line_count <= 1u && flush_bytes == 0u) {
+            enqueue([path, header, payload]() {
+                append_lines(path, header, payload);
+            });
+            return;
+        }
+
+        {
+            std::scoped_lock lock(mutex_);
+            auto& pending = pending_appends_[path.string()];
+            pending.path = path;
+            if (pending.header.empty()) {
+                pending.header = header;
+            }
+            pending.payload += payload;
+            pending.line_count += 1u;
+            pending.payload_bytes += payload.size();
+            if (pending.line_count >= std::max<std::size_t>(1u, flush_line_count) ||
+                (flush_bytes > 0u && pending.payload_bytes >= flush_bytes)) {
+                queue_pending_append_locked(path.string());
+            }
+        }
+        condition_.notify_one();
+    }
+
 private:
+    struct PendingAppend {
+        std::filesystem::path path;
+        std::string header;
+        std::string payload;
+        std::size_t line_count = 0u;
+        std::size_t payload_bytes = 0u;
+    };
+
+    static void append_lines(
+        const std::filesystem::path& path,
+        const std::string& header,
+        const std::string& payload) {
+        if (path.empty()) {
+            return;
+        }
+        const auto parent = path.parent_path();
+        if (!parent.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(parent, ec);
+        }
+        const bool write_header = !std::filesystem::exists(path);
+        std::ofstream output(path, std::ios::app);
+        if (!output.is_open()) {
+            return;
+        }
+        if (write_header && !header.empty()) {
+            output << header;
+        }
+        output << payload;
+    }
+
+    void queue_pending_append_locked(std::string key) {
+        const auto it = pending_appends_.find(key);
+        if (it == pending_appends_.end()) {
+            return;
+        }
+        auto pending = std::move(it->second);
+        pending_appends_.erase(it);
+        tasks_.push_back([pending = std::move(pending)]() {
+            append_lines(pending.path, pending.header, pending.payload);
+        });
+    }
+
     void run() {
         while (true) {
             std::function<void()> task;
             {
                 std::unique_lock lock(mutex_);
                 condition_.wait(lock, [&]() { return stopping_ || !tasks_.empty(); });
+                if (stopping_) {
+                    for (auto it = pending_appends_.begin(); it != pending_appends_.end();) {
+                        auto current = it++;
+                        queue_pending_append_locked(current->first);
+                    }
+                }
                 if (stopping_ && tasks_.empty()) {
                     break;
                 }
@@ -158,6 +241,7 @@ private:
     std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<std::function<void()>> tasks_;
+    std::unordered_map<std::string, PendingAppend> pending_appends_;
     std::thread worker_;
     bool stopping_ = false;
 };
@@ -2403,6 +2487,14 @@ RuntimeOptions make_runtime_options_for_install(const std::filesystem::path& ins
     options.cache_path = paths.planner_cache_path;
     options.execution_cache_path = paths.execution_cache_path;
     options.product.observability.telemetry_path = paths.telemetry_path;
+    options.product.observability.telemetry_batch_line_count = 8u;
+    options.product.observability.telemetry_batch_bytes = 16u * 1024u;
+    options.product.performance.use_summary_diagnostics_for_cached_runs = true;
+    options.product.performance.direct_execution.enable_trusted_cached_validation = true;
+    options.product.performance.direct_execution.trusted_verification_interval = 8u;
+    options.product.performance.direct_execution.trusted_verification_sample_budget = 2u;
+    options.product.performance.direct_execution.inline_dispatch_group_threshold = 2u;
+    options.product.performance.direct_execution.inline_dispatch_item_threshold = 4096u;
     const auto config_path = paths.config_dir / "jakal-runtime-config.ini";
     apply_runtime_ini_overrides(config_path, options);
     return options;
@@ -2640,7 +2732,11 @@ DirectExecutionReport Runtime::execute_with_feedback(
     const WorkloadSpec& workload,
     const OptimizationReport& optimization,
     const WorkloadGraph* workload_graph_override) {
-    auto initial_report = direct_executor_.execute(optimization, devices_, jakal_toolkit_index_);
+    auto direct_policy = options_.product.performance.direct_execution;
+    if (!optimization.loaded_from_cache) {
+        direct_policy.enable_trusted_cached_validation = false;
+    }
+    auto initial_report = direct_executor_.execute(optimization, devices_, jakal_toolkit_index_, direct_policy);
     auto initial_feedback = make_feedback_records(initial_report);
     execution_optimizer_.ingest_execution_feedback(
         initial_report.optimization,
@@ -2657,7 +2753,10 @@ DirectExecutionReport Runtime::execute_with_feedback(
         return initial_report;
     }
 
-    auto refined_report = direct_executor_.execute(refined_optimization, devices_, jakal_toolkit_index_);
+    if (!refined_optimization.loaded_from_cache) {
+        direct_policy.enable_trusted_cached_validation = false;
+    }
+    auto refined_report = direct_executor_.execute(refined_optimization, devices_, jakal_toolkit_index_, direct_policy);
     auto refined_feedback = make_feedback_records(refined_report);
     execution_optimizer_.ingest_execution_feedback(
         refined_report.optimization,
@@ -2724,20 +2823,61 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         devices_,
         &workload_graph,
         &context.execution_tuning);
-    auto refresh_execution_reports = [&](const DirectExecutionReport* execution_report) {
+    auto use_detailed_diagnostics = [&](const bool after_execution) {
+        if (options_.product.performance.diagnostics_mode == RuntimeDiagnosticsMode::summary_only) {
+            return false;
+        }
+        if (after_execution &&
+            options_.product.performance.use_summary_diagnostics_for_cached_runs &&
+            optimization.loaded_from_cache) {
+            return false;
+        }
+        return true;
+    };
+    auto refresh_execution_reports = [&](const DirectExecutionReport* execution_report, const bool after_execution) {
+        const bool detailed = use_detailed_diagnostics(after_execution);
         managed.kernel_coverage = build_kernel_coverage(optimization);
         managed.residency_sequence = build_residency_sequence(optimization);
-        managed.tensor_allocator = build_tensor_allocator(managed.residency_sequence);
-        managed.spill_artifacts = materialize_spill_artifacts(managed.residency_sequence);
-        managed.backend_buffer_bindings = build_backend_buffer_bindings(
-            execution_report,
-            managed.tensor_allocator,
-            managed.residency_sequence,
-            managed.spill_artifacts);
-        managed.executed_residency_movements = build_executed_residency_movements(
-            execution_report,
-            managed.residency_sequence,
-            managed.spill_artifacts);
+        if (detailed) {
+            managed.tensor_allocator = build_tensor_allocator(managed.residency_sequence);
+            managed.spill_artifacts = materialize_spill_artifacts(managed.residency_sequence);
+        } else {
+            managed.tensor_allocator = {};
+            managed.tensor_allocator.peak_live_bytes = managed.residency_sequence.peak_live_bytes;
+            managed.tensor_allocator.peak_reserved_bytes =
+                managed.residency_sequence.peak_live_bytes + managed.residency_sequence.reload_bytes;
+            managed.tensor_allocator.allocation_count =
+                static_cast<std::uint32_t>(optimization.workload_graph.tensors.size());
+            {
+                std::ostringstream summary;
+                summary << "allocator(summary-only) live=" << managed.tensor_allocator.peak_live_bytes
+                        << " reserved=" << managed.tensor_allocator.peak_reserved_bytes;
+                managed.tensor_allocator.summary = summary.str();
+            }
+            managed.spill_artifacts = {};
+            managed.spill_artifacts.materialized_spill_bytes = managed.residency_sequence.spill_bytes;
+            managed.spill_artifacts.materialized_reload_bytes = managed.residency_sequence.reload_bytes;
+            {
+                std::ostringstream summary;
+                summary << "spill(summary-only) spill=" << managed.spill_artifacts.materialized_spill_bytes
+                        << " reload=" << managed.spill_artifacts.materialized_reload_bytes;
+                managed.spill_artifacts.summary = summary.str();
+            }
+        }
+        if (execution_report != nullptr || detailed) {
+            managed.backend_buffer_bindings = build_backend_buffer_bindings(
+                execution_report,
+                managed.tensor_allocator,
+                managed.residency_sequence,
+                managed.spill_artifacts);
+            managed.executed_residency_movements = build_executed_residency_movements(
+                execution_report,
+                managed.residency_sequence,
+                managed.spill_artifacts);
+        } else {
+            managed.backend_buffer_bindings = {};
+            managed.executed_residency_movements = {};
+        }
         managed.memory_preflight.predicted_spill_bytes = managed.residency_sequence.spill_bytes;
         managed.memory_preflight.predicted_reload_bytes = managed.residency_sequence.reload_bytes;
         managed.memory_preflight.forced_spill_count = managed.residency_sequence.forced_spill_count;
@@ -2753,7 +2893,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
     };
     managed.safety.selected_strategy = optimization.partition_strategy;
     managed.memory_preflight = build_memory_preflight(optimization);
-    refresh_execution_reports(nullptr);
+    refresh_execution_reports(nullptr, false);
     refresh_regression_summary();
     managed.safety.planner_risk_score = planner_risk_score(
         effective_workload,
@@ -2789,7 +2929,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             update_planner_diagnostics(planned);
             optimization = std::move(fallback_optimization);
             managed.memory_preflight = std::move(fallback_memory);
-            refresh_execution_reports(nullptr);
+            refresh_execution_reports(nullptr, false);
             refresh_regression_summary();
             managed.safety.planner_risk_score = planner_risk_score(
                 effective_workload,
@@ -2856,7 +2996,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
 
     managed.execution = execute_with_feedback(effective_workload, optimization, &workload_graph);
     managed.executed = true;
-    refresh_execution_reports(&managed.execution);
+    refresh_execution_reports(&managed.execution, true);
     refresh_regression_summary();
     managed.safety.final_strategy = managed.execution.optimization.partition_strategy;
     auto planner_feedback = make_strategy_feedback_sample(
@@ -2906,7 +3046,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
                     managed.execution = std::move(fallback_execution);
                     managed.memory_preflight = std::move(fallback_memory);
                     optimization = std::move(fallback_optimization);
-                    refresh_execution_reports(&managed.execution);
+                    refresh_execution_reports(&managed.execution, true);
                     refresh_regression_summary();
                     managed.safety.planner_risk_score = planner_risk_score(
                         fallback_workload,
@@ -4254,9 +4394,12 @@ void Runtime::persist_telemetry(
          << report.safety.summary << '\n';
 
     if (options_.product.observability.async_telemetry_flush) {
-        telemetry_writer().enqueue([path, header, payload = line.str()]() {
-            append_tsv_line(path, header, payload);
-        });
+        telemetry_writer().enqueue_append(
+            path,
+            header,
+            line.str(),
+            options_.product.observability.telemetry_batch_line_count,
+            options_.product.observability.telemetry_batch_bytes);
     } else {
         append_tsv_line(path, header, line.str());
     }

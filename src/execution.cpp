@@ -158,6 +158,249 @@ std::filesystem::path cpu_runtime_hint_cache_path_for(const std::filesystem::pat
     return path;
 }
 
+std::filesystem::path bootstrap_cache_binary_path_for(const std::filesystem::path& cache_path) {
+    if (cache_path.empty()) {
+        return std::filesystem::path("jakal_core_execution_cache.tsv.bin");
+    }
+    auto path = cache_path;
+    path += ".bin";
+    return path;
+}
+
+std::filesystem::path performance_cache_binary_path_for(const std::filesystem::path& cache_path) {
+    return performance_cache_path_for(cache_path).string() + ".bin";
+}
+
+std::filesystem::path graph_family_cache_binary_path_for(const std::filesystem::path& cache_path) {
+    return graph_family_cache_path_for(cache_path).string() + ".bin";
+}
+
+std::filesystem::path cpu_runtime_hint_cache_binary_path_for(const std::filesystem::path& cache_path) {
+    return cpu_runtime_hint_cache_path_for(cache_path).string() + ".bin";
+}
+
+bool prefer_binary_cache(
+    const std::filesystem::path& binary_path,
+    const std::filesystem::path& text_path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(binary_path, ec)) {
+        return false;
+    }
+    if (!std::filesystem::exists(text_path, ec)) {
+        return true;
+    }
+    return std::filesystem::last_write_time(binary_path, ec) >=
+           std::filesystem::last_write_time(text_path, ec);
+}
+
+template <typename T>
+void write_pod(std::ostream& output, const T& value) {
+    output.write(reinterpret_cast<const char*>(&value), static_cast<std::streamsize>(sizeof(T)));
+}
+
+template <typename T>
+bool read_pod(std::istream& input, T& value) {
+    input.read(reinterpret_cast<char*>(&value), static_cast<std::streamsize>(sizeof(T)));
+    return input.good();
+}
+
+void write_string_binary(std::ostream& output, const std::string& value) {
+    const auto size = static_cast<std::uint32_t>(value.size());
+    write_pod(output, size);
+    if (size > 0u) {
+        output.write(value.data(), static_cast<std::streamsize>(size));
+    }
+}
+
+bool read_string_binary(std::istream& input, std::string& value) {
+    std::uint32_t size = 0u;
+    if (!read_pod(input, size)) {
+        return false;
+    }
+    value.resize(size);
+    if (size > 0u) {
+        input.read(value.data(), static_cast<std::streamsize>(size));
+    }
+    return input.good();
+}
+
+void write_string_vector_binary(std::ostream& output, const std::vector<std::string>& values) {
+    const auto size = static_cast<std::uint32_t>(values.size());
+    write_pod(output, size);
+    for (const auto& value : values) {
+        write_string_binary(output, value);
+    }
+}
+
+bool read_string_vector_binary(std::istream& input, std::vector<std::string>& values) {
+    std::uint32_t size = 0u;
+    if (!read_pod(input, size)) {
+        return false;
+    }
+    values.clear();
+    values.reserve(size);
+    for (std::uint32_t index = 0u; index < size; ++index) {
+        std::string value;
+        if (!read_string_binary(input, value)) {
+            return false;
+        }
+        values.push_back(std::move(value));
+    }
+    return true;
+}
+
+void write_execution_config_binary(std::ostream& output, const ExecutionConfig& config) {
+    write_string_binary(output, config.signature);
+    write_string_binary(output, config.operation_name);
+    write_string_binary(output, config.variant_id);
+    const auto strategy = static_cast<std::uint32_t>(config.strategy);
+    write_pod(output, strategy);
+    write_string_binary(output, config.primary_device_uid);
+    write_string_vector_binary(output, config.participating_devices);
+    write_string_vector_binary(output, config.mapped_structural_nodes);
+    write_pod(output, config.queue_depth);
+    write_pod(output, config.stages);
+    write_pod(output, config.tile_x);
+    write_pod(output, config.tile_y);
+    write_pod(output, config.tile_k);
+    write_pod(output, config.logical_partitions);
+    const auto overlap_transfers = static_cast<std::uint8_t>(config.overlap_transfers ? 1u : 0u);
+    const auto low_precision = static_cast<std::uint8_t>(config.use_low_precision ? 1u : 0u);
+    const auto semantic_head = static_cast<std::uint8_t>(config.semantic_head_partitioning ? 1u : 0u);
+    const auto semantic_token = static_cast<std::uint8_t>(config.semantic_token_partitioning ? 1u : 0u);
+    write_pod(output, overlap_transfers);
+    write_pod(output, low_precision);
+    write_pod(output, config.target_error_tolerance);
+    write_pod(output, config.queue_depth_scale);
+    write_pod(output, config.stage_scale);
+    write_pod(output, config.tile_scale);
+    write_pod(output, config.overlap_ratio);
+    write_pod(output, config.partition_intensity);
+    write_pod(output, config.precision_mix);
+    write_pod(output, config.telemetry_staging_hit_rate);
+    write_pod(output, config.telemetry_cross_device_sync_cost_us);
+    write_pod(output, config.telemetry_residency_pressure);
+    write_pod(output, semantic_head);
+    write_pod(output, semantic_token);
+}
+
+bool read_execution_config_binary(std::istream& input, ExecutionConfig& config) {
+    std::uint32_t strategy = 0u;
+    std::uint8_t overlap_transfers = 0u;
+    std::uint8_t low_precision = 0u;
+    std::uint8_t semantic_head = 0u;
+    std::uint8_t semantic_token = 0u;
+    return read_string_binary(input, config.signature) &&
+           read_string_binary(input, config.operation_name) &&
+           read_string_binary(input, config.variant_id) &&
+           read_pod(input, strategy) &&
+           read_string_binary(input, config.primary_device_uid) &&
+           read_string_vector_binary(input, config.participating_devices) &&
+           read_string_vector_binary(input, config.mapped_structural_nodes) &&
+           read_pod(input, config.queue_depth) &&
+           read_pod(input, config.stages) &&
+           read_pod(input, config.tile_x) &&
+           read_pod(input, config.tile_y) &&
+           read_pod(input, config.tile_k) &&
+           read_pod(input, config.logical_partitions) &&
+           read_pod(input, overlap_transfers) &&
+           read_pod(input, low_precision) &&
+           read_pod(input, config.target_error_tolerance) &&
+           read_pod(input, config.queue_depth_scale) &&
+           read_pod(input, config.stage_scale) &&
+           read_pod(input, config.tile_scale) &&
+           read_pod(input, config.overlap_ratio) &&
+           read_pod(input, config.partition_intensity) &&
+           read_pod(input, config.precision_mix) &&
+           read_pod(input, config.telemetry_staging_hit_rate) &&
+           read_pod(input, config.telemetry_cross_device_sync_cost_us) &&
+           read_pod(input, config.telemetry_residency_pressure) &&
+           read_pod(input, semantic_head) &&
+           read_pod(input, semantic_token) &&
+           ((config.strategy = static_cast<ExecutionStrategy>(strategy)), true) &&
+           ((config.overlap_transfers = overlap_transfers != 0u), true) &&
+           ((config.use_low_precision = low_precision != 0u), true) &&
+           ((config.semantic_head_partitioning = semantic_head != 0u), true) &&
+           ((config.semantic_token_partitioning = semantic_token != 0u), true);
+}
+
+void write_performance_summary_binary(std::ostream& output, const PerformanceSummary& summary) {
+    write_string_binary(output, summary.shape_bucket);
+    write_string_binary(output, summary.device_family_signature);
+    write_execution_config_binary(output, summary.config);
+    write_pod(output, summary.observations);
+    write_pod(output, summary.average_effective_latency_us);
+    write_pod(output, summary.average_relative_error);
+    write_pod(output, summary.average_prediction_scale);
+    write_pod(output, summary.average_calibration_ratio);
+    write_pod(output, summary.average_system_penalty_us);
+    write_pod(output, summary.average_validation_spread_us);
+    write_pod(output, summary.average_reward);
+    write_pod(output, summary.average_copy_share);
+    write_pod(output, summary.average_transfer_overlap_ratio);
+    write_pod(output, summary.average_budget_pressure);
+    write_pod(output, summary.average_queue_separation_ratio);
+    write_pod(output, summary.average_staging_hit_rate);
+    write_pod(output, summary.average_cross_device_sync_cost_us);
+    write_pod(output, summary.average_residency_pressure);
+    write_pod(output, summary.average_kv_host_residency_ratio);
+    write_pod(output, summary.regression_events);
+    write_pod(output, summary.worst_slowdown_vs_reference);
+}
+
+bool read_performance_summary_binary(std::istream& input, PerformanceSummary& summary) {
+    return read_string_binary(input, summary.shape_bucket) &&
+           read_string_binary(input, summary.device_family_signature) &&
+           read_execution_config_binary(input, summary.config) &&
+           read_pod(input, summary.observations) &&
+           read_pod(input, summary.average_effective_latency_us) &&
+           read_pod(input, summary.average_relative_error) &&
+           read_pod(input, summary.average_prediction_scale) &&
+           read_pod(input, summary.average_calibration_ratio) &&
+           read_pod(input, summary.average_system_penalty_us) &&
+           read_pod(input, summary.average_validation_spread_us) &&
+           read_pod(input, summary.average_reward) &&
+           read_pod(input, summary.average_copy_share) &&
+           read_pod(input, summary.average_transfer_overlap_ratio) &&
+           read_pod(input, summary.average_budget_pressure) &&
+           read_pod(input, summary.average_queue_separation_ratio) &&
+           read_pod(input, summary.average_staging_hit_rate) &&
+           read_pod(input, summary.average_cross_device_sync_cost_us) &&
+           read_pod(input, summary.average_residency_pressure) &&
+           read_pod(input, summary.average_kv_host_residency_ratio) &&
+           read_pod(input, summary.regression_events) &&
+           read_pod(input, summary.worst_slowdown_vs_reference);
+}
+
+void write_cpu_runtime_hint_binary(std::ostream& output, const CpuRuntimeHintSummary& summary) {
+    write_string_binary(output, summary.shape_bucket);
+    write_pod(output, summary.preferred_parallel_chunk);
+    write_pod(output, summary.preferred_tile_m);
+    write_pod(output, summary.preferred_tile_n);
+    write_pod(output, summary.preferred_tile_k);
+    write_pod(output, summary.preferred_single_thread_cutoff);
+    write_string_binary(output, summary.preferred_kernel_family);
+    const auto preferred_use_avx512 = static_cast<std::uint8_t>(summary.preferred_use_avx512 ? 1u : 0u);
+    write_pod(output, preferred_use_avx512);
+    write_pod(output, summary.observations);
+    write_pod(output, summary.average_effective_latency_us);
+}
+
+bool read_cpu_runtime_hint_binary(std::istream& input, CpuRuntimeHintSummary& summary) {
+    std::uint8_t preferred_use_avx512 = 0u;
+    return read_string_binary(input, summary.shape_bucket) &&
+           read_pod(input, summary.preferred_parallel_chunk) &&
+           read_pod(input, summary.preferred_tile_m) &&
+           read_pod(input, summary.preferred_tile_n) &&
+           read_pod(input, summary.preferred_tile_k) &&
+           read_pod(input, summary.preferred_single_thread_cutoff) &&
+           read_string_binary(input, summary.preferred_kernel_family) &&
+           read_pod(input, preferred_use_avx512) &&
+           read_pod(input, summary.observations) &&
+           read_pod(input, summary.average_effective_latency_us) &&
+           ((summary.preferred_use_avx512 = preferred_use_avx512 != 0u), true);
+}
+
 std::string shape_bucket_for(const OperationSpec& operation) {
     std::ostringstream stream;
     stream << to_string(operation.op_class);
@@ -2106,6 +2349,11 @@ ExecutionConfigSearchPassState prepare_execution_config_search_pass(
         adaptive_optimizer.should_use_lightweight_path(report_signature, pass.fully_cached);
     pass.validation_tier =
         tuning_overrides == nullptr ? ValidationTier::adaptive : tuning_overrides->validation_tier;
+    if (pass.fully_cached &&
+        pass.lightweight_path &&
+        pass.validation_tier == ValidationTier::adaptive) {
+        pass.validation_tier = ValidationTier::minimal;
+    }
     pass.optimization_deadline = make_optimizer_deadline(tuning_overrides);
     pass.optimizer_route =
         (pass.lightweight_path || pass.runtime_sensitive_path) ? "runtime_sensitive_optimizer"
@@ -7756,6 +8004,43 @@ void BootstrapExecutionOptimizer::load_cache() {
     }
     cache_loaded_ = true;
 
+    const auto binary_path = bootstrap_cache_binary_path_for(cache_path_);
+    if (prefer_binary_cache(binary_path, cache_path_)) {
+        std::ifstream binary(binary_path, std::ios::binary);
+        std::array<char, 8> magic{};
+        std::uint32_t version = 0u;
+        std::uint32_t signature_count = 0u;
+        if (binary.is_open() &&
+            binary.read(magic.data(), static_cast<std::streamsize>(magic.size())) &&
+            std::string_view(magic.data(), magic.size()) == std::string_view("JKLBST02", 8) &&
+            read_pod(binary, version) &&
+            version == 2u &&
+            read_pod(binary, signature_count)) {
+            for (std::uint32_t signature_index = 0u; signature_index < signature_count; ++signature_index) {
+                std::string signature;
+                std::uint32_t config_count = 0u;
+                if (!read_string_binary(binary, signature) || !read_pod(binary, config_count)) {
+                    cache_.clear();
+                    break;
+                }
+                auto& configs = cache_[signature];
+                configs.reserve(config_count);
+                for (std::uint32_t config_index = 0u; config_index < config_count; ++config_index) {
+                    CachedExecutionConfig cached;
+                    if (!read_string_binary(binary, cached.operation_name) ||
+                        !read_execution_config_binary(binary, cached.config)) {
+                        cache_.clear();
+                        break;
+                    }
+                    configs.push_back(std::move(cached));
+                }
+            }
+            if (!cache_.empty() || signature_count == 0u) {
+                return;
+            }
+        }
+    }
+
     std::ifstream input(cache_path_);
     if (!input.is_open()) {
         return;
@@ -7859,8 +8144,39 @@ void AdaptiveExecutionOptimizer::load_cache() {
     }
     cache_loaded_ = true;
 
+    const auto load_summary_map_binary =
+        [](const std::filesystem::path& path, std::unordered_map<std::string, PerformanceSummary>& target) {
+            std::ifstream input(path, std::ios::binary);
+            std::array<char, 8> magic{};
+            std::uint32_t version = 0u;
+            std::uint32_t entry_count = 0u;
+            if (!input.is_open() ||
+                !input.read(magic.data(), static_cast<std::streamsize>(magic.size())) ||
+                std::string_view(magic.data(), magic.size()) != std::string_view("JKLPER02", 8) ||
+                !read_pod(input, version) ||
+                version != kExecutionPerformanceCacheSchemaVersion ||
+                !read_pod(input, entry_count)) {
+                return false;
+            }
+            for (std::uint32_t index = 0u; index < entry_count; ++index) {
+                std::string key;
+                PerformanceSummary summary;
+                if (!read_string_binary(input, key) ||
+                    !read_performance_summary_binary(input, summary)) {
+                    target.clear();
+                    return false;
+                }
+                target.emplace(std::move(key), std::move(summary));
+            }
+            return true;
+        };
+
     const auto load_summary_map =
         [&](const std::filesystem::path& path, std::unordered_map<std::string, PerformanceSummary>& target) {
+            const auto binary_path = path.string() + ".bin";
+            if (prefer_binary_cache(binary_path, path) && load_summary_map_binary(binary_path, target)) {
+                return;
+            }
             std::ifstream input(path);
             if (!input.is_open()) {
                 return;
@@ -7961,6 +8277,34 @@ void AdaptiveExecutionOptimizer::load_cache() {
 
     load_summary_map(performance_cache_path_, performance_cache_);
     load_summary_map(graph_family_cache_path_, graph_family_performance_cache_);
+
+    const auto hint_binary_path = cpu_runtime_hint_cache_path_.string() + ".bin";
+    if (prefer_binary_cache(hint_binary_path, cpu_runtime_hint_cache_path_)) {
+        std::ifstream binary(hint_binary_path, std::ios::binary);
+        std::array<char, 8> magic{};
+        std::uint32_t version = 0u;
+        std::uint32_t entry_count = 0u;
+        if (binary.is_open() &&
+            binary.read(magic.data(), static_cast<std::streamsize>(magic.size())) &&
+            std::string_view(magic.data(), magic.size()) == std::string_view("JKLHNT02", 8) &&
+            read_pod(binary, version) &&
+            version == kExecutionCpuHintCacheSchemaVersion &&
+            read_pod(binary, entry_count)) {
+            for (std::uint32_t index = 0u; index < entry_count; ++index) {
+                std::string key;
+                CpuRuntimeHintSummary summary;
+                if (!read_string_binary(binary, key) ||
+                    !read_cpu_runtime_hint_binary(binary, summary)) {
+                    cpu_runtime_hint_cache_.clear();
+                    break;
+                }
+                cpu_runtime_hint_cache_[std::move(key)] = std::move(summary);
+            }
+            if (!cpu_runtime_hint_cache_.empty() || entry_count == 0u) {
+                return;
+            }
+        }
+    }
 
     std::ifstream hint_input(cpu_runtime_hint_cache_path_);
     if (!hint_input.is_open()) {
@@ -8478,6 +8822,26 @@ void BootstrapExecutionOptimizer::persist_cache() const {
                    << cached.config.precision_mix << '\n';
         }
     }
+
+    const auto binary_path = bootstrap_cache_binary_path_for(cache_path_);
+    std::ofstream binary(binary_path, std::ios::binary | std::ios::trunc);
+    if (!binary.is_open()) {
+        return;
+    }
+    binary.write("JKLBST02", 8);
+    const std::uint32_t version = 2u;
+    write_pod(binary, version);
+    const auto signature_count = static_cast<std::uint32_t>(cache_.size());
+    write_pod(binary, signature_count);
+    for (const auto& [signature, configs] : cache_) {
+        write_string_binary(binary, signature);
+        const auto config_count = static_cast<std::uint32_t>(configs.size());
+        write_pod(binary, config_count);
+        for (const auto& cached : configs) {
+            write_string_binary(binary, cached.operation_name);
+            write_execution_config_binary(binary, cached.config);
+        }
+    }
 }
 
 void AdaptiveExecutionOptimizer::persist_cache() const {
@@ -8542,6 +8906,24 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
         };
     persist_summary_map(performance_cache_path_, performance_cache_);
     persist_summary_map(graph_family_cache_path_, graph_family_performance_cache_);
+    const auto persist_summary_map_binary =
+        [](const std::filesystem::path& path, const std::unordered_map<std::string, PerformanceSummary>& source) {
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            if (!output.is_open()) {
+                return;
+            }
+            output.write("JKLPER02", 8);
+            const auto version = kExecutionPerformanceCacheSchemaVersion;
+            write_pod(output, version);
+            const auto count = static_cast<std::uint32_t>(source.size());
+            write_pod(output, count);
+            for (const auto& [key, summary] : source) {
+                write_string_binary(output, key);
+                write_performance_summary_binary(output, summary);
+            }
+        };
+    persist_summary_map_binary(performance_cache_path_.string() + ".bin", performance_cache_);
+    persist_summary_map_binary(graph_family_cache_path_.string() + ".bin", graph_family_performance_cache_);
 
     std::ofstream hint_output(cpu_runtime_hint_cache_path_, std::ios::trunc);
     if (!hint_output.is_open()) {
@@ -8561,6 +8943,20 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
                     << (summary.preferred_use_avx512 ? 1 : 0) << '\t'
                     << summary.observations << '\t'
                     << summary.average_effective_latency_us << '\n';
+    }
+
+    std::ofstream hint_binary(cpu_runtime_hint_cache_path_.string() + ".bin", std::ios::binary | std::ios::trunc);
+    if (!hint_binary.is_open()) {
+        return;
+    }
+    hint_binary.write("JKLHNT02", 8);
+    const auto hint_version = kExecutionCpuHintCacheSchemaVersion;
+    write_pod(hint_binary, hint_version);
+    const auto hint_count = static_cast<std::uint32_t>(cpu_runtime_hint_cache_.size());
+    write_pod(hint_binary, hint_count);
+    for (const auto& [key, summary] : cpu_runtime_hint_cache_) {
+        write_string_binary(hint_binary, key);
+        write_cpu_runtime_hint_binary(hint_binary, summary);
     }
 }
 

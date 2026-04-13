@@ -4,6 +4,7 @@
 #include "jakal/executors/interfaces.hpp"
 #include "jakal/jakal_toolkit.hpp"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -68,12 +69,21 @@ struct DirectExecutionReport {
     bool all_succeeded = false;
 };
 
+struct DirectExecutionPolicy {
+    bool enable_trusted_cached_validation = false;
+    std::uint32_t trusted_verification_interval = 8u;
+    std::uint32_t trusted_verification_sample_budget = 2u;
+    std::size_t inline_dispatch_group_threshold = 2u;
+    std::size_t inline_dispatch_item_threshold = 4096u;
+};
+
 class DirectExecutor {
 public:
     [[nodiscard]] DirectExecutionReport execute(
         const OptimizationReport& optimization,
         const std::vector<HardwareGraph>& graphs,
-        const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index) const;
+        const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index,
+        const DirectExecutionPolicy& policy = {}) const;
 };
 
 }  // namespace jakal
